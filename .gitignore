@@ -1,0 +1,14 @@
+# Swift / SwiftPM
+.build/
+.swiftpm/
+DerivedData/
+*.xcodeproj
+
+# App bundle produced by bundle.sh
+MacDirStats.app/
+
+# Claude Code local settings (machine-specific)
+.claude/settings.local.json
+
+# macOS
+.DS_Store
