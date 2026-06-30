@@ -8,8 +8,11 @@ import Synchronization
 /// directory's own files, pushes child directories back onto the stack, and
 /// propagates sizes up the ancestor chain via atomics. Termination is detected
 /// when the count of in-flight directories returns to zero.
-final class DirectoryScanner {
+final class DirectoryScanner: ScanBackend {
     let root: FSNode
+
+    var directoryCount: Int64 { dirCount.load(ordering: .relaxed) }
+    var scanErrorCount: Int64 { errorCount.load(ordering: .relaxed) }
 
     /// One starting point of the scan. Multiple seeds let a single scan span
     /// several volumes, all aggregating into a shared (virtual) `root`.

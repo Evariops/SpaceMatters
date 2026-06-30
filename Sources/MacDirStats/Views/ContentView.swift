@@ -2,7 +2,7 @@ import SwiftUI
 import AppKit
 
 struct ContentView: View {
-    @Bindable var controller: ScanController
+    @Bindable var app: AppModel
     @AppStorage("isDark") private var isDark = true
     @AppStorage("fdaBannerDismissed") private var fdaDismissed = false
 
@@ -10,32 +10,20 @@ struct ContentView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if !controller.hasFullDiskAccess && !fdaDismissed {
+            if !app.filesystem.hasFullDiskAccess && !fdaDismissed {
                 FDABanner(onDismiss: { fdaDismissed = true })
                 Divider().overlay(theme.separator)
             }
 
-            if controller.root == nil {
-                // Splash: no toolbar; theme toggle floats in the top-right corner.
-                EmptyState(controller: controller, isDark: $isDark)
+            switch app.route {
+            case .splash:
+                EmptyState(app: app, isDark: $isDark)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .background(theme.windowBackground)
-            } else {
-                ToolbarBar(controller: controller, isDark: $isDark)
-                Divider().overlay(theme.separator)
-
-                HSplitView {
-                    VSplitView {
-                        DirectoryListView(controller: controller)
-                            .frame(minHeight: 160)
-                        TypeBreakdownView(controller: controller)
-                            .frame(minHeight: 120)
-                    }
-                    .frame(minWidth: 280, idealWidth: 360, maxWidth: 560)
-
-                    TreemapPane(controller: controller)
-                        .frame(minWidth: 360)
-                }
+            case .filesystem:
+                FilesystemResultView(controller: app.filesystem, app: app, isDark: $isDark)
+            case .containers:
+                ContainerResultView(controller: app.containers, app: app, isDark: $isDark)
             }
         }
         .environment(\.theme, theme)
@@ -43,8 +31,34 @@ struct ContentView: View {
         .background(theme.windowBackground)
         .frame(minWidth: 900, minHeight: 560)
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-            // Re-check after the user returns from System Settings.
-            controller.refreshFullDiskAccess()
+            app.filesystem.refreshFullDiskAccess()
+        }
+    }
+}
+
+private struct FilesystemResultView: View {
+    @Bindable var controller: ScanController
+    let app: AppModel
+    @Binding var isDark: Bool
+    @Environment(\.theme) private var theme
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ToolbarBar(controller: controller, app: app, isDark: $isDark)
+            Divider().overlay(theme.separator)
+
+            HSplitView {
+                VSplitView {
+                    DirectoryListView(controller: controller)
+                        .frame(minHeight: 160)
+                    TypeBreakdownView(controller: controller)
+                        .frame(minHeight: 120)
+                }
+                .frame(minWidth: 280, idealWidth: 360, maxWidth: 560)
+
+                TreemapPane(controller: controller)
+                    .frame(minWidth: 360)
+            }
         }
     }
 }
@@ -127,13 +141,14 @@ private struct TreemapPane: View {
 
 private struct ToolbarBar: View {
     @Bindable var controller: ScanController
+    let app: AppModel
     @Binding var isDark: Bool
     @Environment(\.theme) private var theme
 
     var body: some View {
         HStack(spacing: 12) {
             // Back to the disk-selection splash.
-            Button(action: controller.goHome) {
+            Button(action: app.showSplash) {
                 Label("Home", systemImage: "chevron.backward")
             }
             .buttonStyle(.plain)
@@ -234,12 +249,14 @@ private struct Stat: View {
 }
 
 private struct EmptyState: View {
-    @Bindable var controller: ScanController
+    @Bindable var app: AppModel
     @Binding var isDark: Bool
     @Environment(\.theme) private var theme
 
     @State private var volumes: [Volume] = []
     @State private var selected: Set<URL> = []
+    @State private var vms: [VMMachine] = []
+    @State private var engines: [ContainerEngine] = []
 
     private let columns = [GridItem(.adaptive(minimum: 230, maximum: 320), spacing: 14)]
 
@@ -268,11 +285,31 @@ private struct EmptyState: View {
                                 .contentShape(RoundedRectangle(cornerRadius: 12))
                                 .onTapGesture { toggle(volume) }
                                 .simultaneousGesture(TapGesture(count: 2).onEnded {
-                                    controller.scan(volumes: [volume])
+                                    app.scan(volumes: [volume])
                                 })
                         }
                     }
                     .frame(maxWidth: 780)
+                }
+
+                if !vms.isEmpty {
+                    section("Virtual machines") {
+                        LazyVGrid(columns: columns, spacing: 14) {
+                            ForEach(vms) { vm in
+                                VMCard(machine: vm, scope: .full, theme: theme) { app.scanVMFilesystem(vm) }
+                            }
+                        }
+                    }
+                }
+
+                if !engines.isEmpty {
+                    section("Containers") {
+                        LazyVGrid(columns: columns, spacing: 14) {
+                            ForEach(engines) { engine in
+                                ContainerEngineCard(engine: engine, theme: theme) { app.analyzeContainers(engine) }
+                            }
+                        }
+                    }
                 }
 
                 VStack(spacing: 10) {
@@ -283,7 +320,7 @@ private struct EmptyState: View {
                     .disabled(selected.isEmpty)
                     .opacity(selected.isEmpty ? 0.5 : 1)
 
-                    Button(action: controller.chooseFolderAndScan) {
+                    Button(action: app.openFolder) {
                         Label("Choose a folder instead…", systemImage: "folder")
                             .font(.system(size: 12))
                     }
@@ -306,6 +343,23 @@ private struct EmptyState: View {
             .help("Toggle theme")
         }
         .onAppear(perform: reload)
+        .task {
+            // Detection shells out to podman/colima — keep it off the main thread.
+            vms = await Task.detached(priority: .userInitiated) { VMProbe.detect() }.value
+            engines = await Task.detached(priority: .userInitiated) { ContainerProbe.detect() }.value
+        }
+    }
+
+    @ViewBuilder
+    private func section<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(theme.textSecondary)
+                .textCase(.uppercase)
+            content()
+        }
+        .frame(maxWidth: 780)
     }
 
     private var scanLabel: String {
@@ -319,7 +373,7 @@ private struct EmptyState: View {
 
     private func scanSelected() {
         let chosen = volumes.filter { selected.contains($0.id) }
-        if !chosen.isEmpty { controller.scan(volumes: chosen) }
+        if !chosen.isEmpty { app.scan(volumes: chosen) }
     }
 
     private func reload() {
@@ -399,6 +453,117 @@ private struct VolumeCard: View {
         case ..<0.9: return Color(hex: 0xD29922)
         default: return Color(hex: 0xF85149)
         }
+    }
+}
+
+private struct VMCard: View {
+    let machine: VMMachine
+    let scope: VMScope
+    let theme: Theme
+    let action: () -> Void
+    @State private var hovering = false
+
+    private var enabled: Bool { machine.running }
+    private var title: String { "\(machine.runtime.rawValue) — \(scope == .full ? "Full VM" : "Containers")" }
+    private var subtitle: String { scope == .full ? machine.name : "Image & container storage" }
+    private var icon: String { scope == .full ? "cube.transparent.fill" : "square.stack.3d.up.fill" }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 11) {
+            HStack(spacing: 10) {
+                Image(systemName: icon)
+                    .font(.system(size: 20))
+                    .foregroundStyle(enabled ? theme.accent : theme.textSecondary)
+                    .frame(width: 32)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(theme.textPrimary)
+                        .lineLimit(1)
+                    Text(subtitle)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(theme.textSecondary)
+                        .lineLimit(1)
+                }
+                Spacer()
+                if !enabled {
+                    Text("Stopped")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(theme.textSecondary)
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(Capsule().fill(theme.barTrack))
+                }
+            }
+
+            HStack {
+                Text("\(Format.bytes(machine.diskBytes)) VM disk")
+                    .font(.system(size: 10).monospacedDigit())
+                    .foregroundStyle(theme.textSecondary)
+                Spacer()
+                if enabled {
+                    Label("Analyze", systemImage: "play.fill")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(hovering ? theme.accent : theme.textSecondary)
+                }
+            }
+        }
+        .padding(14)
+        .background(RoundedRectangle(cornerRadius: 12).fill(theme.panelBackground))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .strokeBorder(enabled && hovering ? theme.accent : theme.separator, lineWidth: enabled && hovering ? 2 : 1)
+        )
+        .opacity(enabled ? 1 : 0.5)
+        .contentShape(RoundedRectangle(cornerRadius: 12))
+        .onHover { if enabled { hovering = $0 } }
+        .onTapGesture { if enabled { action() } }
+        .help(enabled ? "Analyze this VM" : "\(machine.runtime.rawValue) is stopped — start it to analyze")
+    }
+}
+
+private struct ContainerEngineCard: View {
+    let engine: ContainerEngine
+    let theme: Theme
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 11) {
+            HStack(spacing: 10) {
+                Image(systemName: "square.stack.3d.up.fill")
+                    .font(.system(size: 20))
+                    .foregroundStyle(theme.accent)
+                    .frame(width: 32)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(engine.displayName)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(theme.textPrimary)
+                    Text("Images, layers & volumes")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(theme.textSecondary)
+                }
+                Spacer()
+            }
+            HStack {
+                Text("Container engine")
+                    .font(.system(size: 10))
+                    .foregroundStyle(theme.textSecondary)
+                Spacer()
+                Label("Analyze", systemImage: "play.fill")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(hovering ? theme.accent : theme.textSecondary)
+            }
+        }
+        .padding(14)
+        .background(RoundedRectangle(cornerRadius: 12).fill(theme.panelBackground))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .strokeBorder(hovering ? theme.accent : theme.separator, lineWidth: hovering ? 2 : 1)
+        )
+        .contentShape(RoundedRectangle(cornerRadius: 12))
+        .onHover { hovering = $0 }
+        .onTapGesture(perform: action)
+        .help("Analyze \(engine.displayName) images & containers")
     }
 }
 

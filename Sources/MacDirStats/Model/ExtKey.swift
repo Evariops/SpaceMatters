@@ -54,6 +54,15 @@ struct ExtKey: Hashable {
         self.hi = hi
     }
 
+    /// Derive the extension key from a file name string (for streamed scans).
+    init(fileName: String) {
+        if fileName.isEmpty { self = .none; return }
+        let bytes = Array(fileName.utf8)
+        self = bytes.withUnsafeBytes { raw in
+            ExtKey(name: raw.baseAddress!, length: raw.count)
+        }
+    }
+
     /// Human-readable name for display (e.g. ".png", "[no extension]").
     var displayName: String {
         if self == .none { return "[no extension]" }

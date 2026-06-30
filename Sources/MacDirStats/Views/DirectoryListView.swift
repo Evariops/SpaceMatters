@@ -180,13 +180,18 @@ private struct OutlineRowView: View {
     @ViewBuilder
     private func contextMenu() -> some View {
         if let path = itemPath() {
-            Button { controller.openItem(path) } label: { Label("Open", systemImage: "arrow.up.forward.app") }
-            Button { controller.revealInFinder(path) } label: { Label("Reveal in Finder", systemImage: "folder") }
-            Button { controller.copyPath(path) } label: { Label("Copy Path", systemImage: "doc.on.doc") }
-            Divider()
-            Button { moveToTrash() } label: { Label("Move to Trash", systemImage: "trash") }
-            Button(role: .destructive, action: requestDelete) {
-                Label("Delete Permanently…", systemImage: "trash.slash")
+            if controller.isHostScan {
+                Button { controller.openItem(path) } label: { Label("Open", systemImage: "arrow.up.forward.app") }
+                Button { controller.revealInFinder(path) } label: { Label("Reveal in Finder", systemImage: "folder") }
+                Button { controller.copyPath(path) } label: { Label("Copy Path", systemImage: "doc.on.doc") }
+                Divider()
+                Button { moveToTrash() } label: { Label("Move to Trash", systemImage: "trash") }
+                Button(role: .destructive, action: requestDelete) {
+                    Label("Delete Permanently…", systemImage: "trash.slash")
+                }
+            } else {
+                // VM scan: paths live inside the VM, so host actions don't apply.
+                Button { controller.copyPath(path) } label: { Label("Copy Path (in VM)", systemImage: "doc.on.doc") }
             }
         }
     }

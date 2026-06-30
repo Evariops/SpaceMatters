@@ -60,6 +60,14 @@ final class FSNode {
         return _children.count
     }
 
+    /// Append a child discovered during an incremental (streamed) scan.
+    func appendChild(_ child: FSNode) {
+        gTreeLock.lock(); _children.append(child); _scanned = true; gTreeLock.unlock()
+    }
+
+    /// Set the dominant file type (used by streamed scans, which compute it live).
+    func updateDominantExt(_ ext: ExtKey) { dominantExt = ext }
+
     /// Detach a child (after it's been trashed/deleted on disk).
     func removeChild(_ child: FSNode) {
         gTreeLock.lock(); _children.removeAll { $0 === child }; gTreeLock.unlock()

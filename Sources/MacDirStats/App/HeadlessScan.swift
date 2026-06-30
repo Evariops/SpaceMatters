@@ -69,6 +69,71 @@ enum HeadlessScan {
         }
     }
 
+    /// Headless VM scan that prints rising counts as the stream arrives — proves
+    /// the find-over-SSH backend updates progressively, not in one blocking call.
+    static func runVM(runtime: String, scope: String) {
+        let machines = VMProbe.detect()
+        print("detected VMs:")
+        for m in machines {
+            print("  \(m.runtime.rawValue) \(m.name) — \(m.running ? "running" : "stopped"), disk \(Format.bytes(m.diskBytes))")
+        }
+        guard let machine = machines.first(where: { $0.runtime.rawValue.lowercased() == runtime.lowercased() }) else {
+            print("no \(runtime) machine found"); return
+        }
+        guard machine.running else { print("\(machine.runtime.rawValue) is not running — cannot scan"); return }
+
+        let vmScope: VMScope = (scope.lowercased() == "containers") ? .containers : .full
+        let cmd = VMProbe.scanCommand(machine: machine, scope: vmScope)
+        print("scanning \(machine.runtime.rawValue) (\(vmScope.rawValue)) root=\(cmd.rootPath)")
+
+        let root = FSNode(name: machine.name, parent: nil)
+        let scanner = CommandScanner(root: root, rootPath: cmd.rootPath, executable: cmd.executable, arguments: cmd.arguments)
+        let start = Date()
+        scanner.start()
+
+        var last: Int64 = -1
+        while !scanner.isFinished {
+            usleep(250_000)
+            let files = root.fileCount.load(ordering: .relaxed)
+            if files != last {
+                print(String(format: "  [%5.1fs] dirs=%-7d files=%-8d on-disk=%@",
+                             Date().timeIntervalSince(start), scanner.directoryCount, files,
+                             Format.bytes(root.aggPhysical.load(ordering: .relaxed))))
+                last = files
+            }
+        }
+
+        print(String(format: "DONE in %.2fs — dirs=%d files=%d  on-disk=%@  logical=%@",
+                     Date().timeIntervalSince(start), scanner.directoryCount,
+                     root.fileCount.load(ordering: .relaxed),
+                     Format.bytes(root.aggPhysical.load(ordering: .relaxed)),
+                     Format.bytes(root.aggLogical.load(ordering: .relaxed))))
+        for row in scanner.snapshotExtensions(metric: .physical, limit: 6) {
+            print("  \(row.name): \(Format.bytes(row.physical)) (\(Format.count(row.count)) files)")
+        }
+    }
+
+    static func runContainers() {
+        guard let engine = ContainerProbe.detect().first else { print("no reachable container engine"); return }
+        print("engine: \(engine.displayName) (\(engine.executable))")
+        let snap = ContainerQueries.fetchAll(engine)
+        print("df:")
+        for r in snap.df {
+            print("  \(r.type): size=\(Format.bytes(r.size)) reclaimable=\(Format.bytes(r.reclaimable)) total=\(r.total) active=\(r.active)")
+        }
+        print("images: \(snap.images.count)")
+        for img in snap.images.sorted(by: { $0.size > $1.size }).prefix(5) {
+            print("  \(img.name) [\(img.shortID)] \(Format.bytes(img.size)) inUse=\(img.inUse)")
+        }
+        if let biggest = snap.images.max(by: { $0.size < $1.size }) {
+            print("layers of \(biggest.name):")
+            for layer in ContainerQueries.history(engine, imageID: biggest.id).prefix(8) {
+                print(String(format: "  %9@  %@", Format.bytes(layer.size) as NSString, String(layer.command.prefix(64)) as NSString))
+            }
+        }
+        print("containers: \(snap.containers.count), volumes: \(snap.volumes.count)")
+    }
+
     static func listVolumes() {
         for v in Volume.mounted() {
             print(String(format: "%-28@ %@  total=%@  free=%@  %@%@",

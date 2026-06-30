@@ -43,7 +43,11 @@ final class ScanController {
     /// Set to ask the outline to scroll a node into view; cleared once handled.
     var revealTarget: FSNode?
 
-    private var scanner: DirectoryScanner?
+    /// True for local host scans; false for VM scans (whose paths aren't host
+    /// paths, so Finder/Trash actions and on-demand file listing don't apply).
+    private(set) var isHostScan = true
+
+    private var scanner: (any ScanBackend)?
     private var timer: Timer?
     private var startTime = Date()
     private var lastSampleTime = Date()
@@ -75,9 +79,11 @@ final class ScanController {
 
     /// Remembered for Rescan (so a multi-disk scan rescans the same disks).
     private(set) var lastVolumes: [Volume] = []
+    @ObservationIgnored private var lastVM: (machine: VMMachine, scope: VMScope)?
 
     func scan(url: URL) {
         lastVolumes = []
+        lastVM = nil
         let node = FSNode(name: url.lastPathComponent.isEmpty ? url.path : url.lastPathComponent, parent: nil)
         begin(root: node, seeds: [.init(path: url.path, node: node)], displayPath: url.path)
     }
@@ -87,6 +93,7 @@ final class ScanController {
     func scan(volumes: [Volume]) {
         guard !volumes.isEmpty else { return }
         lastVolumes = volumes
+        lastVM = nil
 
         if volumes.count == 1 {
             let v = volumes[0]
@@ -108,12 +115,42 @@ final class ScanController {
     }
 
     private func begin(root: FSNode, seeds: [DirectoryScanner.Seed], displayPath: String) {
-        cancel()
-
         // Skip network volumes and the APFS Data firmlink mount (avoids double
         // counting), unless one of those is itself a chosen root.
         let skip = DirectoryScanner.recommendedSkipPaths(seedPaths: seeds.map(\.path))
         let scanner = DirectoryScanner(root: root, seeds: seeds, skipPaths: skip)
+        var paths: [ObjectIdentifier: String] = [:]
+        for seed in seeds { paths[ObjectIdentifier(seed.node)] = seed.path }
+        startBackend(root: root, scanner: scanner, displayPath: displayPath, isHost: true, nodePaths: paths)
+    }
+
+    /// Scan inside a Podman/Colima VM (streamed `find` over SSH).
+    func scanVM(machine: VMMachine, scope: VMScope) {
+        guard machine.running else { return }
+        lastVolumes = []
+        lastVM = (machine, scope)
+        let cmd = VMProbe.scanCommand(machine: machine, scope: scope)
+        let label = scope == .full ? "VM" : "Containers"
+        let node = FSNode(name: "\(machine.runtime.rawValue) — \(label)", parent: nil)
+        let scanner = CommandScanner(root: node, rootPath: cmd.rootPath, executable: cmd.executable, arguments: cmd.arguments)
+        startBackend(
+            root: node,
+            scanner: scanner,
+            displayPath: cmd.rootPath,
+            isHost: false,
+            nodePaths: [ObjectIdentifier(node): cmd.rootPath]
+        )
+    }
+
+    private func startBackend(
+        root: FSNode,
+        scanner: any ScanBackend,
+        displayPath: String,
+        isHost: Bool,
+        nodePaths: [ObjectIdentifier: String]
+    ) {
+        cancel()
+
         self.root = root
         self.zoomRoot = root
         self.selection = root
@@ -123,11 +160,11 @@ final class ScanController {
         self.rootPath = displayPath
         self.rootName = root.name
         self.scanner = scanner
+        self.isHostScan = isHost
 
         sortCache.removeAll()
         fileCache.removeAll()
-        nodePaths.removeAll()
-        for seed in seeds { nodePaths[ObjectIdentifier(seed.node)] = seed.path }
+        self.nodePaths = nodePaths
 
         totalLogical = 0; totalPhysical = 0; fileCount = 0; dirCount = 0; errorCount = 0
         filesPerSecond = 0; elapsed = 0; extRows = []
@@ -148,6 +185,7 @@ final class ScanController {
     }
 
     func rescan() {
+        if let lastVM { scanVM(machine: lastVM.machine, scope: lastVM.scope); return }
         if !lastVolumes.isEmpty { scan(volumes: lastVolumes); return }
         guard !rootPath.isEmpty else { return }
         scan(url: URL(fileURLWithPath: rootPath))
@@ -167,6 +205,8 @@ final class ScanController {
         rootPath = ""
         rootName = ""
         lastVolumes = []
+        lastVM = nil
+        isHostScan = true
         phase = .idle
 
         totalLogical = 0; totalPhysical = 0; fileCount = 0; dirCount = 0; errorCount = 0
@@ -252,6 +292,8 @@ final class ScanController {
     /// Files directly inside `node`, enumerated on demand and cached (capped to
     /// the largest N so a giant folder can't blow up memory or the row count).
     func filesIn(_ node: FSNode) -> [FileItem] {
+        // VM scans enumerate over SSH; we don't re-shell per expanded folder.
+        guard isHostScan else { return [] }
         let key = ObjectIdentifier(node)
         if phase != .scanning, let cached = fileCache[key] { return cached }
 
@@ -486,8 +528,8 @@ final class ScanController {
         totalLogical = root.aggLogical.load(ordering: .relaxed)
         totalPhysical = root.aggPhysical.load(ordering: .relaxed)
         fileCount = root.fileCount.load(ordering: .relaxed)
-        dirCount = scanner.dirCount.load(ordering: .relaxed)
-        errorCount = scanner.errorCount.load(ordering: .relaxed)
+        dirCount = scanner.directoryCount
+        errorCount = scanner.scanErrorCount
 
         let now = Date()
         elapsed = now.timeIntervalSince(startTime)

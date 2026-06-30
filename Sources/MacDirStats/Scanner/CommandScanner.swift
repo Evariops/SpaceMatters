@@ -1,0 +1,204 @@
+import Foundation
+import Synchronization
+
+/// Scans a filesystem that isn't reachable by host syscalls (inside a Podman or
+/// Colima VM) by running a streamed `find` over SSH and parsing its output **as
+/// it arrives**. Output format (one record per line):
+///
+///     <type>\t<blocks>\t<bytes>\t<path>
+///
+/// where blocks are 512-byte units (→ on-disk size) and bytes is the logical
+/// size. We read the pipe incrementally (never block until completion), so the
+/// tree and sizes fill in live exactly like the local scanner.
+final class CommandScanner: ScanBackend {
+    let root: FSNode
+    private let rootPath: String
+    private let executable: String
+    private let arguments: [String]
+
+    private let dirCountAtomic = Atomic<Int64>(0)
+    private let errAtomic = Atomic<Int64>(0)
+
+    private var process: Process?
+    private var thread: Thread?
+    private let finishLock = NSLock()
+    private var finished = false
+
+    // Touched only by the single reader thread.
+    private var nodes: [String: FSNode] = [:]
+    private var largestFile: [ObjectIdentifier: Int64] = [:]
+
+    private let extLock = NSLock()
+    private var extStats: [ExtKey: ExtStat] = [:]
+
+    init(root: FSNode, rootPath: String, executable: String, arguments: [String]) {
+        self.root = root
+        self.rootPath = rootPath
+        self.executable = executable
+        self.arguments = arguments
+    }
+
+    // MARK: ScanBackend
+
+    func start() {
+        nodes[rootPath] = root
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        let outPipe = Pipe()
+        process.standardOutput = outPipe
+        process.standardError = FileHandle.nullDevice
+        self.process = process
+
+        let thread = Thread { [weak self] in
+            self?.readLoop(outPipe.fileHandleForReading, process: process)
+        }
+        thread.stackSize = 4 << 20
+        thread.name = "macdirstats.vm-scanner"
+        self.thread = thread
+
+        do {
+            try process.run()
+        } catch {
+            errAtomic.wrappingAdd(1, ordering: .relaxed)
+            markFinished()
+            return
+        }
+        thread.start()
+    }
+
+    func cancel() {
+        process?.terminate()
+        markFinished()
+    }
+
+    var isFinished: Bool {
+        finishLock.lock(); defer { finishLock.unlock() }
+        return finished
+    }
+
+    var directoryCount: Int64 { dirCountAtomic.load(ordering: .relaxed) }
+    var scanErrorCount: Int64 { errAtomic.load(ordering: .relaxed) }
+
+    func snapshotExtensions(metric: SizeMetric, limit: Int) -> [ExtRow] {
+        extLock.lock()
+        let copy = extStats
+        extLock.unlock()
+
+        var rows = copy.map { key, stat in
+            ExtRow(key: key, name: key.displayName, logical: stat.logical, physical: stat.physical, count: stat.count)
+        }
+        rows.sort { metric == .physical ? $0.physical > $1.physical : $0.logical > $1.logical }
+        if rows.count > limit { rows.removeLast(rows.count - limit) }
+        return rows
+    }
+
+    // MARK: Streaming reader
+
+    private func readLoop(_ handle: FileHandle, process: Process) {
+        var pending = Data()
+        while true {
+            let chunk = handle.availableData // returns as soon as bytes arrive; empty == EOF
+            if chunk.isEmpty { break }
+            pending.append(chunk)
+
+            // Parse every complete line we have so far; keep the remainder.
+            var searchStart = pending.startIndex
+            while let nl = pending[searchStart...].firstIndex(of: 0x0A) {
+                parse(pending[searchStart..<nl])
+                searchStart = pending.index(after: nl)
+            }
+            if searchStart > pending.startIndex {
+                pending.removeSubrange(pending.startIndex..<searchStart)
+            }
+        }
+        if !pending.isEmpty { parse(pending[...]) }
+
+        process.waitUntilExit()
+        nodes.removeAll()
+        largestFile.removeAll()
+        markFinished()
+    }
+
+    private func parse(_ line: Data) {
+        let bytes = [UInt8](line)
+        guard bytes.count >= 7 else { return }
+
+        var t1 = -1, t2 = -1, t3 = -1
+        var i = 0
+        while i < bytes.count {
+            if bytes[i] == 0x09 {
+                if t1 < 0 { t1 = i }
+                else if t2 < 0 { t2 = i }
+                else { t3 = i; break }
+            }
+            i += 1
+        }
+        guard t1 >= 1, t2 > t1, t3 > t2, t3 + 1 < bytes.count else { return }
+
+        let type = bytes[0]
+        let blocks = asciiInt(bytes, t1 + 1, t2)
+        let logical = asciiInt(bytes, t2 + 1, t3)
+        let physical = blocks * 512
+        let path = String(decoding: bytes[(t3 + 1)...], as: UTF8.self)
+
+        if type == 0x64 { // 'd' directory
+            if path == rootPath || nodes[path] != nil {
+                dirCountAtomic.wrappingAdd(1, ordering: .relaxed)
+                return
+            }
+            let (parentPath, name) = Self.split(path)
+            let parent = nodes[parentPath] ?? root
+            let node = FSNode(name: name, parent: parent, isDirectory: true)
+            parent.appendChild(node)
+            nodes[path] = node
+            dirCountAtomic.wrappingAdd(1, ordering: .relaxed)
+        } else { // file, symlink, etc.
+            let (parentPath, name) = Self.split(path)
+            let parent = nodes[parentPath] ?? root
+            parent.adjustDirectFiles(logical: logical, physical: physical, count: 1)
+
+            var node: FSNode? = parent
+            while let cur = node {
+                cur.aggLogical.wrappingAdd(logical, ordering: .relaxed)
+                cur.aggPhysical.wrappingAdd(physical, ordering: .relaxed)
+                cur.fileCount.wrappingAdd(1, ordering: .relaxed)
+                node = cur.parent
+            }
+
+            let key = ExtKey(fileName: name)
+            extLock.lock()
+            extStats[key, default: ExtStat()].add(logical: logical, physical: physical)
+            extLock.unlock()
+
+            // Colour the folder by its largest file's type (cheap, looks right).
+            let pid = ObjectIdentifier(parent)
+            if physical > (largestFile[pid] ?? -1) {
+                largestFile[pid] = physical
+                parent.updateDominantExt(key)
+            }
+        }
+    }
+
+    private func asciiInt(_ b: [UInt8], _ lo: Int, _ hi: Int) -> Int64 {
+        var value: Int64 = 0
+        var i = lo
+        while i < hi {
+            let c = b[i]
+            if c >= 0x30 && c <= 0x39 { value = value * 10 + Int64(c - 0x30) }
+            i += 1
+        }
+        return value
+    }
+
+    private static func split(_ path: String) -> (parent: String, name: String) {
+        guard let idx = path.lastIndex(of: "/") else { return ("/", path) }
+        if idx == path.startIndex { return ("/", String(path[path.index(after: idx)...])) }
+        return (String(path[..<idx]), String(path[path.index(after: idx)...]))
+    }
+
+    private func markFinished() {
+        finishLock.lock(); finished = true; finishLock.unlock()
+    }
+}

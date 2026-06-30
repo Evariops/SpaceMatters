@@ -11,6 +11,16 @@ enum Entry {
             HeadlessScan.listVolumes()
             return
         }
+        if args.contains("--containers") {
+            HeadlessScan.runContainers()
+            return
+        }
+        if let idx = args.firstIndex(of: "--vm-scan"), idx + 1 < args.count {
+            let runtime = args[idx + 1]
+            let scope = idx + 2 < args.count ? args[idx + 2] : "full"
+            HeadlessScan.runVM(runtime: runtime, scope: scope)
+            return
+        }
         if let idx = args.firstIndex(of: "--scan"), idx + 1 < args.count {
             HeadlessScan.run(paths: Array(args[(idx + 1)...]))
             return
@@ -21,16 +31,16 @@ enum Entry {
 
 struct MacDirStatsApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @State private var controller = ScanController()
+    @State private var app = AppModel()
 
     var body: some Scene {
         WindowGroup {
-            ContentView(controller: controller)
+            ContentView(app: app)
         }
         .windowToolbarStyle(.unifiedCompact)
         .commands {
             CommandGroup(replacing: .newItem) {
-                Button("Open Folder…") { controller.chooseFolderAndScan() }
+                Button("Open Folder…") { app.openFolder() }
                     .keyboardShortcut("o", modifiers: .command)
             }
         }
