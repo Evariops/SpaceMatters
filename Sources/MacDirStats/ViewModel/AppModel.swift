@@ -8,15 +8,17 @@ import Observation
 @MainActor
 @Observable
 final class AppModel {
-    enum Route: Equatable { case splash, filesystem, containers }
+    enum Route: Equatable { case splash, filesystem, containers, kubernetes }
     private(set) var route: Route = .splash
 
     let filesystem = ScanController()
     let containers = ContainerController()
+    let kubernetes = KubernetesController()
 
     func showSplash() {
         filesystem.goHome()
         containers.stop()
+        kubernetes.stop()
         route = .splash
     }
 
@@ -42,5 +44,12 @@ final class AppModel {
     func analyzeContainers(_ engine: ContainerEngine) {
         route = .containers
         containers.load(engine: engine)
+    }
+
+    // MARK: Kubernetes mode
+
+    func analyzeKubernetes(context: String) {
+        route = .kubernetes
+        kubernetes.load(context: context)
     }
 }

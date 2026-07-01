@@ -134,6 +134,33 @@ enum HeadlessScan {
         print("containers: \(snap.containers.count), volumes: \(snap.volumes.count)")
     }
 
+    static func runK8s(context: String?) {
+        let contexts = K8sProbe.contexts()
+        print("contexts: \(contexts.map { $0.isCurrent ? "\($0.name)*" : $0.name }.joined(separator: ", "))")
+        guard let ctx = context ?? contexts.first(where: \.isCurrent)?.name ?? contexts.first?.name else {
+            print("no kube context"); return
+        }
+        print("analyzing context: \(ctx)")
+        var pvcs = K8sQueries.pvcs(context: ctx)
+        let pods = K8sQueries.pods(context: ctx)
+        let pvs = K8sQueries.pvs(context: ctx)
+        var usage: [String: Int64] = [:]
+        for node in K8sQueries.nodeNames(context: ctx) {
+            for (k, v) in K8sQueries.nodeUsage(context: ctx, node: node) { usage[k] = v }
+        }
+        pvcs = pvcs.map { var p = $0; if let u = usage[p.id] { p.used = u }; return p }
+
+        let totalCap = pvcs.reduce(0) { $0 + $1.capacity }
+        let totalUsed = pvcs.compactMap(\.used).reduce(0, +)
+        print("PVCs: \(pvcs.count)  pods-with-PVC=\(pods.count)  capacity=\(Format.bytes(totalCap))  used=\(Format.bytes(totalUsed))")
+        for pvc in pvcs.sorted(by: { $0.capacity > $1.capacity }).prefix(8) {
+            let u = pvc.used.map { "\(Format.bytes($0))/\(Format.bytes(pvc.capacity)) (\(Int((pvc.usageFraction ?? 0) * 100))%)" } ?? "—"
+            print("  \(pvc.namespace)/\(pvc.name)  \(u)  \(pvc.accessShort)  \(pvc.storageClass)  \(pvc.phase)")
+        }
+        let reclaimable = pvs.filter(\.reclaimable)
+        print("PVs: \(pvs.count)  reclaimable=\(reclaimable.count) (\(Format.bytes(reclaimable.reduce(0) { $0 + $1.capacity })))")
+    }
+
     static func listVolumes() {
         for v in Volume.mounted() {
             print(String(format: "%-28@ %@  total=%@  free=%@  %@%@",

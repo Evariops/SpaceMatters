@@ -15,6 +15,11 @@ enum Entry {
             HeadlessScan.runContainers()
             return
         }
+        if let idx = args.firstIndex(of: "--k8s") {
+            let ctx = idx + 1 < args.count ? args[idx + 1] : nil
+            HeadlessScan.runK8s(context: ctx)
+            return
+        }
         if let idx = args.firstIndex(of: "--vm-scan"), idx + 1 < args.count {
             let runtime = args[idx + 1]
             let scope = idx + 2 < args.count ? args[idx + 2] : "full"

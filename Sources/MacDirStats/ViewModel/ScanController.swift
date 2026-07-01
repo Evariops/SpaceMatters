@@ -493,6 +493,23 @@ final class ScanController {
         bump()
     }
 
+    /// Breadcrumb path: scan root → current zoom root.
+    var zoomPath: [FSNode] {
+        guard let zoom = zoomRoot else { return [] }
+        var path: [FSNode] = []
+        var node: FSNode? = zoom
+        while let cur = node { path.append(cur); node = cur.parent }
+        return path.reversed()
+    }
+
+    /// Navigate to a breadcrumb node: zoom the treemap there, select it, and
+    /// reveal it in the outline — one click, both panes updated.
+    func navigate(to node: FSNode) {
+        zoomRoot = node
+        reveal(node) // sets selection, selectedRowID, revealTarget, expands ancestors
+        bump()
+    }
+
     func zoomOut() {
         if let parent = zoomRoot?.parent {
             zoomRoot = parent

@@ -24,6 +24,8 @@ struct ContentView: View {
                 FilesystemResultView(controller: app.filesystem, app: app, isDark: $isDark)
             case .containers:
                 ContainerResultView(controller: app.containers, app: app, isDark: $isDark)
+            case .kubernetes:
+                KubernetesResultView(controller: app.kubernetes, app: app, isDark: $isDark)
             }
         }
         .environment(\.theme, theme)
@@ -106,36 +108,69 @@ private struct TreemapPane: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // Breadcrumb / zoom controls.
-            HStack(spacing: 8) {
-                Button { controller.zoomOut() } label: {
-                    Image(systemName: "arrow.up.left")
-                }
-                .buttonStyle(.plain)
-                .disabled(controller.zoomRoot?.parent == nil)
-                .foregroundStyle(controller.zoomRoot?.parent == nil ? theme.textSecondary.opacity(0.4) : theme.textPrimary)
-
-                Text(controller.zoomRoot?.name ?? controller.rootName)
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(theme.textPrimary)
-                    .lineLimit(1)
-
-                Spacer()
-
-                if let sel = controller.selection {
-                    Text(Format.bytes(sel.size(controller.metric)))
-                        .font(.system(size: 11, weight: .medium).monospacedDigit())
-                        .foregroundStyle(theme.textSecondary)
-                }
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 7)
-            .background(theme.panelBackground)
+            Breadcrumb(controller: controller)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 7)
+                .background(theme.panelBackground)
 
             Divider().overlay(theme.separator)
             TreemapView(controller: controller)
         }
         .background(theme.treemapBackground)
+    }
+}
+
+/// Clickable path from the scan root to the current zoom. The root stays pinned
+/// on the left; deeper segments scroll. Clicking any segment zooms there and
+/// updates the selection in both the tree and the treemap.
+private struct Breadcrumb: View {
+    @Bindable var controller: ScanController
+    @Environment(\.theme) private var theme
+
+    var body: some View {
+        let path = controller.zoomPath
+        HStack(spacing: 4) {
+            if let root = path.first {
+                segment(root, isCurrent: path.count == 1)
+            }
+            if path.count > 1 {
+                ScrollViewReader { proxy in
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 4) {
+                            ForEach(Array(path.dropFirst().enumerated()), id: \.element.id) { idx, node in
+                                Image(systemName: "chevron.compact.right")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(theme.textSecondary.opacity(0.6))
+                                segment(node, isCurrent: idx == path.count - 2)
+                                    .id(node.id)
+                            }
+                        }
+                    }
+                    .onChange(of: controller.zoomRoot) { _, zoom in
+                        if let zoom { withAnimation { proxy.scrollTo(zoom.id, anchor: .trailing) } }
+                    }
+                }
+            }
+
+            Spacer(minLength: 8)
+
+            if let sel = controller.selection {
+                Text(Format.bytes(sel.size(controller.metric)))
+                    .font(.system(size: 11, weight: .medium).monospacedDigit())
+                    .foregroundStyle(theme.textSecondary)
+            }
+        }
+    }
+
+    private func segment(_ node: FSNode, isCurrent: Bool) -> some View {
+        Button { controller.navigate(to: node) } label: {
+            Text(node.name)
+                .font(.system(size: 12, weight: isCurrent ? .semibold : .medium))
+                .foregroundStyle(isCurrent ? theme.textPrimary : theme.accent)
+                .lineLimit(1)
+        }
+        .buttonStyle(.plain)
+        .help(node.name)
     }
 }
 
@@ -254,9 +289,9 @@ private struct EmptyState: View {
     @Environment(\.theme) private var theme
 
     @State private var volumes: [Volume] = []
-    @State private var selected: Set<URL> = []
     @State private var vms: [VMMachine] = []
     @State private var engines: [ContainerEngine] = []
+    @State private var kubeContexts: [K8sContext] = []
 
     private let columns = [GridItem(.adaptive(minimum: 230, maximum: 320), spacing: 14)]
 
@@ -270,7 +305,7 @@ private struct EmptyState: View {
                     Text("MacDirStats")
                         .font(.system(size: 24, weight: .bold))
                         .foregroundStyle(theme.textPrimary)
-                    Text("Choose one or more disks to analyze")
+                    Text("Choose what to analyze")
                         .font(.system(size: 13))
                         .foregroundStyle(theme.textSecondary)
                 }
@@ -281,12 +316,7 @@ private struct EmptyState: View {
                 } else {
                     LazyVGrid(columns: columns, spacing: 14) {
                         ForEach(volumes) { volume in
-                            VolumeCard(volume: volume, isSelected: selected.contains(volume.id), theme: theme)
-                                .contentShape(RoundedRectangle(cornerRadius: 12))
-                                .onTapGesture { toggle(volume) }
-                                .simultaneousGesture(TapGesture(count: 2).onEnded {
-                                    app.scan(volumes: [volume])
-                                })
+                            VolumeCard(volume: volume, theme: theme) { app.scan(volumes: [volume]) }
                         }
                     }
                     .frame(maxWidth: 780)
@@ -312,22 +342,17 @@ private struct EmptyState: View {
                     }
                 }
 
-                VStack(spacing: 10) {
-                    Button(action: scanSelected) {
-                        Label(scanLabel, systemImage: "play.fill")
+                if !kubeContexts.isEmpty {
+                    section("Kubernetes") {
+                        LazyVGrid(columns: columns, spacing: 14) {
+                            ForEach(kubeContexts) { ctx in
+                                KubeContextCard(context: ctx, theme: theme) { app.analyzeKubernetes(context: ctx.name) }
+                            }
+                        }
                     }
-                    .buttonStyle(PrimaryButtonStyle())
-                    .disabled(selected.isEmpty)
-                    .opacity(selected.isEmpty ? 0.5 : 1)
-
-                    Button(action: app.openFolder) {
-                        Label("Choose a folder instead…", systemImage: "folder")
-                            .font(.system(size: 12))
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(theme.textSecondary)
                 }
-                .padding(.bottom, 40)
+
+                Color.clear.frame(height: 24)
             }
             .frame(maxWidth: .infinity)
             .padding(.horizontal, 40)
@@ -347,6 +372,7 @@ private struct EmptyState: View {
             // Detection shells out to podman/colima — keep it off the main thread.
             vms = await Task.detached(priority: .userInitiated) { VMProbe.detect() }.value
             engines = await Task.detached(priority: .userInitiated) { ContainerProbe.detect() }.value
+            kubeContexts = await Task.detached(priority: .userInitiated) { K8sProbe.contexts() }.value
         }
     }
 
@@ -362,32 +388,15 @@ private struct EmptyState: View {
         .frame(maxWidth: 780)
     }
 
-    private var scanLabel: String {
-        selected.count > 1 ? "Analyze \(selected.count) disks" : "Analyze"
-    }
-
-    private func toggle(_ volume: Volume) {
-        if selected.contains(volume.id) { selected.remove(volume.id) }
-        else { selected.insert(volume.id) }
-    }
-
-    private func scanSelected() {
-        let chosen = volumes.filter { selected.contains($0.id) }
-        if !chosen.isEmpty { app.scan(volumes: chosen) }
-    }
-
     private func reload() {
         volumes = Volume.mounted()
-        if selected.isEmpty, let preferred = volumes.first(where: { $0.isRoot }) ?? volumes.first {
-            selected = [preferred.id]
-        }
     }
 }
 
 private struct VolumeCard: View {
     let volume: Volume
-    let isSelected: Bool
     let theme: Theme
+    let action: () -> Void
     @State private var hovering = false
 
     var body: some View {
@@ -408,9 +417,6 @@ private struct VolumeCard: View {
                         .textCase(.uppercase)
                 }
                 Spacer()
-                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                    .font(.system(size: 16))
-                    .foregroundStyle(isSelected ? theme.accent : theme.separator)
             }
 
             GeometryReader { geo in
@@ -424,11 +430,12 @@ private struct VolumeCard: View {
             .frame(height: 6)
 
             HStack {
-                Text("\(Format.bytes(volume.used)) used")
+                Text("\(Format.bytes(volume.used)) used · \(Format.bytes(volume.available)) free")
                     .foregroundStyle(theme.textSecondary)
                 Spacer()
-                Text("\(Format.bytes(volume.available)) free")
-                    .foregroundStyle(theme.textSecondary)
+                Label("Analyze", systemImage: "play.fill")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(hovering ? theme.accent : theme.textSecondary)
             }
             .font(.system(size: 10).monospacedDigit())
         }
@@ -439,12 +446,11 @@ private struct VolumeCard: View {
         )
         .overlay(
             RoundedRectangle(cornerRadius: 12)
-                .strokeBorder(
-                    isSelected ? theme.accent : (hovering ? theme.textSecondary.opacity(0.4) : theme.separator),
-                    lineWidth: isSelected ? 2 : 1
-                )
+                .strokeBorder(hovering ? theme.accent : theme.separator, lineWidth: hovering ? 2 : 1)
         )
+        .contentShape(RoundedRectangle(cornerRadius: 12))
         .onHover { hovering = $0 }
+        .onTapGesture(perform: action)
     }
 
     private var usageColor: Color {
@@ -564,6 +570,50 @@ private struct ContainerEngineCard: View {
         .onHover { hovering = $0 }
         .onTapGesture(perform: action)
         .help("Analyze \(engine.displayName) images & containers")
+    }
+}
+
+private struct KubeContextCard: View {
+    let context: K8sContext
+    let theme: Theme
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 11) {
+            HStack(spacing: 10) {
+                Image(systemName: "sailboat.fill")
+                    .font(.system(size: 20)).foregroundStyle(theme.accent).frame(width: 32)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(context.name)
+                        .font(.system(size: 13, weight: .semibold)).foregroundStyle(theme.textPrimary)
+                        .lineLimit(1).truncationMode(.middle)
+                    Text("PVCs · usage · storage")
+                        .font(.system(size: 10, weight: .medium)).foregroundStyle(theme.textSecondary)
+                }
+                Spacer()
+                if context.isCurrent {
+                    Text("current").font(.system(size: 9, weight: .bold)).foregroundStyle(theme.accent)
+                        .padding(.horizontal, 5).padding(.vertical, 1)
+                        .background(Capsule().fill(theme.accent.opacity(0.16)))
+                }
+            }
+            HStack {
+                Text("Kube context").font(.system(size: 10)).foregroundStyle(theme.textSecondary)
+                Spacer()
+                Label("Analyze", systemImage: "play.fill")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(hovering ? theme.accent : theme.textSecondary)
+            }
+        }
+        .padding(14)
+        .background(RoundedRectangle(cornerRadius: 12).fill(theme.panelBackground))
+        .overlay(RoundedRectangle(cornerRadius: 12)
+            .strokeBorder(hovering ? theme.accent : theme.separator, lineWidth: hovering ? 2 : 1))
+        .contentShape(RoundedRectangle(cornerRadius: 12))
+        .onHover { hovering = $0 }
+        .onTapGesture(perform: action)
+        .help("Analyze PVC storage on \(context.name)")
     }
 }
 
