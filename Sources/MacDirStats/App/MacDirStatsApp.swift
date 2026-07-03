@@ -27,8 +27,7 @@ enum Entry {
             return
         }
         if let idx = args.firstIndex(of: "--scan"), idx + 1 < args.count {
-            HeadlessScan.run(paths: Array(args[(idx + 1)...]))
-            return
+            exit(HeadlessScan.run(paths: Array(args[(idx + 1)...])))
         }
         MacDirStatsApp.main()
     }

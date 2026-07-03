@@ -6,10 +6,18 @@ import Foundation
 /// Prints totals and timing, then exits. Lets the engine be validated without
 /// bringing up the GUI.
 enum HeadlessScan {
-    static func run(paths: [String]) {
+    /// Returns a process exit code so scripts/CI can tell a bad invocation from a
+    /// clean scan (a nonexistent path used to "succeed" with exit 0).
+    @discardableResult
+    static func run(paths: [String]) -> Int32 {
         guard !paths.isEmpty else {
             print("usage: MacDirStats --scan <path> [more paths ...]")
-            return
+            return 2
+        }
+        let fm = FileManager.default
+        for p in paths where !fm.fileExists(atPath: p) {
+            FileHandle.standardError.write(Data("error: path does not exist: \(p)\n".utf8))
+            return 1
         }
 
         let root: FSNode
@@ -67,6 +75,7 @@ enum HeadlessScan {
                              Format.bytes(row.physical) as NSString, Format.count(row.count) as NSString))
             }
         }
+        return 0
     }
 
     /// Headless VM scan that prints rising counts as the stream arrives — proves
