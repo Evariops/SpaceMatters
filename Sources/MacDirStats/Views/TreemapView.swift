@@ -77,20 +77,36 @@ struct TreemapView: View {
             // immediately instead of waiting out the double-click interval.
             .simultaneousGesture(
                 TapGesture(count: 2).onEnded {
-                    // Double-click a folder tile to dive in; double-click a leaf
-                    // (or the gaps) to pop back out — a mouse-only way to zoom out.
-                    if let hovered, hovered.node.isDirectory { controller.zoom(into: hovered.node) }
-                    else { controller.zoomOut() }
+                    // Double-click: open a file tile, dive into a folder tile, or
+                    // pop back out on a leaf/gap — a mouse-only way to zoom.
+                    if let hovered {
+                        if let file = hovered.file {
+                            if let base = controller.path(for: hovered.node) {
+                                controller.openItem((base == "/" ? "/" : base + "/") + file.name)
+                            }
+                        } else if hovered.node.isDirectory {
+                            controller.zoom(into: hovered.node)
+                        } else {
+                            controller.zoomOut()
+                        }
+                    } else {
+                        controller.zoomOut()
+                    }
                 }
             )
             .contextMenu {
-                if let node = hovered?.node { treemapMenu(for: node) }
+                if let hovered { treemapMenu(for: hovered) }
             }
             .overlay(alignment: .bottomLeading) {
                 if let hovered {
-                    HoverLabel(node: hovered.node, path: hoverPath(hovered.node), metric: controller.metric)
-                        .padding(8)
-                        .allowsHitTesting(false)
+                    if let file = hovered.file {
+                        HoverLabel(title: file.name, isDirectory: false, sizeText: Format.bytes(file.size))
+                            .padding(8).allowsHitTesting(false)
+                    } else {
+                        HoverLabel(title: hoverPath(hovered.node), isDirectory: hovered.node.isDirectory,
+                                   sizeText: Format.bytes(hovered.node.size(controller.metric)))
+                            .padding(8).allowsHitTesting(false)
+                    }
                 }
             }
             .accessibilityElement(children: .ignore)
@@ -113,7 +129,24 @@ struct TreemapView: View {
         }
         lastSize = size
         let rect = CGRect(origin: .zero, size: size).insetBy(dx: 1, dy: 1)
-        let result = TreemapLayout.compute(root: zoom, rect: rect, metric: controller.metric)
+
+        // SPEC-05 (B2): refine the zoom root's own files into individual tiles.
+        // The overview (root of the scan, or any level "from afar") stays folder-
+        // granular; only the folder you've entered shows its files.
+        var rootFiles: [FileTileInfo]? = nil
+        // Only post-scan: during a scan the count churns and would re-enumerate the
+        // folder's files every refresh. Files refine once the scan settles.
+        if controller.isHostScan && !controller.isScanning {
+            let items = controller.filesIn(zoom)
+            if !items.isEmpty {
+                rootFiles = items.map {
+                    FileTileInfo(name: $0.name, size: $0.size(controller.metric),
+                                 extName: OutlineRowView.extDisplay($0.name))
+                }
+            }
+        }
+
+        let result = TreemapLayout.compute(root: zoom, rect: rect, metric: controller.metric, rootFiles: rootFiles)
         let newTiles = result.tiles
 
         var maxSize: Int64 = 1
@@ -126,9 +159,11 @@ struct TreemapView: View {
         var newColors = [Color]()
         newColors.reserveCapacity(newTiles.count)
         for tile in newTiles {
-            // Colour by dominant file type (matches the legend); size → brightness.
+            // Colour by file type (matches the legend); size → brightness. File
+            // tiles use their own extension; directory tiles their dominant one.
             let weight = pow(Double(tileSize(tile)) / denom, 0.40)
-            newColors.append(theme.treemapTypeColor(extName: tile.node.dominantExt.displayName, weight: weight))
+            let extName = tile.file?.extName ?? tile.node.dominantExt.displayName
+            newColors.append(theme.treemapTypeColor(extName: extName, weight: weight))
         }
 
         tiles = newTiles
@@ -138,7 +173,8 @@ struct TreemapView: View {
     }
 
     private func tileSize(_ tile: TreemapTile) -> Int64 {
-        tile.isFileBlock ? tile.node.directFilesSize(controller.metric) : tile.node.size(controller.metric)
+        if let file = tile.file { return file.size }
+        return tile.isFileBlock ? tile.node.directFilesSize(controller.metric) : tile.node.size(controller.metric)
     }
 
     private func hitTest(_ point: CGPoint) -> TreemapTile? {
@@ -157,7 +193,20 @@ struct TreemapView: View {
     }
 
     @ViewBuilder
-    private func treemapMenu(for node: FSNode) -> some View {
+    private func treemapMenu(for tile: TreemapTile) -> some View {
+        if let file = tile.file, let base = controller.path(for: tile.node) {
+            // A single file of the zoom root (SPEC-05).
+            let path = (base == "/" ? "/" : base + "/") + file.name
+            Button { controller.openItem(path) } label: { Label("Open", systemImage: "arrow.up.forward.app") }
+            Button { controller.revealInFinder(path) } label: { Label("Reveal in Finder", systemImage: "folder") }
+            Button { controller.copyPath(path) } label: { Label("Copy Path", systemImage: "doc.on.doc") }
+        } else {
+            treemapDirMenu(for: tile.node)
+        }
+    }
+
+    @ViewBuilder
+    private func treemapDirMenu(for node: FSNode) -> some View {
         if node.isDirectory {
             Button { controller.zoom(into: node) } label: { Label("Zoom In", systemImage: "plus.magnifyingglass") }
         }
@@ -252,7 +301,9 @@ private struct TreemapCanvas: View, Equatable {
 
                 let dimmed: Bool
                 if let ext = highlightExt {
-                    dimmed = tile.node.dominantExt != ext
+                    // File tiles match on their own extension; folder tiles on their dominant one.
+                    let tileExt = tile.file?.extName ?? tile.node.dominantExt.displayName
+                    dimmed = tileExt != ext.displayName
                 } else if !searchMatchIDs.isEmpty {
                     dimmed = !isUnderMatch(tile.node)
                 } else {
@@ -266,10 +317,11 @@ private struct TreemapCanvas: View, Equatable {
                     ctx.stroke(path, with: .color(border), lineWidth: 0.6)
                 }
 
-                // Label big directory tiles.
-                if !dimmed, !tile.isFileBlock, r.width > 64, r.height > 22 {
+                // Label big directory + file tiles (not the aggregate block).
+                let label = tile.file?.name ?? (tile.isFileBlock ? nil : tile.node.name)
+                if !dimmed, let label, r.width > 64, r.height > 22 {
                     let labelRect = r.insetBy(dx: 5, dy: 3)
-                    var text = ctx.resolve(Text(tile.node.name)
+                    var text = ctx.resolve(Text(label)
                         .font(.system(size: 10.5, weight: .medium)))
                     text.shading = labelColor
                     ctx.draw(text, in: CGRect(x: labelRect.minX, y: labelRect.minY,
@@ -282,20 +334,20 @@ private struct TreemapCanvas: View, Equatable {
 }
 
 private struct HoverLabel: View {
-    let node: FSNode
-    let path: String
-    let metric: SizeMetric
+    let title: String
+    let isDirectory: Bool
+    let sizeText: String
     @Environment(\.theme) private var theme
 
     var body: some View {
         HStack(spacing: 6) {
-            Image(systemName: node.isDirectory ? "folder.fill" : "doc.fill")
+            Image(systemName: isDirectory ? "folder.fill" : "doc.fill")
                 .foregroundStyle(theme.accent)
-            Text(path)
+            Text(title)
                 .foregroundStyle(theme.textPrimary)
                 .lineLimit(1)
                 .truncationMode(.head)
-            Text(Format.bytes(node.size(metric)))
+            Text(sizeText)
                 .foregroundStyle(theme.textSecondary)
         }
         .font(.system(size: 11, weight: .medium))

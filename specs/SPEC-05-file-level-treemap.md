@@ -2,6 +2,15 @@
 
 > **Findings** : S5 (README l'évoque), complète A8 (couleur de tuile). Optionnel.
 > **Contrainte produit (imposée)** : la **vue globale reste strictement par dossier** — lisibilité prioritaire. Le détail fichier est une propriété du **niveau de zoom courant**, jamais de la carte entière.
+> **Statut** : ✅ **IMPLÉMENTÉ & LIVE-VÉRIFIÉ** (Axe B2 — tuiles-fichiers au zoomRoot, sous-dossiers agrégés).
+
+## 0. Résultat d'implémentation
+
+- **Axe B2** : `TreemapLayout.compute(..., rootFiles:)` — seuls les fichiers directs du **zoomRoot** (depth 0) sont matérialisés en tuiles individuelles ; les sous-dossiers restent agrégés (récursion avec `files: nil`). L'overview reste strictement par dossier.
+- **`TreemapTile.file: FileTileInfo?`** (nom, taille au métrique courant, extension) porte la tuile-fichier ; couleur par **extension du fichier** (`treemapTypeColor`, cohérent avec la légende), label = nom du fichier, hover/menu/double-clic (Open/Reveal/Copy) dédiés. **Live-vérifié** : `demo05` montre video.mp4/archive.zip/photo.png/document.pdf/notes.txt en tuiles colorées distinctes, `subfolder` agrégé.
+- **Résidu** : si la liste de fichiers est plafonnée (`maxFilesPerFolder`), le reliquat reste un bloc agrégé « other files » (proportions exactes).
+- **Mémoire** : les fichiers viennent du `fileCache` **borné** existant (≤ 2000/dossier, par répertoire visité), rempli au zoom-in via `filesIn(zoomRoot)`. Non matérialisé **pendant** le scan (évite la ré-énumération à 10 Hz) — raffinement une fois le scan stabilisé.
+- **Test** : `zoomRootRefinesIntoFileTiles` (zoomRoot → N tuiles-fichiers + sous-dossier agrégé ; overview → 1 bloc agrégé, 0 tuile-fichier).
 
 ## 1. Objectif
 
