@@ -24,7 +24,10 @@ struct TreemapView: View {
                     colors: colors,
                     border: theme.treemapBorder,
                     generation: generation,
-                    isDark: theme.isDark
+                    isDark: theme.isDark,
+                    highlightExt: controller.selectedExt,
+                    searchMatchIDs: controller.searchMatchIDs,
+                    highlightVersion: controller.highlightVersion
                 )
                 .equatable()
 
@@ -149,29 +152,84 @@ struct TreemapView: View {
     }
 }
 
-/// The drawn treemap. Equatable on `generation`/`isDark` so it only re-renders
-/// when the layout actually changed — hover and selection overlays live in the
-/// parent and never force a full redraw.
+/// The drawn treemap. Equatable on the layout `generation` / `isDark` /
+/// `highlightVersion` so it only re-renders when something that affects the
+/// pixels changed — hover and selection overlays live in the parent.
+///
+/// Each tile gets a soft "cushion" sheen (a light-top / dark-bottom gradient) for
+/// a pseudo-3D look, a name label when it's big enough, and dims when a file-type
+/// filter is active and it doesn't match.
 private struct TreemapCanvas: View, Equatable {
     let tiles: [TreemapTile]
     let colors: [Color]
     let border: Color
     let generation: Int
     let isDark: Bool
+    let highlightExt: ExtKey?
+    let searchMatchIDs: Set<ObjectIdentifier>
+    let highlightVersion: Int
 
     static func == (lhs: TreemapCanvas, rhs: TreemapCanvas) -> Bool {
-        lhs.generation == rhs.generation && lhs.isDark == rhs.isDark
+        lhs.generation == rhs.generation && lhs.isDark == rhs.isDark && lhs.highlightVersion == rhs.highlightVersion
     }
+
+    private func isUnderMatch(_ node: FSNode) -> Bool {
+        var current: FSNode? = node
+        while let n = current {
+            if searchMatchIDs.contains(ObjectIdentifier(n)) { return true }
+            current = n.parent
+        }
+        return false
+    }
+
+    private static let cushion = Gradient(stops: [
+        .init(color: .white.opacity(0.16), location: 0),
+        .init(color: .clear, location: 0.45),
+        .init(color: .black.opacity(0.20), location: 1),
+    ])
 
     var body: some View {
         Canvas(rendersAsynchronously: true) { ctx, _ in
+            let labelColor = GraphicsContext.Shading.color(.white.opacity(0.92))
             for i in tiles.indices {
-                let r = tiles[i].rect
+                let tile = tiles[i]
+                let r = tile.rect
                 if r.width <= 0.5 || r.height <= 0.5 { continue }
                 let path = Path(r)
+
                 ctx.fill(path, with: .color(colors[i]))
+
+                // Cushion sheen (skip the tiniest tiles for perf/clarity).
+                if r.width > 6 && r.height > 6 {
+                    ctx.fill(path, with: .linearGradient(Self.cushion,
+                                                         startPoint: CGPoint(x: r.midX, y: r.minY),
+                                                         endPoint: CGPoint(x: r.midX, y: r.maxY)))
+                }
+
+                let dimmed: Bool
+                if let ext = highlightExt {
+                    dimmed = tile.node.dominantExt != ext
+                } else if !searchMatchIDs.isEmpty {
+                    dimmed = !isUnderMatch(tile.node)
+                } else {
+                    dimmed = false
+                }
+                if dimmed {
+                    ctx.fill(path, with: .color(.black.opacity(0.72)))
+                }
+
                 if r.width > 3 && r.height > 3 {
                     ctx.stroke(path, with: .color(border), lineWidth: 0.6)
+                }
+
+                // Label big directory tiles.
+                if !dimmed, !tile.isFileBlock, r.width > 64, r.height > 22 {
+                    let labelRect = r.insetBy(dx: 5, dy: 3)
+                    var text = ctx.resolve(Text(tile.node.name)
+                        .font(.system(size: 10.5, weight: .medium)))
+                    text.shading = labelColor
+                    ctx.draw(text, in: CGRect(x: labelRect.minX, y: labelRect.minY,
+                                              width: labelRect.width, height: 14))
                 }
             }
         }

@@ -179,6 +179,9 @@ private struct ToolbarBar: View {
     let app: AppModel
     @Binding var isDark: Bool
     @Environment(\.theme) private var theme
+    @State private var searchText = ""
+    @FocusState private var searchFocused: Bool
+    @State private var searchTask: Task<Void, Never>?
 
     var body: some View {
         HStack(spacing: 12) {
@@ -212,6 +215,13 @@ private struct ToolbarBar: View {
             Spacer()
 
             if controller.root != nil {
+                searchField
+                Button("") { searchFocused = true }
+                    .keyboardShortcut("f", modifiers: .command)
+                    .opacity(0).frame(width: 0)
+            }
+
+            if controller.root != nil {
                 Picker("", selection: Binding(get: { controller.metric }, set: { controller.metric = $0 })) {
                     ForEach(SizeMetric.allCases) { Text($0.label).tag($0) }
                 }
@@ -240,6 +250,37 @@ private struct ToolbarBar: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
         .background(theme.panelBackground)
+    }
+
+    private var searchField: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "magnifyingglass").font(.system(size: 11)).foregroundStyle(theme.textSecondary)
+            TextField("Search folders…", text: $searchText)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12))
+                .frame(width: 150)
+                .focused($searchFocused)
+                .onSubmit { controller.setSearch(searchText) }
+                .onChange(of: searchText) { _, query in debounceSearch(query) }
+            if !searchText.isEmpty {
+                Button { searchText = ""; controller.setSearch("") } label: {
+                    Image(systemName: "xmark.circle.fill").font(.system(size: 11))
+                }
+                .buttonStyle(.plain).foregroundStyle(theme.textSecondary)
+            }
+        }
+        .padding(.horizontal, 8).padding(.vertical, 4)
+        .background(RoundedRectangle(cornerRadius: 7).fill(theme.windowBackground))
+        .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(searchFocused ? theme.accent : theme.separator))
+    }
+
+    private func debounceSearch(_ query: String) {
+        searchTask?.cancel()
+        searchTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            if Task.isCancelled { return }
+            controller.setSearch(query)
+        }
     }
 }
 

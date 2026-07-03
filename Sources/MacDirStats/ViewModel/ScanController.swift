@@ -43,6 +43,54 @@ final class ScanController {
     /// Set to ask the outline to scroll a node into view; cleared once handled.
     var revealTarget: FSNode?
 
+    /// A file type picked in the breakdown panel → its tiles are spotlighted in
+    /// the treemap (everything else dims). `nil` = no type filter.
+    var selectedExt: ExtKey?
+    /// Bumped whenever the treemap highlight (type filter) changes, so the cached
+    /// treemap canvas knows to redraw.
+    private(set) var highlightVersion: Int = 0
+
+    func toggleExt(_ ext: ExtKey) {
+        selectedExt = (selectedExt == ext) ? nil : ext
+        if selectedExt != nil { searchQuery = ""; searchDirect = []; searchPath = [] }
+        highlightVersion &+= 1
+    }
+
+    // MARK: Search
+
+    var searchQuery = ""
+    /// Directories whose name matched (bright in the treemap, bold in the tree).
+    @ObservationIgnored private(set) var searchDirect: Set<ObjectIdentifier> = []
+    /// Matches + their ancestors — the pruned tree shown while searching.
+    @ObservationIgnored private var searchPath: Set<ObjectIdentifier> = []
+
+    var isSearching: Bool { !searchQuery.isEmpty }
+    func isSearchMatch(_ node: FSNode) -> Bool { searchDirect.contains(ObjectIdentifier(node)) }
+    var searchMatchIDs: Set<ObjectIdentifier> { searchDirect }
+
+    func setSearch(_ query: String) {
+        searchQuery = query
+        selectedExt = nil
+        highlightVersion &+= 1
+        guard !query.isEmpty, let root else {
+            searchDirect = []; searchPath = []; bump(); return
+        }
+        var direct = Set<ObjectIdentifier>()
+        var path = Set<ObjectIdentifier>()
+        func walk(_ node: FSNode) {
+            if node.name.range(of: query, options: .caseInsensitive) != nil {
+                direct.insert(ObjectIdentifier(node))
+                var p: FSNode? = node
+                while let cur = p { path.insert(ObjectIdentifier(cur)); p = cur.parent }
+            }
+            for child in node.children { walk(child) }
+        }
+        walk(root)
+        searchDirect = direct
+        searchPath = path
+        bump()
+    }
+
     /// True for local host scans; false for VM scans (whose paths aren't host
     /// paths, so Finder/Trash actions and on-demand file listing don't apply).
     private(set) var isHostScan = true
@@ -157,6 +205,8 @@ final class ScanController {
         self.selectedRowID = .dir(ObjectIdentifier(root))
         self.expanded = [root]
         self.revealTarget = nil
+        self.selectedExt = nil
+        self.searchQuery = ""; self.searchDirect = []; self.searchPath = []
         self.rootPath = displayPath
         self.rootName = root.name
         self.scanner = scanner
@@ -347,6 +397,24 @@ final class ScanController {
     /// expanded folder's files mixed in, biggest-first. O(visible), not O(tree).
     func visibleRows() -> [OutlineRow] {
         guard let root else { return [] }
+
+        // Search mode: show only the pruned path tree (matches + ancestors),
+        // fully expanded, directories only.
+        if isSearching {
+            var out: [OutlineRow] = []
+            func walk(_ node: FSNode, depth: Int, siblingMax: Int64) {
+                guard searchPath.contains(ObjectIdentifier(node)) else { return }
+                let kids = sortedChildren(node).filter { searchPath.contains(ObjectIdentifier($0)) }
+                out.append(OutlineRow(
+                    kind: .directory(node), depth: depth, siblingMax: siblingMax,
+                    isExpandable: false, isExpanded: !kids.isEmpty, id: .dir(ObjectIdentifier(node))))
+                let childMax = max(kids.first?.size(metric) ?? 1, 1)
+                for kid in kids { walk(kid, depth: depth + 1, siblingMax: childMax) }
+            }
+            walk(root, depth: 0, siblingMax: max(root.size(metric), 1))
+            return out
+        }
+
         var out: [OutlineRow] = []
         out.reserveCapacity(256)
 

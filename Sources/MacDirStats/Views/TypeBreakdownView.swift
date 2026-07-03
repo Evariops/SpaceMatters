@@ -14,6 +14,12 @@ struct TypeBreakdownView: View {
                 Text("File types")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(theme.textSecondary)
+                if controller.selectedExt != nil {
+                    Button { controller.toggleExt(controller.selectedExt!) } label: {
+                        Text("clear filter").font(.system(size: 10, weight: .medium)).foregroundStyle(theme.accent)
+                    }
+                    .buttonStyle(.plain)
+                }
                 Spacer()
                 Text("\(rows.count)")
                     .font(.system(size: 10).monospacedDigit())
@@ -27,7 +33,10 @@ struct TypeBreakdownView: View {
             ScrollView {
                 LazyVStack(spacing: 0) {
                     ForEach(rows) { row in
-                        TypeRow(row: row, metric: controller.metric, maxSize: max(maxSize, 1))
+                        TypeRow(row: row, metric: controller.metric, maxSize: max(maxSize, 1),
+                                isSelected: controller.selectedExt == row.key) {
+                            controller.toggleExt(row.key)
+                        }
                     }
                 }
             }
@@ -40,6 +49,8 @@ private struct TypeRow: View {
     let row: ExtRow
     let metric: SizeMetric
     let maxSize: Int64
+    let isSelected: Bool
+    let onTap: () -> Void
     @Environment(\.theme) private var theme
     @State private var hovering = false
 
@@ -81,7 +92,9 @@ private struct TypeRow: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 4)
-        .background(hovering ? theme.rowHover : .clear)
+        .background(isSelected ? theme.rowSelected : (hovering ? theme.rowHover : .clear))
+        .contentShape(Rectangle())
+        .onTapGesture(perform: onTap)
         .onHover { hovering = $0 }
     }
 }
