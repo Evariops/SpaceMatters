@@ -1,8 +1,10 @@
 # Exécution du plan — état de complétion
 
 > **Date** : 2026-07-03 · **Base** : [PLAN-ACTION.md](PLAN-ACTION.md).
-> **Branche** : `plan-execution` · 8 commits (Phase 0 → tests).
-> Chaque changement compile (`swift build`) et la suite (`swift test`, 7 tests) passe. Les correctifs d'intégrité (A1, A2) sont **vérifiés empiriquement** (scan headless vs `du`).
+> **Branche** : `plan-execution` · 10 commits (Phase 0 → tests + vérif comportementale).
+> Chaque changement compile (`swift build`) et la suite (`swift test`, **10 tests**) passe. Les correctifs d'intégrité (A1, A2) sont **vérifiés empiriquement** (scan headless vs `du`).
+>
+> **Lancement réel** : l'app a été **lancée** (`--open <fixture>`) et tourne sans crash. Le pilotage/capture UI interactif n'est **pas** possible dans cet environnement (permissions macOS Screen Recording et Accessibility non accordées au contexte : `screencapture` → « could not create image from display », `osascript` System Events → erreur `-1719`). La logique GUI-adjacente (navigation, zoom, suppression) est donc vérifiée par des **tests ViewModel** qui pilotent un vrai `ScanController` sur un arbre scanné (`NavigationTests` : B1, F2, A7, zoomOut, suppressions async), pas par des clics simulés.
 
 ## Résumé
 
