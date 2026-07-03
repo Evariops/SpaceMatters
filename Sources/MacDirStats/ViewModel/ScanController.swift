@@ -512,13 +512,35 @@ final class ScanController {
             a.fileCount.wrappingAdd(-count, ordering: .relaxed)
             p = a.parent
         }
+
+        // Lift any navigation state that points into the subtree we're about to
+        // free onto the surviving parent, and drop expanded/reveal references to
+        // it. Must run *before* detaching, while the parent chain is intact — this
+        // is what prevents the use-after-free through dangling `parent` pointers.
+        let survivor = node.parent
+        if let z = zoomRoot, z === node || Self.isDescendant(z, of: node) { zoomRoot = survivor }
+        if let s = selection, s === node || Self.isDescendant(s, of: node) {
+            selection = survivor
+            selectedRowID = survivor.map { .dir(ObjectIdentifier($0)) }
+        }
+        if let r = revealTarget, r === node || Self.isDescendant(r, of: node) { revealTarget = nil }
+        expanded = expanded.filter { $0 !== node && !Self.isDescendant($0, of: node) }
+
         node.parent?.removeChild(node)
-        expanded.remove(node)
-        if selection === node { selection = node.parent }
         sortCache.removeAll(); fileCache.removeAll()
         refreshTotals()
         bump()
         return true
+    }
+
+    /// Whether `node` lies strictly below `ancestor` in the tree.
+    private static func isDescendant(_ node: FSNode, of ancestor: FSNode) -> Bool {
+        var cur = node.parent
+        while let n = cur {
+            if n === ancestor { return true }
+            cur = n.parent
+        }
+        return false
     }
 
     @discardableResult

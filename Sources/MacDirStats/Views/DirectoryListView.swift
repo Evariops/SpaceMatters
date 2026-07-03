@@ -185,10 +185,14 @@ private struct OutlineRowView: View {
                 Button { controller.revealInFinder(path) } label: { Label("Reveal in Finder", systemImage: "folder") }
                 Button { controller.copyPath(path) } label: { Label("Copy Path", systemImage: "doc.on.doc") }
                 Divider()
+                // Deleting while the scan is still running would corrupt totals:
+                // queued workers keep feeding the detached subtree's ancestors.
                 Button { moveToTrash() } label: { Label("Move to Trash", systemImage: "trash") }
+                    .disabled(controller.isScanning)
                 Button(role: .destructive, action: requestDelete) {
                     Label("Delete Permanently…", systemImage: "trash.slash")
                 }
+                .disabled(controller.isScanning)
             } else {
                 // VM scan: paths live inside the VM, so host actions don't apply.
                 Button { controller.copyPath(path) } label: { Label("Copy Path (in VM)", systemImage: "doc.on.doc") }

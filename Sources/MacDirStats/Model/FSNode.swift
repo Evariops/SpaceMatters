@@ -15,7 +15,11 @@ import Synchronization
 /// "au fil de l'eau".
 final class FSNode {
     let name: String
-    unowned(unsafe) let parent: FSNode?
+    // `unowned` (not `unowned(unsafe)`): the tree is retained top-down via
+    // `_children`, so a surviving descendant whose ancestor was detached would
+    // otherwise dangle. The liveness check costs nothing next to the syscalls and
+    // turns any such bug into a diagnosable trap instead of silent corruption.
+    unowned let parent: FSNode?
     let isDirectory: Bool
 
     /// Subtree totals — sum of direct files of this node and all descendants.
@@ -23,14 +27,26 @@ final class FSNode {
     let aggPhysical = Atomic<Int64>(0)
     let fileCount = Atomic<Int64>(0)
 
-    /// This directory's own immediate files (set once, before `setChildren`).
-    private(set) var directFilesLogical: Int64 = 0
-    private(set) var directFilesPhysical: Int64 = 0
-    private(set) var directFileCount: Int64 = 0
+    /// This directory's own immediate files. Atomic so the UI can read live
+    /// totals at refresh rate while a worker is still filling them in — a node is
+    /// published into its parent's `_children` before its own fields are set.
+    private let _directFilesLogical = Atomic<Int64>(0)
+    private let _directFilesPhysical = Atomic<Int64>(0)
+    private let _directFileCount = Atomic<Int64>(0)
+
+    var directFilesLogical: Int64 { _directFilesLogical.load(ordering: .relaxed) }
+    var directFilesPhysical: Int64 { _directFilesPhysical.load(ordering: .relaxed) }
+    var directFileCount: Int64 { _directFileCount.load(ordering: .relaxed) }
 
     /// Extension that accounts for the most bytes among this directory's direct
-    /// files — used to colour the treemap by file type.
-    private(set) var dominantExt: ExtKey = .none
+    /// files — used to colour the treemap by file type. Guarded by `gTreeLock`:
+    /// it's a 16-byte value a worker writes and the UI reads, so a plain field
+    /// could tear (wrong tile colour).
+    private var _dominantExt: ExtKey = .none
+    var dominantExt: ExtKey {
+        gTreeLock.lock(); defer { gTreeLock.unlock() }
+        return _dominantExt
+    }
 
     private var _children: [FSNode] = []
     private var _scanned = false
@@ -66,18 +82,22 @@ final class FSNode {
     }
 
     /// Set the dominant file type (used by streamed scans, which compute it live).
-    func updateDominantExt(_ ext: ExtKey) { dominantExt = ext }
+    func updateDominantExt(_ ext: ExtKey) {
+        gTreeLock.lock(); _dominantExt = ext; gTreeLock.unlock()
+    }
 
     /// Detach a child (after it's been trashed/deleted on disk).
     func removeChild(_ child: FSNode) {
         gTreeLock.lock(); _children.removeAll { $0 === child }; gTreeLock.unlock()
     }
 
-    /// Adjust this directory's own-file totals (after a file was removed).
+    /// Adjust this directory's own-file totals (after a file was removed). Single
+    /// writer (MainActor post-scan, or the streamed reader thread), so a plain
+    /// load/store on the atomics is race-free against the UI's atomic reads.
     func adjustDirectFiles(logical: Int64, physical: Int64, count: Int64) {
-        directFilesLogical = max(0, directFilesLogical + logical)
-        directFilesPhysical = max(0, directFilesPhysical + physical)
-        directFileCount = max(0, directFileCount + count)
+        _directFilesLogical.store(max(0, directFilesLogical + logical), ordering: .relaxed)
+        _directFilesPhysical.store(max(0, directFilesPhysical + physical), ordering: .relaxed)
+        _directFileCount.store(max(0, directFileCount + count), ordering: .relaxed)
     }
 
     /// Called once by the owning worker after a directory's entries are read.
@@ -88,11 +108,11 @@ final class FSNode {
         fileCount: Int64,
         dominantExt: ExtKey = .none
     ) {
-        directFilesLogical = filesLogical
-        directFilesPhysical = filesPhysical
-        directFileCount = fileCount
-        self.dominantExt = dominantExt
+        _directFilesLogical.store(filesLogical, ordering: .relaxed)
+        _directFilesPhysical.store(filesPhysical, ordering: .relaxed)
+        _directFileCount.store(fileCount, ordering: .relaxed)
         gTreeLock.lock()
+        _dominantExt = dominantExt
         _children = children
         _scanned = true
         gTreeLock.unlock()

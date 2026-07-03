@@ -13,6 +13,11 @@ enum FSAttr {
     static let cmnObjType: UInt32       = 0x0000_0008
     static let cmnError: UInt32         = 0x2000_0000
 
+    // Directory attribute bits
+    static let dirMountStatus: UInt32   = 0x0000_0004
+    // ATTR_DIR_MOUNTSTATUS flags
+    static let mntStatusMountPoint: UInt32 = 0x0000_0001
+
     // File attribute bits
     static let fileTotalSize: UInt32    = 0x0000_0002 // logical size, all forks
     static let fileAllocSize: UInt32    = 0x0000_0004 // on-disk size, all forks
@@ -29,6 +34,9 @@ struct BulkEntry {
     let name: UnsafeRawPointer
     let nameLength: Int
     let isDirectory: Bool
+    /// True when this directory is the mount point of another filesystem — the
+    /// scanner uses it to stay on one volume (`-xdev` semantics).
+    let isMountPoint: Bool
     let logicalSize: Int64
     let physicalSize: Int64
 }
@@ -46,6 +54,7 @@ func enumerateDirectory(
     var attrList = attrlist()
     attrList.bitmapcount = 5 // ATTR_BIT_MAP_COUNT
     attrList.commonattr = FSAttr.cmnReturnedAttrs | FSAttr.cmnName | FSAttr.cmnObjType | FSAttr.cmnError
+    attrList.dirattr = FSAttr.dirMountStatus
     attrList.fileattr = FSAttr.fileTotalSize | FSAttr.fileAllocSize
 
     var errorCount = 0
@@ -54,7 +63,8 @@ func enumerateDirectory(
         let count = withUnsafeMutablePointer(to: &attrList) { alPtr in
             getattrlistbulk(fd, alPtr, buffer, bufferSize, 0)
         }
-        if count <= 0 { break } // 0 == done, -1 == error (errno set)
+        if count == 0 { break }                    // no more entries
+        if count < 0 { errorCount += 1; break }    // EACCES/EIO/volume gone: partial listing, not a clean end
 
         var entry = buffer
         for _ in 0..<count {
@@ -63,8 +73,21 @@ func enumerateDirectory(
 
             // attribute_set_t: commonattr, volattr, dirattr, fileattr, forkattr
             let commonReturned = entry.loadUnaligned(fromByteOffset: off, as: UInt32.self)
+            let dirReturned = entry.loadUnaligned(fromByteOffset: off + 8, as: UInt32.self)
             let fileReturned = entry.loadUnaligned(fromByteOffset: off + 12, as: UInt32.self)
             off += 20
+
+            // ATTR_CMN_ERROR is packed immediately after ATTR_CMN_RETURNED_ATTRS —
+            // *before* the name — per getattrlistbulk(2), an explicit exception to
+            // the usual "order follows bit value" rule. Reading it first keeps every
+            // later offset aligned even for entries the kernel could not stat;
+            // otherwise an error entry misaligns the name attr_ref and can read out
+            // of bounds (worse under -Ounchecked).
+            var entryError: UInt32 = 0
+            if commonReturned & FSAttr.cmnError != 0 {
+                entryError = entry.loadUnaligned(fromByteOffset: off, as: UInt32.self)
+                off += 4
+            }
 
             var namePtr: UnsafeRawPointer? = nil
             var nameLen = 0
@@ -72,9 +95,12 @@ func enumerateDirectory(
                 let nameOffset = entry.loadUnaligned(fromByteOffset: off, as: Int32.self)
                 let rawLen = entry.loadUnaligned(fromByteOffset: off + 4, as: UInt32.self)
                 let nameByteOffset = off + Int(nameOffset)
-                namePtr = UnsafeRawPointer(entry.advanced(by: nameByteOffset))
-                nameLen = Int(rawLen)
-                if nameLen > 0 { nameLen -= 1 } // strip trailing NUL
+                // Defensive: only trust the name if its bytes sit inside this entry.
+                if nameOffset >= 0, rawLen > 0,
+                   nameByteOffset + Int(rawLen) <= Int(entryLength) {
+                    namePtr = UnsafeRawPointer(entry.advanced(by: nameByteOffset))
+                    nameLen = Int(rawLen) - 1 // strip trailing NUL
+                }
                 off += 8
             }
 
@@ -84,9 +110,12 @@ func enumerateDirectory(
                 off += 4
             }
 
-            var entryError: UInt32 = 0
-            if commonReturned & FSAttr.cmnError != 0 {
-                entryError = entry.loadUnaligned(fromByteOffset: off, as: UInt32.self)
+            // Directory attributes follow the common block. Only directories carry
+            // ATTR_DIR_MOUNTSTATUS; for files the bit is simply absent.
+            var isMountPoint = false
+            if dirReturned & FSAttr.dirMountStatus != 0 {
+                let mountStatus = entry.loadUnaligned(fromByteOffset: off, as: UInt32.self)
+                isMountPoint = (mountStatus & FSAttr.mntStatusMountPoint) != 0
                 off += 4
             }
 
@@ -109,6 +138,7 @@ func enumerateDirectory(
                     name: np,
                     nameLength: nameLen,
                     isDirectory: objType == FSAttr.vdir,
+                    isMountPoint: isMountPoint,
                     logicalSize: logical,
                     physicalSize: physical
                 ))

@@ -35,6 +35,11 @@ final class DirectoryScanner: ScanBackend {
     /// prompts and double-counting.
     private let skipPaths: Set<String>
 
+    /// The scan's own starting points. A mounted volume is only descended into
+    /// when it's one of these (the user asked for it); otherwise crossing a mount
+    /// is suppressed to keep totals on a single filesystem.
+    private let seedPaths: Set<String>
+
     private let workerCount: Int
     private var threads: [Thread] = []
 
@@ -55,6 +60,7 @@ final class DirectoryScanner: ScanBackend {
         self.root = root
         self.seeds = seeds
         self.skipPaths = skipPaths
+        self.seedPaths = Set(seeds.map(\.path))
         let cores = ProcessInfo.processInfo.activeProcessorCount
         // Scanning APFS/SSD is throughput-bound on syscalls; oversubscribe a
         // little but keep it bounded.
@@ -197,6 +203,9 @@ final class DirectoryScanner: ScanBackend {
                 )
                 let childPath = pathPrefix + name
                 if skipPaths.contains(childPath) { return } // network mount / Data firmlink
+                // Stay on one volume: don't descend into a mounted filesystem
+                // (swap, Preboot, external disks, DMGs) unless the user seeded it.
+                if entry.isMountPoint && !seedPaths.contains(childPath) { return }
                 let child = FSNode(name: name, parent: item.node, isDirectory: true)
                 childNodes.append(child)
                 childItems.append(WorkItem(path: childPath, node: child))
