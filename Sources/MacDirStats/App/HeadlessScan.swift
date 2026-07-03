@@ -96,7 +96,9 @@ enum HeadlessScan {
         print("scanning \(machine.runtime.rawValue) (\(vmScope.rawValue)) root=\(cmd.rootPath)")
 
         let root = FSNode(name: machine.name, parent: nil)
-        let scanner = CommandScanner(root: root, rootPath: cmd.rootPath, executable: cmd.executable, arguments: cmd.arguments)
+        let scanner = CommandScanner(
+            root: root, rootPath: cmd.rootPath, executable: cmd.executable, arguments: cmd.arguments,
+            source: .vm("\(machine.runtime.rawValue) — \(vmScope.rawValue)"))
         let start = Date()
         scanner.start()
 

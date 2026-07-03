@@ -223,11 +223,31 @@ final class ScanController {
         let cmd = VMProbe.scanCommand(machine: machine, scope: scope)
         let label = scope == .full ? "VM" : "Containers"
         let node = FSNode(name: "\(machine.runtime.rawValue) — \(label)", parent: nil)
-        let scanner = CommandScanner(root: node, rootPath: cmd.rootPath, executable: cmd.executable, arguments: cmd.arguments)
+        let scanner = CommandScanner(
+            root: node, rootPath: cmd.rootPath, executable: cmd.executable, arguments: cmd.arguments,
+            source: .vm("\(machine.runtime.rawValue) — \(label)"))
         startBackend(
             root: node,
             scanner: scanner,
             displayPath: cmd.rootPath,
+            isHost: false,
+            nodePaths: [ObjectIdentifier(node): cmd.rootPath]
+        )
+    }
+
+    /// Scan an arbitrary host over SSH (streamed `find`, read-only) — SPEC-06.
+    func scanRemote(_ target: SSHTarget) {
+        lastVolumes = []
+        lastVM = nil
+        let cmd = target.command()
+        let node = FSNode(name: target.host.isEmpty ? "Remote" : target.host, parent: nil)
+        let scanner = CommandScanner(
+            root: node, rootPath: cmd.rootPath, executable: cmd.executable, arguments: cmd.arguments,
+            source: .remote(target.label))
+        startBackend(
+            root: node,
+            scanner: scanner,
+            displayPath: target.label,
             isHost: false,
             nodePaths: [ObjectIdentifier(node): cmd.rootPath]
         )

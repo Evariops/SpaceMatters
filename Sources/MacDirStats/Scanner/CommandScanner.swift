@@ -15,6 +15,7 @@ final class CommandScanner: ScanBackend {
     private let rootPath: String
     private let executable: String
     private let arguments: [String]
+    let source: ScanSource
 
     private let dirCountAtomic = Atomic<Int64>(0)
     private let errAtomic = Atomic<Int64>(0)
@@ -37,11 +38,16 @@ final class CommandScanner: ScanBackend {
     private let extLock = NSLock()
     private var extStats: [ExtKey: ExtStat] = [:]
 
-    init(root: FSNode, rootPath: String, executable: String, arguments: [String]) {
+    init(root: FSNode, rootPath: String, executable: String, arguments: [String], source: ScanSource) {
         self.root = root
         self.rootPath = rootPath
         self.executable = executable
         self.arguments = arguments
+        self.source = source
+    }
+
+    func diagnostics() -> String {
+        "\(executable) \(arguments.joined(separator: " "))"
     }
 
     // MARK: ScanBackend

@@ -58,6 +58,12 @@ final class AppModel {
         if filesystem.root != nil { route = .filesystem }
     }
 
+    /// Scan an arbitrary host over SSH (streamed `find`, read-only) — SPEC-06.
+    func scanRemote(_ target: SSHTarget) {
+        route = .filesystem
+        filesystem.scanRemote(target)
+    }
+
     // MARK: Container mode
 
     func analyzeContainers(_ engine: ContainerEngine) {

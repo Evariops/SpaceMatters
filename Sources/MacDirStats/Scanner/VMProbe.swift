@@ -95,7 +95,7 @@ enum VMProbe {
     /// stream continuously for a reactive UI.
     static func scanCommand(machine: VMMachine, scope: VMScope) -> (executable: String, arguments: [String], rootPath: String) {
         let rootPath = scope == .full ? "/" : containerStoragePath(for: machine)
-        let remote = "sudo stdbuf -o0 find \(rootPath) -xdev -printf '%y\\t%b\\t%s\\t%p\\0'"
+        let remote = RemoteFind.command(rootPath: rootPath, sudo: true) // shared find spec (SPEC-06)
         switch machine.runtime {
         case .podman:
             return (machine.executable, ["machine", "ssh", machine.name, remote], rootPath)

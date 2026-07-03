@@ -1,6 +1,16 @@
 # SPEC-06 — Backends de scan pluggables
 
 > **Findings** : S6. H1 (Docker) est **déjà fait**. Étend le contrat `ScanBackend`.
+> **Statut** : ✅ **IMPLÉMENTÉ** — contrat enrichi + backend SSH générique + carte splash.
+
+## 0. Résultat d'implémentation
+
+- **Contrat enrichi** ([ScanBackend.swift](../Sources/MacDirStats/Scanner/ScanBackend.swift)) : `var source: ScanSource { get }` (`host | vm | remote | archive`, avec `isReadOnly`/`label`) + `func diagnostics() -> String`, defaults fournis. L'UI gate déjà les actions destructrices sur `!isHostScan` (⇒ remote/vm lecture seule).
+- **Commande `find` partagée** : `RemoteFind.command(rootPath:sudo:)` + `printf` centralisé — VMProbe **et** SSH le réutilisent (plus de dérive de format).
+- **Backend SSH générique** : `SSHTarget` (user/host/port/path/identity/sudo) → `command()` construit `ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new … <find>`. `ScanController.scanRemote` / `AppModel.scanRemote` lancent un `CommandScanner` (`source: .remote`) — **réutilise à 100 % le parser de flux streamé existant**, quasi gratuit.
+- **UI splash** : section « Remote » → `RemoteCard` → `RemoteScanSheet` (formulaire host/user/path/port/identity/sudo, note lecture seule + auth par clé).
+- **Tests** : `sshTargetBuildsFindCommand`, `hostOnlyTargetOmitsUserAndOptionals`, et **`commandScannerParsesFindStream`** (le parser SSH exercé localement via `printf` au format NUL exact — arbre/tailles/dirCount/extensions validés).
+- **🔬 Non testable ici** : un scan SSH réel exige Remote Login **et** GNU `find`/`-printf` côté distant (le `find` de macOS ne l'a pas) — exactement le cas que le canal d'erreur D-D diagnostique (J6.3).
 
 ## 1. Objectif
 

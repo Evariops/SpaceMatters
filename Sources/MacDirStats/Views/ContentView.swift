@@ -467,6 +467,7 @@ private struct EmptyState: View {
     @State private var vms: [VMMachine] = []
     @State private var engines: [ContainerEngine] = []
     @State private var kubeContexts: [K8sContext] = []
+    @State private var showingRemote = false
 
     private let columns = [GridItem(.adaptive(minimum: 230, maximum: 320), spacing: 14)]
 
@@ -528,10 +529,25 @@ private struct EmptyState: View {
                     }
                 }
 
+                section("Remote") {
+                    LazyVGrid(columns: columns, spacing: 14) {
+                        RemoteCard(theme: theme) { showingRemote = true }
+                    }
+                }
+
                 Color.clear.frame(height: 24)
             }
             .frame(maxWidth: .infinity)
             .padding(.horizontal, 40)
+        }
+        .sheet(isPresented: $showingRemote) {
+            RemoteScanSheet { target in
+                showingRemote = false
+                app.scanRemote(target)
+            } cancel: {
+                showingRemote = false
+            }
+            .environment(\.theme, theme)
         }
         .overlay(alignment: .topTrailing) {
             Button { isDark.toggle() } label: {
@@ -634,6 +650,117 @@ private struct VolumeCard: View {
         case ..<0.7: return Color(hex: 0x3FB950)
         case ..<0.9: return Color(hex: 0xD29922)
         default: return Color(hex: 0xF85149)
+        }
+    }
+}
+
+/// Splash card that opens the SSH connection form (SPEC-06).
+private struct RemoteCard: View {
+    let theme: Theme
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "network")
+                .font(.system(size: 22))
+                .foregroundStyle(theme.accent)
+                .frame(width: 32, height: 32)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Connect to a server…")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(theme.textPrimary)
+                Text("SSH · read-only")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(theme.textSecondary)
+                    .textCase(.uppercase)
+            }
+            Spacer()
+            Image(systemName: "chevron.right")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(hovering ? theme.accent : theme.textSecondary)
+        }
+        .padding(14)
+        .background(RoundedRectangle(cornerRadius: 12).fill(theme.panelBackground))
+        .overlay(RoundedRectangle(cornerRadius: 12)
+            .strokeBorder(hovering ? theme.accent : theme.separator, lineWidth: hovering ? 2 : 1))
+        .contentShape(RoundedRectangle(cornerRadius: 12))
+        .onHover { hovering = $0 }
+        .onTapGesture(perform: action)
+    }
+}
+
+/// SSH connection form: gathers an `SSHTarget` and launches a read-only remote
+/// scan. `BatchMode` means key-based auth only (documented in the note).
+private struct RemoteScanSheet: View {
+    let scan: (SSHTarget) -> Void
+    let cancel: () -> Void
+    @Environment(\.theme) private var theme
+
+    @State private var host = ""
+    @State private var user = NSUserName()
+    @State private var path = "/"
+    @State private var port = ""
+    @State private var identity = ""
+    @State private var useSudo = false
+
+    private var canScan: Bool { !host.trimmingCharacters(in: .whitespaces).isEmpty && !path.isEmpty }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Scan a remote server")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(theme.textPrimary)
+
+            Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 9) {
+                field("Host", "example.com or 10.0.0.4", text: $host)
+                field("User", NSUserName(), text: $user)
+                field("Path", "/", text: $path)
+                field("Port", "22 (optional)", text: $port)
+                field("Identity file", "~/.ssh/id_ed25519 (optional)", text: $identity)
+                GridRow {
+                    Text("").gridCellColumns(1)
+                    Toggle("Use sudo (for system paths)", isOn: $useSudo)
+                        .font(.system(size: 11))
+                        .toggleStyle(.checkbox)
+                }
+            }
+
+            Text("Uses key-based auth (BatchMode) and GNU `find`. The remote tree is read-only — no Trash or Reveal in Finder.")
+                .font(.system(size: 10))
+                .foregroundStyle(theme.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack {
+                Spacer()
+                Button("Cancel", action: cancel).keyboardShortcut(.cancelAction)
+                Button("Scan") {
+                    scan(SSHTarget(
+                        user: user.trimmingCharacters(in: .whitespaces),
+                        host: host.trimmingCharacters(in: .whitespaces),
+                        port: Int(port.trimmingCharacters(in: .whitespaces)),
+                        path: path.isEmpty ? "/" : path,
+                        identityFile: identity.isEmpty ? nil : (identity as NSString).expandingTildeInPath,
+                        useSudo: useSudo))
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(!canScan)
+            }
+        }
+        .padding(20)
+        .frame(width: 420)
+        .background(theme.windowBackground)
+    }
+
+    private func field(_ label: String, _ placeholder: String, text: Binding<String>) -> some View {
+        GridRow {
+            Text(label)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(theme.textSecondary)
+                .gridColumnAlignment(.trailing)
+            TextField(placeholder, text: text)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 12))
         }
     }
 }
