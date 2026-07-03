@@ -1,37 +1,48 @@
-# SPEC-07 — Distribution : icône, notarisation, About, mises à jour
+# SPEC-07 — Distribution : DMG signé + notarisé via GitHub
 
 > **Findings** : J1.1 (pas de binaire de release), J1.2 (icône générique), J1.4 (usage descriptions TCC absentes), J1.5 (version/About), D4 (signature/notarisation). I3 (`bundle.sh` `|| true`) **déjà corrigé**.
+> **Périmètre v1 (imposé)** : distribuer **uniquement un `.dmg` via GitHub Releases**. Pas de Mac App Store. Cask Homebrew / auto-update repoussés hors v1.
 
 ## 1. Objectif
 
-Rendre l'app **partageable** (« le collègue dont le disque est plein ») : signée Developer ID + notarisée, avec icône, About/version, prompts TCC explicites, et un canal de distribution.
+Un collègue télécharge le `.dmg` depuis la page **GitHub Releases**, le monte, glisse l'app dans Applications, et l'ouvre **sans blocage Gatekeeper** — donc DMG **signé Developer ID + notarisé + stapled**.
 
 ## 2. État actuel (vérifié)
 
-- `bundle.sh` : signature ad-hoc (cdhash instable → FDA à re-granter), pas de notarisation, aucun `CFBundleIconFile`/`.icns`, `CFBundleShortVersionString` figé « 1.0 », bundle id `com.macdirstats.app`. Échec total de `codesign` **désormais non masqué** (I3 fait).
+- `bundle.sh` : signature **ad-hoc** (cdhash instable → FDA à re-granter), **pas** de notarisation, **aucun** `.icns`/`CFBundleIconFile`, `CFBundleShortVersionString` figé « 1.0 », bundle id `com.macdirstats.app`. Échec total de `codesign` **désormais non masqué** (I3 fait).
 - Aucune clé `NS*UsageDescription` → prompts TCC nus (J1.4).
-- Détection FDA via ouverture de `TCC.db` ([FullDiskAccess.swift](../Sources/MacDirStats/Util/FullDiskAccess.swift)) — bien documentée.
+- Détection FDA via ouverture de `TCC.db` ([FullDiskAccess.swift](../Sources/MacDirStats/Util/FullDiskAccess.swift)) — bien documentée ; sensible au cdhash → **la signature stable (Developer ID) fait persister le grant FDA**, gros gain vs ad-hoc.
 
-## 3. Plan d'implémentation
+## 3. Plan d'implémentation (v1)
 
-1. **Icône** : `AppIcon.icns` (le camembert du splash suffit) + `CFBundleIconFile` dans `bundle.sh` (J1.2).
-2. **Usage descriptions** : ajouter `NSDesktopFolderUsageDescription`, `NSDocumentsFolderUsageDescription`, `NSDownloadsFolderUsageDescription`, `NSRemovableVolumesUsageDescription`, `NSNetworkVolumesUsageDescription` au plist généré (J1.4) — phrases explicites.
-3. **Signature Developer ID + notarisation** : `codesign --options runtime` avec identité Developer ID, `xcrun notarytool submit --wait`, `xcrun stapler staple` ; DMG signé/notarisé (J1.1, D4).
-4. **About + version** : panneau About custom ; `CFBundleShortVersionString`/`CFBundleVersion` **dérivés de git** (`git describe`) au build (J1.5).
-5. **Mises à jour** : Sparkle *ou* un simple « check GitHub releases ». Cask Homebrew pour l'install (`brew install --cask macdirstats`).
-6. **Onboarding FDA** (J1.3) : bandeau avec mini-étapes (« ajoutez l'app avec **+** puis relancez »), limité à la route filesystem, re-proposé quand `errorCount` explose sans FDA.
+1. **Icône** (J1.2) : `AppIcon.icns` (le camembert `chart.pie.fill` du splash convient) + `CFBundleIconFile` dans `bundle.sh`.
+2. **Usage descriptions TCC** (J1.4) : ajouter au plist généré `NSDesktopFolderUsageDescription`, `NSDocumentsFolderUsageDescription`, `NSDownloadsFolderUsageDescription`, `NSRemovableVolumesUsageDescription`, `NSNetworkVolumesUsageDescription` — phrases explicites.
+3. **Version depuis git** (J1.5) : `CFBundleShortVersionString`/`CFBundleVersion` dérivés de `git describe --tags` au build ; petit panneau About custom.
+4. **Signature Developer ID + notarisation** :
+   - `codesign --force --options runtime --sign "Developer ID Application: …" MacDirStats.app`
+   - construire le DMG (`hdiutil create` ou `create-dmg`) avec l'app + alias `/Applications`
+   - `codesign` le DMG, `xcrun notarytool submit MacDirStats.dmg --keychain-profile … --wait`, puis `xcrun stapler staple MacDirStats.dmg`.
+5. **Script `release.sh`** : build release → bundle → sign → dmg → notarize → staple → `gh release create vX.Y.Z MacDirStats.dmg --notes …`.
+6. **README** : section « Download » pointant la dernière Release GitHub.
 
-## 4. Vérification
+## 4. Hors périmètre v1 (à garder en tête)
 
-- `bundle.sh` produit un `.app` notarisé qui passe Gatekeeper sur une **autre** machine (test manuel).
-- `spctl -a -vv MacDirStats.app` → « accepted, source=Notarized Developer ID ».
-- Prompts TCC affichent la phrase d'explication.
+- Cask Homebrew (`brew install --cask macdirstats`) — trivial une fois les Releases en place.
+- Auto-update (Sparkle appcast **ou** simple « check GitHub releases »).
+- Mac App Store (sandbox incompatible avec le scan disque global — non pertinent).
 
-## 5. Risques & hypothèses
+## 5. Vérification
 
-- Nécessite un compte Apple Developer (Developer ID) — prérequis externe.
-- 🔬 Hardened runtime vs FDA/debuggabilité : le fallback existant reste utile pour les builds locaux.
+- `spctl -a -vv -t open --context context:primary-signature MacDirStats.dmg` → « accepted, source=Notarized Developer ID ».
+- `codesign -dv --verbose=4 MacDirStats.app` → identité Developer ID, hardened runtime.
+- **Test réel** : télécharger le DMG depuis la Release GitHub sur une **autre** session/machine → ouverture sans « développeur non identifié ».
+- Vérifier que le grant FDA **persiste** après un rebuild signé (cdhash stable).
 
-## 6. Effort & dépendances
+## 6. Risques & hypothèses
+
+- Prérequis externe : compte Apple Developer (Developer ID Application) + `notarytool` keychain profile.
+- 🔬 Hardened runtime vs debuggabilité locale : garder le fallback ad-hoc de `bundle.sh` pour les builds de dev ; le chemin signé/notarisé est réservé à `release.sh`.
+
+## 7. Effort & dépendances
 
 **1–2 jours** (hors obtention du compte Developer). Indépendant.

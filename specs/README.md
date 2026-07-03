@@ -18,9 +18,9 @@ Principe directeur (repris du plan) : **intégrité > performance > robustesse >
 | [SPEC-02](SPEC-02-invalidation-rescan.md) | Invalidation & re-scan de sous-arbre | B1(cure), A6, A7, J4.4, D1 | 1–2 j | — |
 | [SPEC-03](SPEC-03-exact-vs-attribution.md) | Comptage exact vs attribution + réconciliation | A3, A4, A10, J9 | 2–3 j | — |
 | [SPEC-04](SPEC-04-fsevents-live.md) | FSEvents — tableau de bord vivant | S3, J5.2, J4.5, D1 | 1–2 j | SPEC-02 |
-| [SPEC-05](SPEC-05-file-level-treemap.md) | Treemap au niveau fichier | S5 | 2–3 j | — |
+| [SPEC-05](SPEC-05-file-level-treemap.md) | Raffinement fichier **au zoom** (overview par dossier) | S5 | 2–3 j | — |
 | [SPEC-06](SPEC-06-pluggable-backends.md) | Backends pluggables | S6 | ~1 j/backend | — |
-| [SPEC-07](SPEC-07-distribution.md) | Distribution (icône, notarisation, About) | J1.1–J1.5, D4 | 1–2 j | — |
+| [SPEC-07](SPEC-07-distribution.md) | Distribution **DMG signé/notarisé via GitHub** (v1) | J1.1–J1.5, D4 | 1–2 j | — |
 | [SPEC-08](SPEC-08-accessibility.md) | Accessibilité & i18n complètes | J10.1–J10.4, J9.5 | 1–2 j | SPEC-01 (partiel) |
 
 **Ordre recommandé** : SPEC-02 (débloque SPEC-04 et ferme A6/A7 proprement) → SPEC-01 → SPEC-03 → SPEC-08 → SPEC-04 → SPEC-05/06/07 selon priorités produit.
