@@ -192,6 +192,9 @@ private struct OutlineRowView: View {
         .simultaneousGesture(TapGesture(count: 2).onEnded { activate() })
         .onHover { hovering = $0 }
         .contextMenu { contextMenu() }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(isDirectory ? "Folder" : "File") \(displayName), \(Format.bytes(size))")
+        .accessibilityAddTraits(isSelected ? [.isSelected] : [])
     }
 
     private var rowBackground: Color {

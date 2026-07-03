@@ -179,6 +179,7 @@ private struct Breadcrumb: View {
             .disabled(!controller.canZoomOut)
             .help("Zoom out (⌘↑)")
             .keyboardShortcut(.upArrow, modifiers: .command)
+            .accessibilityLabel("Zoom out")
 
             if let root = path.first {
                 segment(root, isCurrent: path.count == 1)
@@ -372,6 +373,9 @@ private struct Stat: View {
                 .foregroundStyle(theme.textSecondary)
                 .textCase(.uppercase)
         }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(label)
+        .accessibilityValue(value)
     }
 }
 

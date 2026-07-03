@@ -93,6 +93,9 @@ struct TreemapView: View {
                         .allowsHitTesting(false)
                 }
             }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Treemap")
+            .accessibilityValue(controller.zoomRoot.map { "showing \($0.name), \(Format.bytes($0.size(controller.metric)))" } ?? "")
             .onAppear { recompute(size: geo.size) }
             .onChange(of: geo.size) { _, size in recompute(size: size) }
             .onChange(of: controller.version) { _, _ in recompute(size: lastSize) }
