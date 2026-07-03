@@ -12,3 +12,6 @@ MacDirStats.app/
 
 # macOS
 .DS_Store
+
+# Release artifacts
+*.dmg

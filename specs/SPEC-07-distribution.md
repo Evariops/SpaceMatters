@@ -2,6 +2,17 @@
 
 > **Findings** : J1.1 (pas de binaire de release), J1.2 (icône générique), J1.4 (usage descriptions TCC absentes), J1.5 (version/About), D4 (signature/notarisation). I3 (`bundle.sh` `|| true`) **déjà corrigé**.
 > **Périmètre v1 (imposé)** : distribuer **uniquement un `.dmg` via GitHub Releases**. Pas de Mac App Store. Cask Homebrew / auto-update repoussés hors v1.
+> **Statut** : ✅ **IMPLÉMENTÉ** (tout le codable) — signature/notarisation exécutables une fois le compte Developer ID fourni (prérequis externe).
+
+## 0. Résultat d'implémentation
+
+- **Icône** (J1.2) : [`Scripts/make-icon.sh`](../Scripts/make-icon.sh) rend `chart.pie.fill` (accent sur fond panneau) → `Resources/AppIcon.icns` (généré, commité) ; `bundle.sh` la copie + `CFBundleIconFile`. Vérifié visuellement.
+- **Usage descriptions TCC** (J1.4) : `NSDesktop/Documents/Downloads/RemovableVolumes/NetworkVolumes UsageDescription` ajoutées au plist. `plutil -lint` OK.
+- **Version depuis git** (J1.5) : `CFBundleShortVersionString` = `git describe --tags` (repli `0.1.0`), `CFBundleVersion` = nb de commits. Vérifié (`0.1.0` / build `26`).
+- **`release.sh`** : build → `bundle.sh` (Developer ID) → **hardened-runtime sign + verify** → DMG (`hdiutil`, app + alias `/Applications`) → sign DMG → `notarytool submit --wait` → `stapler staple` → `spctl` check → **`gh release create`**. Prérequis externes documentés en tête (cert Developer ID + profil `notarytool` + `gh auth`).
+- **README** : section « Download » pointant `releases/latest`.
+- **`.gitignore`** : `*.dmg` (artefact) exclu ; `MacDirStats.app/` déjà exclu.
+- **🔬 Non exécutable ici** : la signature Developer ID + notarisation exigent un compte Apple Developer (prérequis externe assumé par la spec §6). Le repli ad-hoc de `bundle.sh` reste pour le dev local (vérifié : bundle signé ad-hoc lance sans crash).
 
 ## 1. Objectif
 

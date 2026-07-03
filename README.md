@@ -22,6 +22,16 @@ with an obsession for **scan speed**, **live UI feedback**, and **low memory use
 | Per-extension stats | [`ExtKey`](Sources/MacDirStats/Model/ExtKey.swift) packs the extension into two `UInt64`s inline — **zero `String` allocations per file**. |
 | Live UI | Sizes are atomics propagated up the ancestor chain as each directory completes; the UI re-reads them at 10 Hz. |
 
+## Download
+
+Grab the latest signed & notarized `.dmg` from the **[Releases page](../../releases/latest)**,
+open it, and drag **MacDirStats** into Applications. It launches without a
+Gatekeeper warning (Developer ID signed + notarized).
+
+Maintainers cut a release with [`./release.sh`](release.sh) (build → sign →
+notarize → staple → `gh release create`); see the script header for the one-time
+Apple Developer ID / `notarytool` setup.
+
 ## Build & run
 
 ```bash

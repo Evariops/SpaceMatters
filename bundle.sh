@@ -17,7 +17,20 @@ mkdir -p "$APP/Contents/MacOS"
 mkdir -p "$APP/Contents/Resources"
 cp "$BIN_PATH" "$APP/Contents/MacOS/$BIN_NAME"
 
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+# App icon (J1.2). Regenerate with ./Scripts/make-icon.sh if the look changes.
+ICON_KEY=""
+if [ -f "Resources/AppIcon.icns" ]; then
+    cp "Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+    ICON_KEY="    <key>CFBundleIconFile</key>        <string>AppIcon</string>"
+fi
+
+# Version derived from git so About/Finder reflect the actual build (J1.5).
+# The `|| true` keeps `set -o pipefail` from aborting when there's no tag yet.
+VERSION="$( { git describe --tags --abbrev=0 2>/dev/null || true; } | sed 's/^v//')"
+[ -z "$VERSION" ] && VERSION="0.1.0"
+BUILD="$(git rev-list --count HEAD 2>/dev/null || echo 1)"
+
+cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -27,12 +40,19 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleIdentifier</key>      <string>com.macdirstats.app</string>
     <key>CFBundleExecutable</key>      <string>MacDirStats</string>
     <key>CFBundlePackageType</key>     <string>APPL</string>
-    <key>CFBundleShortVersionString</key> <string>1.0</string>
-    <key>CFBundleVersion</key>         <string>1</string>
+    <key>CFBundleShortVersionString</key> <string>${VERSION}</string>
+    <key>CFBundleVersion</key>         <string>${BUILD}</string>
+${ICON_KEY}
     <key>LSMinimumSystemVersion</key>  <string>15.0</string>
     <key>NSHighResolutionCapable</key> <true/>
     <key>NSPrincipalClass</key>        <string>NSApplication</string>
     <key>LSApplicationCategoryType</key> <string>public.app-category.utilities</string>
+    <!-- TCC usage descriptions (J1.4): shown when macOS prompts for access. -->
+    <key>NSDesktopFolderUsageDescription</key>     <string>MacDirStats measures the size of your Desktop to show what's using disk space.</string>
+    <key>NSDocumentsFolderUsageDescription</key>   <string>MacDirStats measures the size of your Documents to show what's using disk space.</string>
+    <key>NSDownloadsFolderUsageDescription</key>   <string>MacDirStats measures the size of your Downloads to show what's using disk space.</string>
+    <key>NSRemovableVolumesUsageDescription</key>  <string>MacDirStats scans external drives you choose to analyze their disk usage.</string>
+    <key>NSNetworkVolumesUsageDescription</key>    <string>MacDirStats scans network volumes you choose to analyze their disk usage.</string>
 </dict>
 </plist>
 PLIST
