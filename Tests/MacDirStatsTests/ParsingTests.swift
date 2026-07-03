@@ -17,13 +17,32 @@ import Foundation
         #expect(K8sQueries.parseQuantity("garbage") == 0)
     }
 
-    // A10: human-readable byte formatting (base 1024).
+    // A10: human-readable byte formatting — base 1024 with honest IEC labels.
     @Test func formatBytes() {
+        let sep = Locale.current.decimalSeparator ?? "."
         #expect(Format.bytes(0) == "0 B")
         #expect(Format.bytes(1_023) == "1023 B")
-        #expect(Format.bytes(1_024) == "1.00 KB")
-        #expect(Format.bytes(1_048_576) == "1.00 MB")
-        #expect(Format.bytes(1_073_741_824) == "1.00 GB")
+        #expect(Format.bytes(1_024) == "1\(sep)00 KiB")
+        #expect(Format.bytes(1_048_576) == "1\(sep)00 MiB")
+        #expect(Format.bytes(1_073_741_824) == "1\(sep)00 GiB")
+        // 1000-based values are *not* relabelled as KB (that was the A10 bug).
+        #expect(Format.bytes(1_000).hasSuffix(" B"))
+    }
+
+    // J9: reconciliation arithmetic (the derived breakdown fields).
+    @Test func reconciliationArithmetic() {
+        // Scan explains part of "used"; the rest splits into trash/purgeable/unaccounted.
+        let r = Reconciliation(volumeUsed: 1000, scanned: 600, trash: 100,
+                               purgeable: 150, snapshotCount: 2, skippedPaths: 3)
+        #expect(r.accountedFor == 850)          // 600 + 100 + 150
+        #expect(r.unaccounted == 150)           // 1000 − 850
+        #expect(!r.scanExceedsUsed)
+
+        // Attribution over hardlinks/clones can push the scan above "used".
+        let over = Reconciliation(volumeUsed: 500, scanned: 900, trash: 0,
+                                  purgeable: 0, snapshotCount: 0, skippedPaths: 0)
+        #expect(over.scanExceedsUsed)
+        #expect(over.unaccounted == 0)          // clamped, never negative
     }
 
     // ExtKey: never crashes on hostile input, folds ASCII case.

@@ -290,6 +290,32 @@ private struct ToolbarBar: View {
                     They differ because the disk stores files in fixed-size blocks (~4 KB): a tiny file still uses a whole block, so "On disk" is usually larger. macOS-compressed files are the exception (smaller on disk than their content).
                     """
                 )
+
+                // Counting mode — host scans only (VM scans are always attribution).
+                if controller.isHostScan {
+                    Picker("", selection: Binding(get: { controller.countingMode }, set: { controller.countingMode = $0 })) {
+                        ForEach(CountingMode.allCases) { Text($0.label).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    .fixedSize()
+                    .disabled(controller.isScanning)
+                    .help(
+                        """
+                        How shared storage is counted (re-scans when changed):
+
+                        • Attribution — every hardlink is charged the full size (“who is responsible for this space”). Matches `du -l`.
+
+                        • Exact — hardlinked files are counted once, so the total matches what the disk actually holds (`du` / `df`).
+
+                        APFS clones (copy-on-write copies) are still counted in full in both modes — they can make the total larger than `df` reports.
+                        """
+                    )
+                }
+            }
+
+            // Reconciliation ("why doesn't this match Finder?") — volume scans only.
+            if controller.lastVolumes.count == 1 && !controller.isScanning {
+                ReconciliationButton(controller: controller)
             }
 
             Button { isDark.toggle() } label: {

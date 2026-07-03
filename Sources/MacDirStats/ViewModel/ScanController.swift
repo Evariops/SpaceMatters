@@ -34,6 +34,13 @@ final class ScanController {
         didSet { if metric != oldValue { extRows = scanner?.snapshotExtensions(metric: metric, limit: 250) ?? []; bump() } }
     }
 
+    /// Exact vs attribution counting. Dedup happens at scan time, so flipping this
+    /// re-scans the same target with the new semantics (host scans only; VM scans
+    /// are always attribution).
+    var countingMode: CountingMode = .attribution {
+        didSet { if countingMode != oldValue { rescan() } }
+    }
+
     /// The node currently focused in the treemap / selected in the list.
     var selection: FSNode?
     /// The directory the treemap is zoomed into (defaults to root).
@@ -182,7 +189,7 @@ final class ScanController {
         // Skip network volumes and the APFS Data firmlink mount (avoids double
         // counting), unless one of those is itself a chosen root.
         let skip = DirectoryScanner.recommendedSkipPaths(seedPaths: seeds.map(\.path))
-        let scanner = DirectoryScanner(root: root, seeds: seeds, skipPaths: skip)
+        let scanner = DirectoryScanner(root: root, seeds: seeds, skipPaths: skip, exact: countingMode == .exact)
         var paths: [ObjectIdentifier: String] = [:]
         for seed in seeds { paths[ObjectIdentifier(seed.node)] = seed.path }
         startBackend(root: root, scanner: scanner, displayPath: displayPath, isHost: true, nodePaths: paths)
@@ -742,7 +749,7 @@ final class ScanController {
         // Re-scan in place: children are created with `node` as their parent, so
         // the parent chain stays intact all the way to the real root.
         let skip = DirectoryScanner.recommendedSkipPaths(seedPaths: [path])
-        let sub = DirectoryScanner(root: node, seeds: [.init(path: path, node: node)], skipPaths: skip)
+        let sub = DirectoryScanner(root: node, seeds: [.init(path: path, node: node)], skipPaths: skip, exact: countingMode == .exact)
         sub.start()
         await Task.detached(priority: .userInitiated) { sub.waitUntilFinished() }.value
 

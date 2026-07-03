@@ -40,11 +40,55 @@ import Foundation
         #expect(abs(ourKiB - duKiB) <= 1, "scan \(ourKiB) KiB vs du -sklx \(duKiB) KiB")
     }
 
-    /// `du -sklx`: count hard links per link, stay on one volume, report KiB.
-    static func duKiB(_ path: String) throws -> Int {
+    /// A3: exact mode dedups hardlinks (matches `du -skx`); attribution counts
+    /// every link (`du -sklx`). This also validates the exact-mode bulk-buffer
+    /// parsing — a bad FILEID/LINKCOUNT offset would break the dedup and fail here.
+    @Test func exactModeDedupsHardlinks() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("mds-hl-\(UUID().uuidString)")
+        let d1 = root.appendingPathComponent("d1")
+        let d2 = root.appendingPathComponent("d2")
+        try fm.createDirectory(at: d1, withIntermediateDirectories: true)
+        try fm.createDirectory(at: d2, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+
+        // One 200 KB payload hardlinked into three places, plus an unshared file.
+        let payload = d1.appendingPathComponent("payload.bin")
+        try Data(count: 200_000).write(to: payload)
+        try fm.linkItem(at: payload, to: d1.appendingPathComponent("link2.bin"))
+        try fm.linkItem(at: payload, to: d2.appendingPathComponent("link3.bin"))
+        try Data(count: 40_000).write(to: root.appendingPathComponent("solo.dat"))
+
+        func scanTotal(exact: Bool) -> Int64 {
+            let node = FSNode(name: root.lastPathComponent, parent: nil)
+            let s = DirectoryScanner(root: node, seeds: [.init(path: root.path, node: node)], exact: exact)
+            s.start(); s.waitUntilFinished()
+            return node.aggPhysical.load(ordering: .relaxed)
+        }
+
+        let attribution = scanTotal(exact: false)
+        let exact = scanTotal(exact: true)
+
+        // Attribution counts all 3 links (~3 payloads + solo); exact counts the
+        // shared blocks once (~1 payload + solo) — so it must be strictly smaller.
+        #expect(exact < attribution)
+        #expect(attribution - exact > 300_000) // ~2 extra payload copies elided
+
+        // Cross-check the semantics against du itself.
+        let exactKiB = Int((exact + 1023) / 1024)
+        let attrKiB = Int((attribution + 1023) / 1024)
+        #expect(abs(exactKiB - (try Self.duKiB(root.path, perLink: false))) <= 1,
+                "exact \(exactKiB) KiB vs du -skx")
+        #expect(abs(attrKiB - (try Self.duKiB(root.path, perLink: true))) <= 1,
+                "attribution \(attrKiB) KiB vs du -sklx")
+    }
+
+    /// `du -sk[l]x`: with `-l` count hard links per link (attribution), without it
+    /// dedup them (exact). Stay on one volume, report KiB.
+    static func duKiB(_ path: String, perLink: Bool = true) throws -> Int {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/du")
-        p.arguments = ["-sklx", path]
+        p.arguments = [perLink ? "-sklx" : "-skx", path]
         let pipe = Pipe(); p.standardOutput = pipe
         try p.run(); p.waitUntilExit()
         let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)

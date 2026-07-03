@@ -163,6 +163,18 @@ enum SizeMetric: String, CaseIterable, Identifiable {
     var label: String { self == .physical ? "On disk" : "Logical" }
 }
 
+/// How shared storage is counted. **Attribution** (default) blames every hardlink
+/// for the full bytes ("who is responsible for this space") — clones count full.
+/// **Exact** dedups hardlinks so the total matches `du`/`df` ("what's actually on
+/// disk"). Because dedup happens while scanning (files aren't kept in RAM),
+/// switching modes re-scans.
+enum CountingMode: String, CaseIterable, Identifiable {
+    case attribution
+    case exact
+    var id: String { rawValue }
+    var label: String { self == .attribution ? "Attribution" : "Exact" }
+}
+
 /// A single global lock guards every node's children array. Writes happen once
 /// per directory (cheap, brief); UI reads snapshot only the expanded/visible
 /// nodes — so contention stays low even under a hot scan.

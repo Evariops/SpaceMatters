@@ -1,6 +1,15 @@
 # SPEC-03 — Comptage exact vs attribution + réconciliation des chiffres
 
 > **Findings** : A3 (hardlinks comptés par lien), A4 (clones APFS non déduits), A10 (base 1024 étiquetée KB), J9 (« pourquoi ça ne matche pas Finder ? »), J9.5 (locale mixte). Renvoie à D-G/S4 du plan. A1 (montages) est **déjà corrigé**.
+> **Statut** : ✅ **IMPLÉMENTÉ** — A3 exact (validé contre `du`), A10/J9.5, J9 réconciliation. A4 en repli honnête (conforme §3.b/§6).
+
+## 0. Résultat d'implémentation
+
+- **A3 hardlinks (exact) — validé contre `du`** : `CountingMode { attribution | exact }` (toggle toolbar, hôte). En mode exact, l'énumérateur bulk demande `ATTR_CMN_FILEID` + `ATTR_FILE_LINKCOUNT` (lus en ordre de bits exact ; **le mode attribution par défaut packe un buffer identique** — reads gardés par le masque `returned`), et le scanner dédup les inodes multi-liens (`Set<UInt64>`, seulement `linkCount > 1` → mémoire négligeable). Test golden `exactModeDedupsHardlinks` : exact ↔ `du -skx`, attribution ↔ `du -sklx`. Bascule = re-scan (dédup au scan). VM = attribution.
+- **A10 + J9.5 (format)** : `Format.bytes` → base 1024 avec **libellés IEC honnêtes** (KiB/MiB/…), séparateur décimal **localisé**. Test `formatBytes` mis à jour.
+- **J9 réconciliation** : `Reconciliation` (modèle) + `ReconciliationButton`/popover (scans de volume entier). Décompose « utilisé (API) » = scan + corbeille (`~/.Trash` + `.Trashes`) + purgeable (`importantUsage − available`, avec nb de snapshots `tmutil`) + non-attribué ; signale `scanExceedsUsed` (signature de l'attribution sur hardlinks/clones) et les chemins illisibles. Test `reconciliationArithmetic`.
+- **A4 clones APFS — repli honnête (conforme au plan)** : le §3.b/§6 marquait `ATTR_CMNEXT_PRIVATESIZE` 🔬 « à prototyper / repli honnête si non fiable ». Le parsing d'attributs étendus (`forkattr`) est plus risqué que le buffer standard ; **non adopté**. À la place, note UI explicite (tooltip du toggle + panneau réconciliation) : « les clones APFS sont comptés pleins dans les deux modes et peuvent gonfler le total au-delà de `df` ».
+- **A1 (montages)** : déjà corrigé.
 
 ## 1. Objectif
 

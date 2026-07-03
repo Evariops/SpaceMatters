@@ -11,6 +11,7 @@ enum FSAttr {
     static let cmnReturnedAttrs: UInt32 = 0x8000_0000
     static let cmnName: UInt32          = 0x0000_0001
     static let cmnObjType: UInt32       = 0x0000_0008
+    static let cmnFileID: UInt32        = 0x0200_0000 // inode number (u_int64), exact mode
     static let cmnError: UInt32         = 0x2000_0000
 
     // Directory attribute bits
@@ -19,6 +20,7 @@ enum FSAttr {
     static let mntStatusMountPoint: UInt32 = 0x0000_0001
 
     // File attribute bits
+    static let fileLinkCount: UInt32    = 0x0000_0001 // hardlink count (u_int32), exact mode
     static let fileTotalSize: UInt32    = 0x0000_0002 // logical size, all forks
     static let fileAllocSize: UInt32    = 0x0000_0004 // on-disk size, all forks
 
@@ -39,6 +41,12 @@ struct BulkEntry {
     let isMountPoint: Bool
     let logicalSize: Int64
     let physicalSize: Int64
+    /// Inode number — only populated when the enumerator is `hardlinkAware`
+    /// (exact counting mode); `0` otherwise.
+    let fileID: UInt64
+    /// Hardlink count — `0` unless `hardlinkAware`. `> 1` marks a file whose
+    /// blocks are shared by several directory entries (dedup candidate).
+    let linkCount: UInt32
 }
 
 /// Enumerate every direct child of an open directory file descriptor, invoking
@@ -49,6 +57,7 @@ func enumerateDirectory(
     fd: Int32,
     buffer: UnsafeMutableRawPointer,
     bufferSize: Int,
+    hardlinkAware: Bool = false,
     _ body: (BulkEntry) -> Void
 ) -> Int {
     var attrList = attrlist()
@@ -56,6 +65,13 @@ func enumerateDirectory(
     attrList.commonattr = FSAttr.cmnReturnedAttrs | FSAttr.cmnName | FSAttr.cmnObjType | FSAttr.cmnError
     attrList.dirattr = FSAttr.dirMountStatus
     attrList.fileattr = FSAttr.fileTotalSize | FSAttr.fileAllocSize
+    // Exact counting mode also needs the inode + link count to dedup hardlinks.
+    // Requested only then, so the default (attribution) path packs an identical
+    // buffer to before — the reads below are gated on the returned-attr masks.
+    if hardlinkAware {
+        attrList.commonattr |= FSAttr.cmnFileID
+        attrList.fileattr |= FSAttr.fileLinkCount
+    }
 
     var errorCount = 0
 
@@ -110,12 +126,28 @@ func enumerateDirectory(
                 off += 4
             }
 
+            // ATTR_CMN_FILEID (0x02000000) sorts after ATTR_CMN_OBJTYPE (0x08) in
+            // the buffer's ascending-bit packing order. Present only in exact mode.
+            var fileID: UInt64 = 0
+            if commonReturned & FSAttr.cmnFileID != 0 {
+                fileID = entry.loadUnaligned(fromByteOffset: off, as: UInt64.self)
+                off += 8
+            }
+
             // Directory attributes follow the common block. Only directories carry
             // ATTR_DIR_MOUNTSTATUS; for files the bit is simply absent.
             var isMountPoint = false
             if dirReturned & FSAttr.dirMountStatus != 0 {
                 let mountStatus = entry.loadUnaligned(fromByteOffset: off, as: UInt32.self)
                 isMountPoint = (mountStatus & FSAttr.mntStatusMountPoint) != 0
+                off += 4
+            }
+
+            // File attributes, in ascending-bit order: LINKCOUNT (0x01) before
+            // TOTALSIZE (0x02) before ALLOCSIZE (0x04). LINKCOUNT is exact-mode only.
+            var linkCount: UInt32 = 0
+            if fileReturned & FSAttr.fileLinkCount != 0 {
+                linkCount = entry.loadUnaligned(fromByteOffset: off, as: UInt32.self)
                 off += 4
             }
 
@@ -140,7 +172,9 @@ func enumerateDirectory(
                     isDirectory: objType == FSAttr.vdir,
                     isMountPoint: isMountPoint,
                     logicalSize: logical,
-                    physicalSize: physical
+                    physicalSize: physical,
+                    fileID: fileID,
+                    linkCount: linkCount
                 ))
             }
 

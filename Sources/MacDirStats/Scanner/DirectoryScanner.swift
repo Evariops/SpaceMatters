@@ -54,12 +54,21 @@ final class DirectoryScanner: ScanBackend {
     private let extLock = NSLock()
     private var extStats: [ExtKey: ExtStat] = [:]
 
+    /// Exact counting mode: dedup hardlinks so shared blocks are counted once
+    /// (matches `du`/df). Attribution mode (default) counts every link.
+    private let exact: Bool
+    private let linkLock = NSLock()
+    /// Inodes of multi-link files already counted (only `linkCount > 1` entries,
+    /// so this stays negligible even on huge trees).
+    private var seenInodes: Set<UInt64> = []
+
     private static let bufferSize = 256 * 1024
 
-    init(root: FSNode, seeds: [Seed], skipPaths: Set<String> = [], workerCount: Int? = nil) {
+    init(root: FSNode, seeds: [Seed], skipPaths: Set<String> = [], exact: Bool = false, workerCount: Int? = nil) {
         self.root = root
         self.seeds = seeds
         self.skipPaths = skipPaths
+        self.exact = exact
         self.seedPaths = Set(seeds.map(\.path))
         let cores = ProcessInfo.processInfo.activeProcessorCount
         // Scanning APFS/SSD is throughput-bound on syscalls; oversubscribe a
@@ -265,7 +274,7 @@ final class DirectoryScanner: ScanBackend {
         // Avoid a double slash when the parent is "/" so paths match skip entries.
         let pathPrefix = item.path == "/" ? "/" : item.path + "/"
 
-        let errors = enumerateDirectory(fd: fd, buffer: buffer, bufferSize: Self.bufferSize) { entry in
+        let errors = enumerateDirectory(fd: fd, buffer: buffer, bufferSize: Self.bufferSize, hardlinkAware: exact) { entry in
             if entry.isDirectory {
                 let name = String(
                     decoding: UnsafeRawBufferPointer(start: entry.name, count: entry.nameLength),
@@ -280,11 +289,21 @@ final class DirectoryScanner: ScanBackend {
                 childNodes.append(child)
                 childItems.append(WorkItem(path: childPath, node: child))
             } else {
-                filesLogical += entry.logicalSize
-                filesPhysical += entry.physicalSize
+                var effL = entry.logicalSize
+                var effP = entry.physicalSize
+                // Exact mode: count a multi-linked inode's blocks only on its first
+                // sighting; later hardlinks contribute 0 bytes (still 1 file entry).
+                if exact && entry.linkCount > 1 {
+                    linkLock.lock()
+                    let firstSighting = seenInodes.insert(entry.fileID).inserted
+                    linkLock.unlock()
+                    if !firstSighting { effL = 0; effP = 0 }
+                }
+                filesLogical += effL
+                filesPhysical += effP
                 fileCount += 1
                 let key = ExtKey(name: entry.name, length: entry.nameLength)
-                localExt[key, default: ExtStat()].add(logical: entry.logicalSize, physical: entry.physicalSize)
+                localExt[key, default: ExtStat()].add(logical: effL, physical: effP)
             }
         }
         if errors > 0 {
