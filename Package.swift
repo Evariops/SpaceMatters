@@ -17,6 +17,12 @@ let package = Package(
                 .swiftLanguageMode(.v5),
                 .unsafeFlags(["-Ounchecked"], .when(configuration: .release)),
             ]
-        )
+        ),
+        .testTarget(
+            name: "MacDirStatsTests",
+            dependencies: ["MacDirStats"],
+            path: "Tests/MacDirStatsTests",
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
     ]
 )
