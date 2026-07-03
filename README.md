@@ -47,14 +47,18 @@ Prints totals, timing, throughput, and the top file types.
 ## Using the UI
 
 - **Left:** live directory outline (sorted by size) over a file-type breakdown.
-- **Right:** squarified treemap. **Hover** for a tooltip, **click** to select,
-  **double-click** a folder to zoom in; the **↖︎** button zooms out.
+- **Right:** squarified treemap. **Hover** for a path + size tooltip, **click**
+  to select, **double-click** a folder to zoom in. Zoom back out with the
+  **↖︎** breadcrumb button, **⌘↑**, or a **double-click** on empty space.
+  **Right-click** any tile for Reveal in Finder / Copy Path / Move to Trash.
 - **On disk / Logical** toggle switches between allocated and content size.
 - Sun/moon toggles the theme.
 
 ## Notes & current limits
 
-- Size accuracy: physical (on-disk) total matches `du -sk` exactly in testing.
+- Size accuracy: the physical (on-disk) total matches `du -skx` exactly in
+  testing — the scan stays on the volume you picked and does not cross into
+  mounted filesystems (swap, Preboot, external disks, DMGs), matching `du -x`.
 - Symlinks are counted by their own size and **not** followed (no cycles).
 - Hard-linked files are counted once per link (same as WinDirStat).
 - Scanning system locations may require granting access; per-entry permission

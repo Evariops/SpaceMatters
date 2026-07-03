@@ -600,10 +600,17 @@ final class ScanController {
 
     // MARK: Treemap zoom
 
+    /// Single point that keeps `selection` and the list's `selectedRowID` in
+    /// lock-step — the list, breadcrumb and treemap always agree on the node.
+    private func setSelection(_ node: FSNode?) {
+        selection = node
+        selectedRowID = node.map { .dir(ObjectIdentifier($0)) }
+    }
+
     func zoom(into node: FSNode) {
         guard node.isDirectory else { return }
         zoomRoot = node
-        selection = node
+        setSelection(node)
         bump()
     }
 
@@ -627,16 +634,20 @@ final class ScanController {
     func zoomOut() {
         if let parent = zoomRoot?.parent {
             zoomRoot = parent
-            selection = parent
+            setSelection(parent)
+            revealTarget = parent // scroll the list to the newly focused node
             bump()
         }
     }
 
     func resetZoom() {
         zoomRoot = root
-        selection = root
+        setSelection(root)
         bump()
     }
+
+    /// Whether zooming out is possible (drives the breadcrumb button + ⌘↑).
+    var canZoomOut: Bool { zoomRoot?.parent != nil }
 
     // MARK: Timer / refresh
 

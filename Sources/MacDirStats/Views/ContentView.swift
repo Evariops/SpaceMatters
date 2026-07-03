@@ -160,6 +160,15 @@ private struct Breadcrumb: View {
     var body: some View {
         let path = controller.zoomPath
         HStack(spacing: 4) {
+            Button(action: controller.zoomOut) {
+                Image(systemName: "arrow.up.left").font(.system(size: 11, weight: .semibold))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(controller.canZoomOut ? theme.accent : theme.textSecondary.opacity(0.4))
+            .disabled(!controller.canZoomOut)
+            .help("Zoom out (⌘↑)")
+            .keyboardShortcut(.upArrow, modifiers: .command)
+
             if let root = path.first {
                 segment(root, isCurrent: path.count == 1)
             }
@@ -235,6 +244,7 @@ private struct ToolbarBar: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(theme.textPrimary)
+                .keyboardShortcut("r", modifiers: .command)
             }
 
             if controller.root != nil {

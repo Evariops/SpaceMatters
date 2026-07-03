@@ -1,4 +1,5 @@
 import SwiftUI
+import QuickLook
 
 /// Live directory outline: folders plus the files inside each opened folder
 /// (listed on demand). Flattened to a single array so the native `List`
@@ -10,6 +11,7 @@ struct DirectoryListView: View {
     @State private var rows: [ScanController.OutlineRow] = []
     @State private var pendingDelete: ScanController.OutlineRow?
     @State private var deleteError: String?
+    @State private var quickLookURL: URL?
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -21,7 +23,8 @@ struct DirectoryListView: View {
                         metric: controller.metric,
                         controller: controller,
                         requestDelete: { pendingDelete = row },
-                        reportError: { deleteError = $0 }
+                        reportError: { deleteError = $0 },
+                        quickLook: { quickLookURL = $0 }
                     )
                     .listRowInsets(EdgeInsets())
                     .listRowBackground(Color.clear)
@@ -33,6 +36,7 @@ struct DirectoryListView: View {
             .environment(\.defaultMinListRowHeight, 1)
             .scrollContentBackground(.hidden)
             .background(theme.panelBackground)
+            .quickLookPreview($quickLookURL)
             .onAppear { rebuild() }
             .onChange(of: controller.version) { _, _ in rebuild() }
             .onChange(of: controller.expanded) { _, _ in rebuild() }
@@ -99,6 +103,7 @@ private struct OutlineRowView: View {
     let controller: ScanController
     let requestDelete: () -> Void
     let reportError: (String) -> Void
+    let quickLook: (URL) -> Void
 
     @Environment(\.theme) private var theme
     @State private var hovering = false
@@ -199,6 +204,7 @@ private struct OutlineRowView: View {
     private func contextMenu() -> some View {
         if let path = itemPath() {
             if controller.isHostScan {
+                Button { quickLook(URL(fileURLWithPath: path)) } label: { Label("Quick Look", systemImage: "eye") }
                 Button { controller.openItem(path) } label: { Label("Open", systemImage: "arrow.up.forward.app") }
                 Button { controller.revealInFinder(path) } label: { Label("Reveal in Finder", systemImage: "folder") }
                 Button { controller.copyPath(path) } label: { Label("Copy Path", systemImage: "doc.on.doc") }

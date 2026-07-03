@@ -77,12 +77,18 @@ struct TreemapView: View {
             // immediately instead of waiting out the double-click interval.
             .simultaneousGesture(
                 TapGesture(count: 2).onEnded {
+                    // Double-click a folder tile to dive in; double-click a leaf
+                    // (or the gaps) to pop back out — a mouse-only way to zoom out.
                     if let hovered, hovered.node.isDirectory { controller.zoom(into: hovered.node) }
+                    else { controller.zoomOut() }
                 }
             )
+            .contextMenu {
+                if let node = hovered?.node { treemapMenu(for: node) }
+            }
             .overlay(alignment: .bottomLeading) {
                 if let hovered {
-                    HoverLabel(node: hovered.node, metric: controller.metric)
+                    HoverLabel(node: hovered.node, path: hoverPath(hovered.node), metric: controller.metric)
                         .padding(8)
                         .allowsHitTesting(false)
                 }
@@ -97,6 +103,7 @@ struct TreemapView: View {
     }
 
     private func recompute(size: CGSize) {
+        hovered = nil // old tile no longer exists after a relayout — avoid a ghost outline
         guard let zoom = controller.zoomRoot, size.width > 1, size.height > 1 else {
             tiles = []; colors = []; regions = [:]; generation &+= 1
             return
@@ -134,6 +141,40 @@ struct TreemapView: View {
     private func hitTest(_ point: CGPoint) -> TreemapTile? {
         for tile in tiles.reversed() where tile.rect.contains(point) { return tile }
         return nil
+    }
+
+    /// Path of a tile relative to the current zoom root — so identical folder
+    /// names (`Caches`, `node_modules`) are distinguishable on hover.
+    private func hoverPath(_ node: FSNode) -> String {
+        guard let zoom = controller.zoomRoot, node !== zoom else { return node.name }
+        var parts: [String] = []
+        var cur: FSNode? = node
+        while let n = cur, n !== zoom { parts.append(n.name); cur = n.parent }
+        return parts.reversed().joined(separator: "/")
+    }
+
+    @ViewBuilder
+    private func treemapMenu(for node: FSNode) -> some View {
+        if node.isDirectory {
+            Button { controller.zoom(into: node) } label: { Label("Zoom In", systemImage: "plus.magnifyingglass") }
+        }
+        if controller.canZoomOut {
+            Button { controller.zoomOut() } label: { Label("Zoom Out", systemImage: "minus.magnifyingglass") }
+        }
+        if let path = controller.path(for: node) {
+            Divider()
+            if controller.isHostScan {
+                Button { controller.revealInFinder(path) } label: { Label("Reveal in Finder", systemImage: "folder") }
+                Button { controller.copyPath(path) } label: { Label("Copy Path", systemImage: "doc.on.doc") }
+                Divider()
+                Button { Task { _ = await controller.remove(directory: node, permanently: false) } } label: {
+                    Label("Move to Trash", systemImage: "trash")
+                }
+                .disabled(controller.isScanning)
+            } else {
+                Button { controller.copyPath(path) } label: { Label("Copy Path (in VM)", systemImage: "doc.on.doc") }
+            }
+        }
     }
 
     /// Bounding region of a directory in the current layout — so selecting it in
@@ -239,6 +280,7 @@ private struct TreemapCanvas: View, Equatable {
 
 private struct HoverLabel: View {
     let node: FSNode
+    let path: String
     let metric: SizeMetric
     @Environment(\.theme) private var theme
 
@@ -246,9 +288,10 @@ private struct HoverLabel: View {
         HStack(spacing: 6) {
             Image(systemName: node.isDirectory ? "folder.fill" : "doc.fill")
                 .foregroundStyle(theme.accent)
-            Text(node.name)
+            Text(path)
                 .foregroundStyle(theme.textPrimary)
                 .lineLimit(1)
+                .truncationMode(.head)
             Text(Format.bytes(node.size(metric)))
                 .foregroundStyle(theme.textSecondary)
         }
