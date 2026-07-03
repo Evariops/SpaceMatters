@@ -562,10 +562,19 @@ final class ScanController {
         if let r = revealTarget, r === node || Self.isDescendant(r, of: node) { revealTarget = nil }
         expanded = expanded.filter { $0 !== node && !Self.isDescendant($0, of: node) }
 
+        // Keep the "folders" stat honest (A7): drop the whole deleted subtree.
+        dirCount = max(0, dirCount - Self.subtreeDirCount(node))
+
         node.parent?.removeChild(node)
         sortCache.removeAll(); fileCache.removeAll()
         refreshTotals()
         bump()
+    }
+
+    private static func subtreeDirCount(_ node: FSNode) -> Int64 {
+        var total: Int64 = node.isDirectory ? 1 : 0
+        for child in node.children { total += subtreeDirCount(child) }
+        return total
     }
 
     /// Whether `node` lies strictly below `ancestor` in the tree.

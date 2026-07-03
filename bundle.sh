@@ -44,8 +44,16 @@ PLIST
 #      name "MacDirStats", type "Code Signing", self-signed.
 #   2) export CODESIGN_ID="MacDirStats"   (then re-run ./bundle.sh)
 SIGN_ID="${CODESIGN_ID:--}"
-codesign --force --deep --options runtime --sign "$SIGN_ID" "$APP" >/dev/null 2>&1 || \
-    codesign --force --deep --sign "$SIGN_ID" "$APP" >/dev/null 2>&1 || true
+# Prefer a hardened runtime; fall back without it (needed for a debuggable
+# ad-hoc build). Only a *total* signing failure is fatal — don't mask it.
+if codesign --force --deep --options runtime --sign "$SIGN_ID" "$APP" >/dev/null 2>&1; then
+    :
+elif codesign --force --deep --sign "$SIGN_ID" "$APP" >/dev/null 2>&1; then
+    echo "note: signed without hardened runtime"
+else
+    echo "error: codesign failed for identity '${SIGN_ID}'" >&2
+    exit 1
+fi
 
 echo "Done → $PWD/$APP  (signed with: ${SIGN_ID})"
 echo "Launch with: open $APP"

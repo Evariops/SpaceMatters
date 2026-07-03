@@ -32,8 +32,18 @@ struct ContentView: View {
         .preferredColorScheme(isDark ? .dark : .light)
         .background(theme.windowBackground)
         .frame(minWidth: 900, minHeight: 560)
+        .navigationTitle(windowTitle)
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             app.filesystem.refreshFullDiskAccess()
+        }
+    }
+
+    private var windowTitle: String {
+        switch app.route {
+        case .splash: return "MacDirStats"
+        case .filesystem: return app.filesystem.rootName.isEmpty ? "MacDirStats" : app.filesystem.rootName
+        case .containers: return app.containers.engineName.isEmpty ? "Containers" : app.containers.engineName
+        case .kubernetes: return app.kubernetes.contextName.isEmpty ? "Kubernetes" : app.kubernetes.contextName
         }
     }
 }
