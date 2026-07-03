@@ -8,9 +8,11 @@ import AppKit
 @MainActor
 @Observable
 final class ScanController {
-    enum Phase { case idle, scanning, finished, cancelled }
+    enum Phase { case idle, scanning, finished, cancelled, failed }
 
     private(set) var phase: Phase = .idle
+    /// Human-readable reason when `phase == .failed` (e.g. VM scan couldn't run).
+    private(set) var failureMessage: String?
     private(set) var root: FSNode?
     private(set) var rootPath: String = ""
     private(set) var rootName: String = ""
@@ -219,6 +221,7 @@ final class ScanController {
         totalLogical = 0; totalPhysical = 0; fileCount = 0; dirCount = 0; errorCount = 0
         filesPerSecond = 0; elapsed = 0; extRows = []
         startTime = Date(); lastSampleTime = startTime; lastSampleCount = 0; tickIndex = 0
+        failureMessage = nil
         phase = .scanning
 
         scanner.start()
@@ -257,6 +260,7 @@ final class ScanController {
         lastVolumes = []
         lastVM = nil
         isHostScan = true
+        failureMessage = nil
         phase = .idle
 
         totalLogical = 0; totalPhysical = 0; fileCount = 0; dirCount = 0; errorCount = 0
@@ -493,15 +497,25 @@ final class ScanController {
         NSPasteboard.general.setString(path, forType: .string)
     }
 
-    @discardableResult
-    func remove(directory node: FSNode, permanently: Bool) -> Bool {
-        guard node.parent != nil, let path = path(for: node) else { return false }
-        let url = URL(fileURLWithPath: path)
-        do {
-            if permanently { try FileManager.default.removeItem(at: url) }
-            else { try FileManager.default.trashItem(at: url, resultingItemURL: nil) }
-        } catch { return false }
+    /// Rows whose on-disk removal is in flight (the list dims them meanwhile).
+    private(set) var deletingRows: Set<RowID> = []
+    func isDeleting(_ id: RowID) -> Bool { deletingRows.contains(id) }
 
+    /// Trash or delete a directory. The disk I/O runs off the main thread (a big
+    /// `node_modules` no longer beach-balls the UI); the tree/aggregate updates
+    /// are applied back on the main actor once it succeeds.
+    @discardableResult
+    func remove(directory node: FSNode, permanently: Bool) async -> Bool {
+        guard node.parent != nil, let path = path(for: node) else { return false }
+        let rowID = RowID.dir(ObjectIdentifier(node))
+        deletingRows.insert(rowID)
+        defer { deletingRows.remove(rowID) }
+        guard await Self.diskRemove(path: path, permanently: permanently) else { return false }
+        applyDirectoryRemoval(node)
+        return true
+    }
+
+    private func applyDirectoryRemoval(_ node: FSNode) {
         let logical = node.aggLogical.load(ordering: .relaxed)
         let physical = node.aggPhysical.load(ordering: .relaxed)
         let count = node.fileCount.load(ordering: .relaxed)
@@ -530,7 +544,6 @@ final class ScanController {
         sortCache.removeAll(); fileCache.removeAll()
         refreshTotals()
         bump()
-        return true
     }
 
     /// Whether `node` lies strictly below `ancestor` in the tree.
@@ -544,13 +557,12 @@ final class ScanController {
     }
 
     @discardableResult
-    func remove(file: FileItem, parent: FSNode, permanently: Bool) -> Bool {
+    func remove(file: FileItem, parent: FSNode, permanently: Bool) async -> Bool {
         guard let path = path(forFile: file, parent: parent) else { return false }
-        let url = URL(fileURLWithPath: path)
-        do {
-            if permanently { try FileManager.default.removeItem(at: url) }
-            else { try FileManager.default.trashItem(at: url, resultingItemURL: nil) }
-        } catch { return false }
+        let rowID = RowID.file(ObjectIdentifier(parent), file.name)
+        deletingRows.insert(rowID)
+        defer { deletingRows.remove(rowID) }
+        guard await Self.diskRemove(path: path, permanently: permanently) else { return false }
 
         parent.adjustDirectFiles(logical: -file.logical, physical: -file.physical, count: -1)
         var p: FSNode? = parent
@@ -565,6 +577,18 @@ final class ScanController {
         refreshTotals()
         bump()
         return true
+    }
+
+    /// The blocking filesystem call, kept off the main actor.
+    private static func diskRemove(path: String, permanently: Bool) async -> Bool {
+        await Task.detached(priority: .userInitiated) {
+            let url = URL(fileURLWithPath: path)
+            do {
+                if permanently { try FileManager.default.removeItem(at: url) }
+                else { try FileManager.default.trashItem(at: url, resultingItemURL: nil) }
+                return true
+            } catch { return false }
+        }.value
     }
 
     private func refreshTotals() {
@@ -655,7 +679,12 @@ final class ScanController {
         }
 
         if scanner.isFinished && phase == .scanning {
-            phase = .finished
+            if let f = scanner.failure {
+                phase = .failed
+                failureMessage = f
+            } else {
+                phase = .finished
+            }
             filesPerSecond = 0
             stopTimer()
             extRows = scanner.snapshotExtensions(metric: metric, limit: 250)

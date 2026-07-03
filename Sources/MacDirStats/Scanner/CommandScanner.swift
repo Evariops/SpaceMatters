@@ -23,6 +23,12 @@ final class CommandScanner: ScanBackend {
     private var thread: Thread?
     private let finishLock = NSLock()
     private var finished = false
+    private let cancelledFlag = Atomic<Bool>(false)
+
+    private let failureLock = NSLock()
+    private var _failure: String?
+    var failure: String? { failureLock.lock(); defer { failureLock.unlock() }; return _failure }
+    private func setFailure(_ msg: String) { failureLock.lock(); if _failure == nil { _failure = msg }; failureLock.unlock() }
 
     // Touched only by the single reader thread.
     private var nodes: [String: FSNode] = [:]
@@ -47,12 +53,13 @@ final class CommandScanner: ScanBackend {
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
         let outPipe = Pipe()
+        let errPipe = Pipe()
         process.standardOutput = outPipe
-        process.standardError = FileHandle.nullDevice
+        process.standardError = errPipe
         self.process = process
 
         let thread = Thread { [weak self] in
-            self?.readLoop(outPipe.fileHandleForReading, process: process)
+            self?.readLoop(outPipe.fileHandleForReading, errHandle: errPipe.fileHandleForReading, process: process)
         }
         thread.stackSize = 4 << 20
         thread.name = "macdirstats.vm-scanner"
@@ -62,6 +69,7 @@ final class CommandScanner: ScanBackend {
             try process.run()
         } catch {
             errAtomic.wrappingAdd(1, ordering: .relaxed)
+            setFailure("Could not launch the scan command: \(error.localizedDescription)")
             markFinished()
             return
         }
@@ -69,7 +77,8 @@ final class CommandScanner: ScanBackend {
     }
 
     func cancel() {
-        process?.terminate()
+        cancelledFlag.store(true, ordering: .relaxed)
+        process?.terminate() // closes stdout → the reader loop sees EOF and stops
         markFinished()
     }
 
@@ -96,11 +105,19 @@ final class CommandScanner: ScanBackend {
 
     // MARK: Streaming reader
 
-    private func readLoop(_ handle: FileHandle, process: Process) {
+    private func readLoop(_ handle: FileHandle, errHandle: FileHandle, process: Process) {
+        // Drain stderr concurrently: `find` can emit many "Permission denied"
+        // lines, which would otherwise fill the stderr pipe and deadlock stdout.
+        let errBox = Mutex<Data>(Data())
+        let errThread = Thread { errBox.withLock { $0 = errHandle.readDataToEndOfFile() } }
+        errThread.stackSize = 1 << 20
+        errThread.start()
+
         var pending = Data()
         while true {
             let chunk = handle.availableData // returns as soon as bytes arrive; empty == EOF
             if chunk.isEmpty { break }
+            if cancelledFlag.load(ordering: .relaxed) { break } // stop feeding the tree after Stop
             pending.append(chunk)
 
             // Parse every complete line we have so far; keep the remainder.
@@ -113,9 +130,26 @@ final class CommandScanner: ScanBackend {
                 pending.removeSubrange(pending.startIndex..<searchStart)
             }
         }
-        if !pending.isEmpty { parse(pending[...]) }
+        if !cancelledFlag.load(ordering: .relaxed), !pending.isEmpty { parse(pending[...]) }
 
         process.waitUntilExit()
+        while errThread.isExecuting { usleep(2000) } // let stderr finish (EOF after exit)
+
+        // Diagnose a hard failure: a non-zero exit, or a "successful" run that
+        // produced nothing (busybox `find` without -printf, missing stdbuf, sudo
+        // denied) — the difference between "empty volume" and "broken scan".
+        if !cancelledFlag.load(ordering: .relaxed) {
+            let errText = errBox.withLock { String(decoding: $0, as: UTF8.self) }
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let code = process.terminationStatus
+            let produced = root.fileCount.load(ordering: .relaxed) > 0 || dirCountAtomic.load(ordering: .relaxed) > 1
+            if code != 0 {
+                setFailure("Scan command failed (exit \(code)).\(errText.isEmpty ? "" : "\n\(String(errText.prefix(400)))")")
+            } else if !produced {
+                setFailure("Scan produced no results — the VM may lack GNU find / stdbuf, or sudo was denied.\(errText.isEmpty ? "" : "\n\(String(errText.prefix(400)))")")
+            }
+        }
+
         nodes.removeAll()
         largestFile.removeAll()
         markFinished()

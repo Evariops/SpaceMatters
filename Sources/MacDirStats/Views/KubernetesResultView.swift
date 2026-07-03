@@ -16,9 +16,21 @@ struct KubernetesResultView: View {
 
             if controller.pvcs.isEmpty {
                 VStack(spacing: 10) {
-                    ProgressView()
-                    Text("Querying \(controller.contextName)…")
-                        .font(.system(size: 12)).foregroundStyle(theme.textSecondary)
+                    if controller.state == .loading {
+                        ProgressView()
+                        Text("Querying \(controller.contextName)…")
+                            .font(.system(size: 12)).foregroundStyle(theme.textSecondary)
+                    } else {
+                        // .ready with no PVCs: an empty/inaccessible context, not a
+                        // hang. (A dead context now times out via ProcessRunner.)
+                        Image(systemName: "tray")
+                            .font(.system(size: 28)).foregroundStyle(theme.textSecondary)
+                        Text("No PVCs in “\(controller.contextName)”")
+                            .font(.system(size: 13, weight: .medium)).foregroundStyle(theme.textPrimary)
+                        Text("The context has no PersistentVolumeClaims, or access to them was denied.")
+                            .font(.system(size: 11)).foregroundStyle(theme.textSecondary)
+                            .multilineTextAlignment(.center)
+                    }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(theme.windowBackground)

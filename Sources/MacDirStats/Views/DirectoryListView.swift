@@ -9,6 +9,7 @@ struct DirectoryListView: View {
 
     @State private var rows: [ScanController.OutlineRow] = []
     @State private var pendingDelete: ScanController.OutlineRow?
+    @State private var deleteError: String?
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -19,7 +20,8 @@ struct DirectoryListView: View {
                         isSelected: controller.selectedRowID == row.id,
                         metric: controller.metric,
                         controller: controller,
-                        requestDelete: { pendingDelete = row }
+                        requestDelete: { pendingDelete = row },
+                        reportError: { deleteError = $0 }
                     )
                     .listRowInsets(EdgeInsets())
                     .listRowBackground(Color.clear)
@@ -51,7 +53,16 @@ struct DirectoryListView: View {
             } message: { row in
                 Text("“\(name(of: row))” will be deleted immediately. This can't be undone.")
             }
+            .alert("Couldn't delete", isPresented: errorAlert, presenting: deleteError) { _ in
+                Button("OK", role: .cancel) { deleteError = nil }
+            } message: { msg in
+                Text(msg)
+            }
         }
+    }
+
+    private var errorAlert: Binding<Bool> {
+        Binding(get: { deleteError != nil }, set: { if !$0 { deleteError = nil } })
     }
 
     private var deleteAlert: Binding<Bool> {
@@ -59,11 +70,16 @@ struct DirectoryListView: View {
     }
 
     private func performDelete(_ row: ScanController.OutlineRow) {
-        switch row.kind {
-        case .directory(let node): controller.remove(directory: node, permanently: true)
-        case .file(let file, let parent): controller.remove(file: file, parent: parent, permanently: true)
-        }
+        let label = name(of: row)
         pendingDelete = nil
+        Task {
+            let ok: Bool
+            switch row.kind {
+            case .directory(let node): ok = await controller.remove(directory: node, permanently: true)
+            case .file(let file, let parent): ok = await controller.remove(file: file, parent: parent, permanently: true)
+            }
+            if !ok { deleteError = "“\(label)” couldn't be deleted. It may be locked, protected, or already gone." }
+        }
     }
 
     private func name(of row: ScanController.OutlineRow) -> String {
@@ -82,6 +98,7 @@ private struct OutlineRowView: View {
     let metric: SizeMetric
     let controller: ScanController
     let requestDelete: () -> Void
+    let reportError: (String) -> Void
 
     @Environment(\.theme) private var theme
     @State private var hovering = false
@@ -163,6 +180,7 @@ private struct OutlineRowView: View {
         .padding(.leading, CGFloat(row.depth) * 14 + 8)
         .padding(.trailing, 10)
         .padding(.vertical, 3)
+        .opacity(controller.isDeleting(row.id) ? 0.4 : 1)
         .background(rowBackground)
         .contentShape(Rectangle())
         .onTapGesture { select() }
@@ -221,9 +239,14 @@ private struct OutlineRowView: View {
     }
 
     private func moveToTrash() {
-        switch row.kind {
-        case .directory(let node): controller.remove(directory: node, permanently: false)
-        case .file(let file, let parent): controller.remove(file: file, parent: parent, permanently: false)
+        let label = displayName
+        Task {
+            let ok: Bool
+            switch row.kind {
+            case .directory(let node): ok = await controller.remove(directory: node, permanently: false)
+            case .file(let file, let parent): ok = await controller.remove(file: file, parent: parent, permanently: false)
+            }
+            if !ok { reportError("“\(label)” couldn't be moved to the Trash. It may be on a read-only or network volume.") }
         }
     }
 

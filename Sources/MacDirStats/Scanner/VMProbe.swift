@@ -34,17 +34,12 @@ enum VMProbe {
         return nil
     }
 
-    static func capture(_ executable: String, _ args: [String]) -> String? {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = args
-        let out = Pipe()
-        process.standardOutput = out
-        process.standardError = FileHandle.nullDevice
-        do { try process.run() } catch { return nil }
-        let data = out.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        return String(data: data, encoding: .utf8)
+    /// One-shot capture of a command's stdout, with a hard timeout so a wedged
+    /// VM or unreachable API server can't block the caller forever. Returns nil
+    /// when the process had to be killed for timing out.
+    static func capture(_ executable: String, _ args: [String], timeout: TimeInterval = 20) -> String? {
+        let result = ProcessRunner.runSync(executable, args, timeout: timeout)
+        return result.timedOut ? nil : result.stdoutString
     }
 
     /// Detect installed Podman machines and Colima profiles with their state.

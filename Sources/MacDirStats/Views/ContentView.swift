@@ -49,6 +49,11 @@ private struct FilesystemResultView: View {
             ToolbarBar(controller: controller, app: app, isDark: $isDark)
             Divider().overlay(theme.separator)
 
+            if controller.phase == .failed, let msg = controller.failureMessage {
+                ErrorBanner(message: msg)
+                Divider().overlay(theme.separator)
+            }
+
             HSplitView {
                 VSplitView {
                     DirectoryListView(controller: controller)
@@ -62,6 +67,31 @@ private struct FilesystemResultView: View {
                     .frame(minWidth: 360)
             }
         }
+    }
+}
+
+/// Discreet failure banner shown when a scan couldn't complete (VM command
+/// missing, remote find failed, …) — so a broken scan never looks like an empty
+/// one.
+private struct ErrorBanner: View {
+    let message: String
+    @Environment(\.theme) private var theme
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 14))
+                .foregroundStyle(Color(hex: 0xD29922))
+            Text(message)
+                .font(.system(size: 11))
+                .foregroundStyle(theme.textPrimary)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 8)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(Color(hex: 0xD29922).opacity(0.12))
     }
 }
 
