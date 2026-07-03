@@ -36,6 +36,7 @@ struct ContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             app.filesystem.refreshFullDiskAccess()
         }
+        .task { app.handleLaunchArgumentsOnce() }
     }
 
     private var windowTitle: String {

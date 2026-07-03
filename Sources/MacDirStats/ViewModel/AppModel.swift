@@ -22,6 +22,18 @@ final class AppModel {
         route = .splash
     }
 
+    /// `--open <path>`: scan a folder straight from the GUI launch (handy for a
+    /// "reveal in / open with MacDirStats" flow, and for driving the app in tests).
+    @ObservationIgnored private var didHandleLaunch = false
+    func handleLaunchArgumentsOnce() {
+        guard !didHandleLaunch else { return }
+        didHandleLaunch = true
+        let args = CommandLine.arguments
+        guard let idx = args.firstIndex(of: "--open"), idx + 1 < args.count else { return }
+        route = .filesystem
+        filesystem.scan(url: URL(fileURLWithPath: args[idx + 1]))
+    }
+
     // MARK: Filesystem mode
 
     func scan(volumes: [Volume]) {
