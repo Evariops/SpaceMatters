@@ -314,12 +314,15 @@ private struct K8sTreemap: View {
     @Bindable var controller: KubernetesController
     @Environment(\.theme) private var theme
     @State private var hovered: PVCInfo?
+    // Memoised layout: recomputed only when the data or the size changes, never on
+    // hover — mirroring the filesystem treemap so hovering stays free.
+    @State private var tiles: [Tile] = []
+    @State private var lastSize: CGSize = .zero
 
     private struct Tile { let rect: CGRect; let pvc: PVCInfo; let namespace: String }
 
     var body: some View {
         GeometryReader { geo in
-            let tiles = computeTiles(size: geo.size)
             ZStack(alignment: .topLeading) {
                 theme.treemapBackground
                 Canvas { ctx, _ in
@@ -361,6 +364,11 @@ private struct K8sTreemap: View {
             .overlay(alignment: .bottomLeading) {
                 if let hovered { hoverLabel(hovered).padding(8).allowsHitTesting(false) }
             }
+            .onAppear { lastSize = geo.size; tiles = computeTiles(size: geo.size) }
+            .onChange(of: geo.size) { _, s in lastSize = s; tiles = computeTiles(size: s) }
+            .onChange(of: controller.pvcs.count) { _, _ in tiles = computeTiles(size: lastSize) }
+            .onChange(of: controller.metric) { _, _ in tiles = computeTiles(size: lastSize) }
+            .onChange(of: controller.nodesScanned) { _, _ in tiles = computeTiles(size: lastSize) }
         }
     }
 

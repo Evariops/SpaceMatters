@@ -136,12 +136,27 @@ enum K8sQueries {
         return items.compactMap { ($0["metadata"] as? [String: Any])?["name"] as? String }
     }
 
-    /// Live used bytes per PVC reported by one node's kubelet stats.
+    /// Live used bytes per PVC reported by one node's kubelet stats (sync, used by
+    /// the headless path).
     static func nodeUsage(context: String, node: String) -> [String: Int64] {
         guard let kubectl = VMProbe.locate("kubectl"),
-              let raw = VMProbe.capture(kubectl, ["--context", context, "get", "--raw",
-                                                  "/api/v1/nodes/\(node)/proxy/stats/summary"]),
-              let data = raw.data(using: .utf8),
+              let raw = VMProbe.capture(kubectl, ["--context", context, "get", "--raw", rawPath(node)]) else { return [:] }
+        return parseNodeUsage(raw)
+    }
+
+    /// Async variant: runs off the cooperative pool via `ProcessRunner` (a shorter
+    /// per-node timeout so one dead kubelet can't stall the group) and is
+    /// cancellable, so the controller can fan several nodes out in parallel.
+    static func nodeUsageAsync(context: String, node: String) async -> [String: Int64] {
+        guard let kubectl = VMProbe.locate("kubectl") else { return [:] }
+        let r = await ProcessRunner.run(kubectl, ["--context", context, "get", "--raw", rawPath(node)], timeout: 10)
+        return r.ok ? parseNodeUsage(r.stdoutString) : [:]
+    }
+
+    private static func rawPath(_ node: String) -> String { "/api/v1/nodes/\(node)/proxy/stats/summary" }
+
+    private static func parseNodeUsage(_ raw: String) -> [String: Int64] {
+        guard let data = raw.data(using: .utf8),
               let summary = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let pods = summary["pods"] as? [[String: Any]] else { return [:] }
         var usage: [String: Int64] = [:]

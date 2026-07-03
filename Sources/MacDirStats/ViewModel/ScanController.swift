@@ -70,27 +70,40 @@ final class ScanController {
     func isSearchMatch(_ node: FSNode) -> Bool { searchDirect.contains(ObjectIdentifier(node)) }
     var searchMatchIDs: Set<ObjectIdentifier> { searchDirect }
 
+    @ObservationIgnored private var searchGeneration = 0
+
     func setSearch(_ query: String) {
         searchQuery = query
         selectedExt = nil
         highlightVersion &+= 1
+        searchGeneration += 1
+        let gen = searchGeneration
         guard !query.isEmpty, let root else {
             searchDirect = []; searchPath = []; bump(); return
         }
-        var direct = Set<ObjectIdentifier>()
-        var path = Set<ObjectIdentifier>()
-        func walk(_ node: FSNode) {
-            if node.name.range(of: query, options: .caseInsensitive) != nil {
-                direct.insert(ObjectIdentifier(node))
-                var p: FSNode? = node
-                while let cur = p { path.insert(ObjectIdentifier(cur)); p = cur.parent }
-            }
-            for child in node.children { walk(child) }
+        // Walk the tree off the main thread (up to hundreds of thousands of
+        // directories) so typing never hitches; apply the result on the main actor
+        // unless a newer keystroke has already superseded this one.
+        Task { @MainActor in
+            let result = await Task.detached(priority: .userInitiated) { () -> (Set<ObjectIdentifier>, Set<ObjectIdentifier>) in
+                var direct = Set<ObjectIdentifier>()
+                var path = Set<ObjectIdentifier>()
+                func walk(_ node: FSNode) {
+                    if node.name.range(of: query, options: [.caseInsensitive, .diacriticInsensitive]) != nil {
+                        direct.insert(ObjectIdentifier(node))
+                        var p: FSNode? = node
+                        while let cur = p { path.insert(ObjectIdentifier(cur)); p = cur.parent }
+                    }
+                    for child in node.children { walk(child) }
+                }
+                walk(root)
+                return (direct, path)
+            }.value
+            guard gen == self.searchGeneration else { return }
+            self.searchDirect = result.0
+            self.searchPath = result.1
+            self.bump()
         }
-        walk(root)
-        searchDirect = direct
-        searchPath = path
-        bump()
     }
 
     /// True for local host scans; false for VM scans (whose paths aren't host
@@ -99,6 +112,7 @@ final class ScanController {
 
     private var scanner: (any ScanBackend)?
     private var timer: Timer?
+    private var scanActivity: NSObjectProtocol?
     private var startTime = Date()
     private var lastSampleTime = Date()
     private var lastSampleCount: Int64 = 0
@@ -305,7 +319,11 @@ final class ScanController {
     // Caches (not observed).
     @ObservationIgnored private var sortCache: [ObjectIdentifier: [FSNode]] = [:]
     @ObservationIgnored private var sortCacheMetric: SizeMetric = .physical
-    @ObservationIgnored private var fileCache: [ObjectIdentifier: [FileItem]] = [:]
+    /// Cached file listing per directory, tagged with the directory's direct-file
+    /// count so it stays valid during a live scan and only re-enumerates the disk
+    /// when that directory's contents actually changed.
+    private struct FileListing { let count: Int64; let items: [FileItem] }
+    @ObservationIgnored private var fileCache: [ObjectIdentifier: FileListing] = [:]
     /// Resolved paths for seed (root/volume) nodes, so any node's full path can be
     /// rebuilt on demand without storing a path on every node.
     @ObservationIgnored private var nodePaths: [ObjectIdentifier: String] = [:]
@@ -349,10 +367,14 @@ final class ScanController {
         // VM scans enumerate over SSH; we don't re-shell per expanded folder.
         guard isHostScan else { return [] }
         let key = ObjectIdentifier(node)
-        if phase != .scanning, let cached = fileCache[key] { return cached }
+        let count = node.directFileCount
+        // Valid as long as the folder's file count is unchanged — true across the
+        // 10 Hz refresh during a scan (a folder's files are set once, atomically)
+        // and forever after it.
+        if let cached = fileCache[key], cached.count == count { return cached.items }
 
         var items: [FileItem] = []
-        if node.directFileCount > 0, let dirPath = path(for: node) {
+        if count > 0, let dirPath = path(for: node) {
             let fd = open(dirPath, O_RDONLY | O_DIRECTORY)
             if fd >= 0 {
                 let bufSize = 64 * 1024
@@ -370,7 +392,7 @@ final class ScanController {
             items.sort { $0.physical > $1.physical }
             items.removeLast(items.count - Self.maxFilesPerFolder)
         }
-        if phase != .scanning { fileCache[key] = items }
+        fileCache[key] = FileListing(count: count, items: items)
         return items
     }
 
@@ -572,7 +594,7 @@ final class ScanController {
             a.fileCount.wrappingAdd(-1, ordering: .relaxed)
             p = a.parent
         }
-        fileCache[ObjectIdentifier(parent)]?.removeAll { $0.name == file.name }
+        fileCache[ObjectIdentifier(parent)] = nil // re-enumerate fresh next time
         sortCache.removeAll()
         refreshTotals()
         bump()
@@ -652,9 +674,14 @@ final class ScanController {
     // MARK: Timer / refresh
 
     private func startTimer() {
+        // Keep App Nap from throttling the scan when the app loses focus, but still
+        // allow the system to sleep on idle (respectful of battery).
+        scanActivity = ProcessInfo.processInfo.beginActivity(
+            options: .userInitiatedAllowingIdleSystemSleep, reason: "Disk scan")
         let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh(final: false) }
         }
+        timer.tolerance = 0.02 // let the OS coalesce wake-ups
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
     }
@@ -662,6 +689,10 @@ final class ScanController {
     private func stopTimer() {
         timer?.invalidate()
         timer = nil
+        if let activity = scanActivity {
+            ProcessInfo.processInfo.endActivity(activity)
+            scanActivity = nil
+        }
     }
 
     private func refresh(final: Bool) {

@@ -89,15 +89,28 @@ final class KubernetesController {
         let nodes = await Task.detached(priority: .userInitiated) { K8sQueries.nodeNames(context: context) }.value
         guard id == loadID else { return }
         nodesTotal = nodes.count
-        for node in nodes {
-            let usage = await Task.detached(priority: .userInitiated) { K8sQueries.nodeUsage(context: context, node: node) }.value
-            guard id == loadID else { return }
-            nodesScanned += 1
-            if !usage.isEmpty {
-                usageAvailable = true
-                applyUsage(usage)
+
+        // Fan out node usage with a bounded number in flight (kubelets tolerate it)
+        // so a 50-node cluster fills its gauges in seconds, not ~half a minute. A
+        // dead node just times out in its slot instead of stalling the whole line.
+        await withTaskGroup(of: [String: Int64].self) { group in
+            var next = nodes.makeIterator()
+            let maxInFlight = min(6, nodes.count)
+            for _ in 0..<maxInFlight {
+                if let node = next.next() {
+                    group.addTask { await K8sQueries.nodeUsageAsync(context: context, node: node) }
+                }
+            }
+            while let usage = await group.next() {
+                if id != loadID { group.cancelAll(); return }
+                nodesScanned += 1
+                if !usage.isEmpty { usageAvailable = true; applyUsage(usage) }
+                if let node = next.next() {
+                    group.addTask { await K8sQueries.nodeUsageAsync(context: context, node: node) }
+                }
             }
         }
+        guard id == loadID else { return }
         state = .ready
     }
 

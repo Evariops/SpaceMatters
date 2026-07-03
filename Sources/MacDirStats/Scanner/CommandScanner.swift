@@ -131,6 +131,7 @@ final class CommandScanner: ScanBackend {
             }
         }
         if !cancelledFlag.load(ordering: .relaxed), !pending.isEmpty { parse(pending[...]) }
+        flushAccumulator() // propagate the final directory's batch
 
         process.waitUntilExit()
         while errThread.isExecuting { usleep(2000) } // let stderr finish (EOF after exit)
@@ -191,15 +192,11 @@ final class CommandScanner: ScanBackend {
         } else { // file, symlink, etc.
             let (parentPath, name) = Self.split(path)
             let parent = nodes[parentPath] ?? root
-            parent.adjustDirectFiles(logical: logical, physical: physical, count: 1)
-
-            var node: FSNode? = parent
-            while let cur = node {
-                cur.aggLogical.wrappingAdd(logical, ordering: .relaxed)
-                cur.aggPhysical.wrappingAdd(physical, ordering: .relaxed)
-                cur.fileCount.wrappingAdd(1, ordering: .relaxed)
-                node = cur.parent
-            }
+            // `find` lists a directory's files consecutively: accumulate them and
+            // walk the ancestor chain once per directory, not once per file.
+            if parent !== accParent { flushAccumulator() }
+            accParent = parent
+            accLogical += logical; accPhysical += physical; accCount += 1
 
             let key = ExtKey(fileName: name)
             extLock.lock()
@@ -213,6 +210,25 @@ final class CommandScanner: ScanBackend {
                 parent.updateDominantExt(key)
             }
         }
+    }
+
+    // Batched ancestor propagation (see file branch above).
+    private var accParent: FSNode?
+    private var accLogical: Int64 = 0
+    private var accPhysical: Int64 = 0
+    private var accCount: Int64 = 0
+
+    private func flushAccumulator() {
+        guard let parent = accParent, accCount > 0 else { accParent = nil; return }
+        parent.adjustDirectFiles(logical: accLogical, physical: accPhysical, count: accCount)
+        var node: FSNode? = parent
+        while let cur = node {
+            cur.aggLogical.wrappingAdd(accLogical, ordering: .relaxed)
+            cur.aggPhysical.wrappingAdd(accPhysical, ordering: .relaxed)
+            cur.fileCount.wrappingAdd(accCount, ordering: .relaxed)
+            node = cur.parent
+        }
+        accParent = nil; accLogical = 0; accPhysical = 0; accCount = 0
     }
 
     private func asciiInt(_ b: [UInt8], _ lo: Int, _ hi: Int) -> Int64 {
