@@ -34,6 +34,13 @@ final class AppModel {
         filesystem.scanVM(machine: machine, scope: .full)
     }
 
+    /// Scan only the VM's image/container storage (GraphRoot) — the subtree a dev
+    /// usually cares about when a Podman/Colima VM has grown large.
+    func scanVMContainers(_ machine: VMMachine) {
+        route = .filesystem
+        filesystem.scanVM(machine: machine, scope: .containers)
+    }
+
     func openFolder() {
         filesystem.chooseFolderAndScan()
         if filesystem.root != nil { route = .filesystem }

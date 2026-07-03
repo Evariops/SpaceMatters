@@ -120,11 +120,11 @@ final class CommandScanner: ScanBackend {
             if cancelledFlag.load(ordering: .relaxed) { break } // stop feeding the tree after Stop
             pending.append(chunk)
 
-            // Parse every complete line we have so far; keep the remainder.
+            // Parse every complete NUL-terminated record; keep the remainder.
             var searchStart = pending.startIndex
-            while let nl = pending[searchStart...].firstIndex(of: 0x0A) {
-                parse(pending[searchStart..<nl])
-                searchStart = pending.index(after: nl)
+            while let nul = pending[searchStart...].firstIndex(of: 0x00) {
+                parse(pending[searchStart..<nul])
+                searchStart = pending.index(after: nul)
             }
             if searchStart > pending.startIndex {
                 pending.removeSubrange(pending.startIndex..<searchStart)

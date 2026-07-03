@@ -89,11 +89,13 @@ enum VMProbe {
         }
     }
 
-    /// Build the streamed-`find` command for a VM scan. `stdbuf -oL` forces
-    /// line-buffered output so results stream out continuously (reactive UI).
+    /// Build the streamed-`find` command for a VM scan. Records are NUL-terminated
+    /// so filenames containing newlines can't split a record; `stdbuf -o0` keeps
+    /// output unbuffered (NUL delimiters defeat line-buffering) so results still
+    /// stream continuously for a reactive UI.
     static func scanCommand(machine: VMMachine, scope: VMScope) -> (executable: String, arguments: [String], rootPath: String) {
         let rootPath = scope == .full ? "/" : containerStoragePath(for: machine)
-        let remote = "sudo stdbuf -oL find \(rootPath) -xdev -printf '%y\\t%b\\t%s\\t%p\\n'"
+        let remote = "sudo stdbuf -o0 find \(rootPath) -xdev -printf '%y\\t%b\\t%s\\t%p\\0'"
         switch machine.runtime {
         case .podman:
             return (machine.executable, ["machine", "ssh", machine.name, remote], rootPath)

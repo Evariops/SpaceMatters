@@ -408,6 +408,7 @@ private struct EmptyState: View {
                         LazyVGrid(columns: columns, spacing: 14) {
                             ForEach(vms) { vm in
                                 VMCard(machine: vm, scope: .full, theme: theme) { app.scanVMFilesystem(vm) }
+                                VMCard(machine: vm, scope: .containers, theme: theme) { app.scanVMContainers(vm) }
                             }
                         }
                     }

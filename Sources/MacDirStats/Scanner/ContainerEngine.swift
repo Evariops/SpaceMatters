@@ -65,6 +65,10 @@ enum ContainerProbe {
         if let podman = VMProbe.locate("podman"), podmanReachable(podman) {
             engines.append(ContainerEngine(kind: .podman, executable: podman))
         }
+        // Docker (Desktop / colima-docker): reachable only when the daemon is up.
+        if let docker = VMProbe.locate("docker"), dockerReachable(docker) {
+            engines.append(ContainerEngine(kind: .docker, executable: docker))
+        }
         return engines
     }
 
@@ -73,6 +77,12 @@ enum ContainerProbe {
               let data = json.data(using: .utf8),
               let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return false }
         return arr.contains { ($0["Running"] as? Bool) ?? false }
+    }
+
+    private static func dockerReachable(_ executable: String) -> Bool {
+        // `docker info` only prints a server version when the daemon answers.
+        guard let out = VMProbe.capture(executable, ["info", "--format", "{{.ServerVersion}}"], timeout: 8) else { return false }
+        return !out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 }
 
@@ -181,7 +191,24 @@ enum ContainerQueries {
         if let i = value as? Int64 { return i }
         if let i = value as? Int { return Int64(i) }
         if let n = value as? NSNumber { return n.int64Value }
-        if let s = value as? String { return Int64(s) ?? 0 }
+        if let s = value as? String {
+            if let plain = Int64(s) { return plain }
+            return parseHumanSize(s) // docker reports sizes as "1.2GB", "512MB", "0B"
+        }
+        return 0
+    }
+
+    /// Parse a docker-style human size ("1.2GB", "512MB", "0B") to bytes. Decimal
+    /// units, matching docker's own output. Returns 0 for anything unrecognised.
+    private static func parseHumanSize(_ raw: String) -> Int64 {
+        let s = raw.trimmingCharacters(in: .whitespaces)
+        let units: [(String, Double)] = [
+            ("TB", 1e12), ("GB", 1e9), ("MB", 1e6), ("kB", 1e3), ("KB", 1e3), ("B", 1),
+        ]
+        for (suffix, mult) in units where s.hasSuffix(suffix) {
+            let num = s.dropLast(suffix.count).trimmingCharacters(in: .whitespaces)
+            if let v = Double(num) { return Int64(v * mult) }
+        }
         return 0
     }
 
