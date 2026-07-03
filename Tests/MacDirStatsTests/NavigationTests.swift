@@ -88,6 +88,60 @@ import Foundation
         #expect(Self.child(c.root!, "A") == nil)
     }
 
+    @Test func listSelectionTracksPrimaryAndSet() async throws {
+        let root = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let c = ScanController()
+        c.scan(url: root)
+        await Self.waitForScan(c)
+
+        let a = try #require(Self.child(c.root!, "A"))
+        let sibling = try #require(Self.child(c.root!, "sibling"))
+
+        // Multi-select (as the native table would): two directories, `sibling` primary.
+        let ids: Set<ScanController.RowID> = [
+            .dir(ObjectIdentifier(a)), .dir(ObjectIdentifier(sibling)),
+        ]
+        c.setListSelection(ids, primary: .init(
+            kind: .directory(sibling), depth: 0, siblingMax: 1,
+            isExpandable: false, isExpanded: false, id: .dir(ObjectIdentifier(sibling))))
+
+        // The full set drives mass actions; the primary drives the treemap.
+        #expect(c.selectedRowIDs == ids)
+        #expect(c.selection === sibling)
+        #expect(c.selectedRowID == .dir(ObjectIdentifier(sibling)))
+
+        // A single programmatic select collapses back to one row (no stale multi).
+        c.selectDirectory(a)
+        #expect(c.selectedRowIDs == [.dir(ObjectIdentifier(a))])
+        #expect(c.selection === a)
+    }
+
+    @Test func deletingAncestorClearsStaleMultiSelection() async throws {
+        let root = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let c = ScanController()
+        c.scan(url: root)
+        await Self.waitForScan(c)
+
+        let a = try #require(Self.child(c.root!, "A"))
+        let b = try #require(Self.child(a, "B"))
+        let sibling = try #require(Self.child(c.root!, "sibling"))
+
+        // Select A, B (inside A) and sibling; then delete A.
+        c.setListSelection(
+            [.dir(ObjectIdentifier(a)), .dir(ObjectIdentifier(b)), .dir(ObjectIdentifier(sibling))],
+            primary: .init(kind: .directory(b), depth: 0, siblingMax: 1,
+                           isExpandable: false, isExpanded: false, id: .dir(ObjectIdentifier(b))))
+        _ = await c.remove(directory: a, permanently: true)
+
+        // No selected id may point into the freed A/B subtree.
+        #expect(!c.selectedRowIDs.contains(.dir(ObjectIdentifier(a))))
+        #expect(!c.selectedRowIDs.contains(.dir(ObjectIdentifier(b))))
+        // What's left is exactly the surviving primary row.
+        #expect(c.selectedRowIDs == c.selectedRowID.map { [$0] } ?? [])
+    }
+
     @Test func deletingFileUpdatesAggregatesAndCount() async throws {
         let root = try Self.makeFixture()
         defer { try? FileManager.default.removeItem(at: root) }

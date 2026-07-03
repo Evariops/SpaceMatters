@@ -1,7 +1,17 @@
 # SPEC-01 — Navigation clavier & liste native
 
 > **Findings** : J3.1 (app 100 % souris), J4.2 (pas de ⌘⌫ ni multi-sélection), partiellement J3.7 (tri/colonnes). Renvoie à D-E du plan.
-> **Statut** : tenté en live (SwiftUI `List(selection:)`) puis **annulé** — voir « Leçon acquise ». Ce spec acte le chemin fiable.
+> **Statut** : ✅ **IMPLÉMENTÉ** (Axe B — `NSTableView` en `NSViewRepresentable`). Voir [DirectoryTable.swift](../Sources/MacDirStats/Views/DirectoryTable.swift).
+
+## 0. Résultat d'implémentation
+
+- `DirectoryTable: NSViewRepresentable` (NSScrollView + `MacDirTableView`), lignes = `NSHostingView(OutlineRowView)` → **zéro régression visuelle** (rendu SwiftUI réutilisé tel quel).
+- Souris **déterministe** : `MacDirTableView.hitTest` renvoie la table pour tout point in-bounds (cellules purement visuelles) ; la sélection passe par `NSTableView.mouseDown`/`row(at:)`, pas par le forwarding de la chaîne de responders. Chevron plier/déplier par géométrie dans `mouseDown`.
+- Clavier : ↑/↓ natifs, ←/→ plier/parent & déplier/enfant, ⏎ zoom/ouvrir, **⌘⌫ corbeille de la sélection (gaté `!isScanning`)**, espace Quick Look, type-select natif.
+- **Multi-sélection** (`allowsMultipleSelection`) : `ScanController.selectedRowIDs` (set) + `setListSelection(_:primary:)` — le *primary* pilote le treemap, le set pilote ⌘⌫. Menu contextuel par ligne (Quick Look/Open/Reveal/Copy/Trash/Delete) via `menu(for:)`.
+- Synchro treemap↔liste : `selectedRowID` reste la source unique ; `updateNSView` idempotent, `scrollRowToVisible` sur `revealTarget`.
+- **Vérifié** : build vert ; 12 tests (dont `listSelectionTracksPrimaryAndSet`, `deletingAncestorClearsStaleMultiSelection`) ; **live** — table native rend l'outline avec fidélité totale (chevrons/icônes/barres/tailles/tri), sélection dessinée, **chaque ligne exposée à l'AX** avec label (« Folder alpha, 1000 KB »), aucun crash. Le pilotage par événements synthétisés (clic/flèches) était bloqué par un panneau *Secure Event Input* d'une autre app ; logique couverte par les tests ViewModel.
+- **Reste optionnel (hors scope 100 %)** : J3.7 en-têtes de colonnes triables — explicitement « facultatif » au §5.7. Menu contextuel multi-cible (aujourd'hui ⌘⌫ couvre la corbeille de masse).
 
 ## 1. Objectif
 

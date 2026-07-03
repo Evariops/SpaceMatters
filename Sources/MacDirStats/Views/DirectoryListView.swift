@@ -2,66 +2,48 @@ import SwiftUI
 import QuickLook
 
 /// Live directory outline: folders plus the files inside each opened folder
-/// (listed on demand). Flattened to a single array so the native `List`
-/// virtualizes it — selection/expansion stays O(visible-on-screen).
+/// (listed on demand). Rendered by a native `NSTableView` (`DirectoryTable`) for
+/// deterministic keyboard navigation, multi-selection and focus; this wrapper
+/// owns the SwiftUI-level chrome (delete confirmation, error alert, Quick Look).
 struct DirectoryListView: View {
-    @Bindable var controller: ScanController
+    let controller: ScanController
     @Environment(\.theme) private var theme
 
-    @State private var rows: [ScanController.OutlineRow] = []
     @State private var pendingDelete: ScanController.OutlineRow?
     @State private var deleteError: String?
     @State private var quickLookURL: URL?
 
     var body: some View {
-        ScrollViewReader { proxy in
-            List {
-                ForEach(rows) { row in
-                    OutlineRowView(
-                        row: row,
-                        isSelected: controller.selectedRowID == row.id,
-                        metric: controller.metric,
-                        controller: controller,
-                        requestDelete: { pendingDelete = row },
-                        reportError: { deleteError = $0 },
-                        quickLook: { quickLookURL = $0 }
-                    )
-                    .listRowInsets(EdgeInsets())
-                    .listRowBackground(Color.clear)
-                    .listRowSeparator(.hidden)
-                    .id(row.id)
-                }
-            }
-            .listStyle(.plain)
-            .environment(\.defaultMinListRowHeight, 1)
-            .scrollContentBackground(.hidden)
-            .background(theme.panelBackground)
-            .quickLookPreview($quickLookURL)
-            .onAppear { rebuild() }
-            .onChange(of: controller.version) { _, _ in rebuild() }
-            .onChange(of: controller.expanded) { _, _ in rebuild() }
-            .onChange(of: controller.metric) { _, _ in rebuild() }
-            .onChange(of: controller.revealTarget) { _, target in
-                guard let target else { return }
-                // Rebuild first so the target row exists, then scroll to it. Avoids
-                // a race where scrollTo runs before the expanded rows are present.
-                rebuild()
-                DispatchQueue.main.async {
-                    proxy.scrollTo(ScanController.RowID.dir(ObjectIdentifier(target)), anchor: .center)
-                    controller.revealTarget = nil
-                }
-            }
-            .alert("Delete permanently?", isPresented: deleteAlert, presenting: pendingDelete) { row in
-                Button("Delete", role: .destructive) { performDelete(row) }
-                Button("Cancel", role: .cancel) { pendingDelete = nil }
-            } message: { row in
-                Text("“\(name(of: row))” will be deleted immediately. This can't be undone.")
-            }
-            .alert("Couldn't delete", isPresented: errorAlert, presenting: deleteError) { _ in
-                Button("OK", role: .cancel) { deleteError = nil }
-            } message: { msg in
-                Text(msg)
-            }
+        // Reading these keeps the representable in sync: `version` at refresh rate,
+        // and the selection / reveal / structure inputs on demand.
+        let _ = controller.version
+        let _ = controller.selectedRowIDs
+        let _ = controller.revealTarget
+        let _ = controller.expanded
+        let _ = controller.metric
+        let rows = controller.visibleRows()
+
+        DirectoryTable(
+            controller: controller,
+            rows: rows,
+            theme: theme,
+            version: controller.version,
+            requestDelete: { pendingDelete = $0 },
+            reportError: { deleteError = $0 },
+            quickLook: { quickLookURL = $0 }
+        )
+        .background(theme.panelBackground)
+        .quickLookPreview($quickLookURL)
+        .alert("Delete permanently?", isPresented: deleteAlert, presenting: pendingDelete) { row in
+            Button("Delete", role: .destructive) { performDelete(row) }
+            Button("Cancel", role: .cancel) { pendingDelete = nil }
+        } message: { row in
+            Text("“\(name(of: row))” will be deleted immediately. This can't be undone.")
+        }
+        .alert("Couldn't delete", isPresented: errorAlert, presenting: deleteError) { _ in
+            Button("OK", role: .cancel) { deleteError = nil }
+        } message: { msg in
+            Text(msg)
         }
     }
 
@@ -92,21 +74,18 @@ struct DirectoryListView: View {
         case .file(let file, _): return file.name
         }
     }
-
-    private func rebuild() { rows = controller.visibleRows() }
 }
 
-private struct OutlineRowView: View {
+/// Presentation-only row. All interaction (selection, activation, chevron,
+/// context menu, keyboard) is owned by `DirectoryTable`/`MacDirTableView`, so
+/// this view carries no gestures — it just draws, keyed off the passed-in state.
+struct OutlineRowView: View {
     let row: ScanController.OutlineRow
     let isSelected: Bool
+    let isHovered: Bool
     let metric: SizeMetric
     let controller: ScanController
-    let requestDelete: () -> Void
-    let reportError: (String) -> Void
-    let quickLook: (URL) -> Void
-
-    @Environment(\.theme) private var theme
-    @State private var hovering = false
+    let theme: Theme
 
     private var isDirectory: Bool {
         if case .directory = row.kind { return true }
@@ -147,8 +126,6 @@ private struct OutlineRowView: View {
                         .foregroundStyle(theme.textSecondary)
                         .font(.system(size: 9, weight: .bold))
                         .frame(width: 12)
-                        .contentShape(Rectangle())
-                        .onTapGesture { toggle() }
                 } else {
                     Color.clear.frame(width: 12)
                 }
@@ -185,13 +162,9 @@ private struct OutlineRowView: View {
         .padding(.leading, CGFloat(row.depth) * 14 + 8)
         .padding(.trailing, 10)
         .padding(.vertical, 3)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .opacity(controller.isDeleting(row.id) ? 0.4 : 1)
         .background(rowBackground)
-        .contentShape(Rectangle())
-        .onTapGesture { select() }
-        .simultaneousGesture(TapGesture(count: 2).onEnded { activate() })
-        .onHover { hovering = $0 }
-        .contextMenu { contextMenu() }
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(isDirectory ? "Folder" : "File") \(displayName), \(Format.bytes(size))")
         .accessibilityAddTraits(isSelected ? [.isSelected] : [])
@@ -199,71 +172,8 @@ private struct OutlineRowView: View {
 
     private var rowBackground: Color {
         if isSelected { return theme.rowSelected }
-        if hovering { return theme.rowHover }
+        if isHovered { return theme.rowHover }
         return .clear
-    }
-
-    @ViewBuilder
-    private func contextMenu() -> some View {
-        if let path = itemPath() {
-            if controller.isHostScan {
-                Button { quickLook(URL(fileURLWithPath: path)) } label: { Label("Quick Look", systemImage: "eye") }
-                Button { controller.openItem(path) } label: { Label("Open", systemImage: "arrow.up.forward.app") }
-                Button { controller.revealInFinder(path) } label: { Label("Reveal in Finder", systemImage: "folder") }
-                Button { controller.copyPath(path) } label: { Label("Copy Path", systemImage: "doc.on.doc") }
-                Divider()
-                // Deleting while the scan is still running would corrupt totals:
-                // queued workers keep feeding the detached subtree's ancestors.
-                Button { moveToTrash() } label: { Label("Move to Trash", systemImage: "trash") }
-                    .disabled(controller.isScanning)
-                Button(role: .destructive, action: requestDelete) {
-                    Label("Delete Permanently…", systemImage: "trash.slash")
-                }
-                .disabled(controller.isScanning)
-            } else {
-                // VM scan: paths live inside the VM, so host actions don't apply.
-                Button { controller.copyPath(path) } label: { Label("Copy Path (in VM)", systemImage: "doc.on.doc") }
-            }
-        }
-    }
-
-    private func toggle() {
-        if case .directory(let node) = row.kind { controller.toggleExpanded(node) }
-    }
-
-    private func select() {
-        switch row.kind {
-        case .directory(let node): controller.selectDirectory(node)
-        case .file(let file, let parent): controller.selectFile(file, parent: parent)
-        }
-    }
-
-    private func activate() {
-        switch row.kind {
-        case .directory(let node):
-            controller.zoom(into: node)
-        case .file(let file, let parent):
-            if let path = controller.path(forFile: file, parent: parent) { controller.openItem(path) }
-        }
-    }
-
-    private func moveToTrash() {
-        let label = displayName
-        Task {
-            let ok: Bool
-            switch row.kind {
-            case .directory(let node): ok = await controller.remove(directory: node, permanently: false)
-            case .file(let file, let parent): ok = await controller.remove(file: file, parent: parent, permanently: false)
-            }
-            if !ok { reportError("“\(label)” couldn't be moved to the Trash. It may be on a read-only or network volume.") }
-        }
-    }
-
-    private func itemPath() -> String? {
-        switch row.kind {
-        case .directory(let node): return controller.path(for: node)
-        case .file(let file, let parent): return controller.path(forFile: file, parent: parent)
-        }
     }
 
     /// Extension label matching the File-types legend (e.g. ".png", "[no extension]").

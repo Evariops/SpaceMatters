@@ -219,6 +219,7 @@ final class ScanController {
         self.zoomRoot = root
         self.selection = root
         self.selectedRowID = .dir(ObjectIdentifier(root))
+        self.selectedRowIDs = [.dir(ObjectIdentifier(root))]
         self.expanded = [root]
         self.revealTarget = nil
         self.selectedExt = nil
@@ -267,6 +268,7 @@ final class ScanController {
         zoomRoot = nil
         selection = nil
         selectedRowID = nil
+        selectedRowIDs = []
         revealTarget = nil
         expanded = []
         rootPath = ""
@@ -314,7 +316,12 @@ final class ScanController {
     }
 
     /// Highlighted row (dirs or files). The treemap separately uses `selection`.
+    /// This is the *primary* (focused) row — the one that drives the treemap.
     var selectedRowID: RowID?
+    /// Full list selection (native table multi-select), for mass actions like
+    /// ⌘⌫. Always contains `selectedRowID` when non-nil. List-only; the treemap
+    /// and breadcrumb track only the primary `selection`.
+    var selectedRowIDs: Set<RowID> = []
 
     // Caches (not observed).
     @ObservationIgnored private var sortCache: [ObjectIdentifier: [FSNode]] = [:]
@@ -339,11 +346,30 @@ final class ScanController {
     func selectDirectory(_ node: FSNode) {
         selection = node
         selectedRowID = .dir(ObjectIdentifier(node))
+        selectedRowIDs = [selectedRowID!]
     }
 
     func selectFile(_ file: FileItem, parent: FSNode) {
         selection = parent
         selectedRowID = .file(ObjectIdentifier(parent), file.name)
+        selectedRowIDs = [selectedRowID!]
+    }
+
+    /// Apply a multi-row selection coming from the native list. `primary` (the
+    /// focused/last-clicked row) drives the treemap selection; the full set drives
+    /// mass actions (⌘⌫). Kept distinct from `selectDirectory` so a multi-select
+    /// isn't collapsed to a single row.
+    func setListSelection(_ ids: Set<RowID>, primary: OutlineRow?) {
+        selectedRowIDs = ids
+        guard let primary else { selection = nil; selectedRowID = nil; return }
+        switch primary.kind {
+        case .directory(let node):
+            selection = node
+            selectedRowID = .dir(ObjectIdentifier(node))
+        case .file(_, let parent):
+            selection = parent
+            selectedRowID = primary.id
+        }
     }
 
     /// Children sorted by current metric, cached after the scan so repeated
@@ -501,6 +527,7 @@ final class ScanController {
         expandAncestors(of: node)
         selection = node
         selectedRowID = .dir(ObjectIdentifier(node))
+        selectedRowIDs = [selectedRowID!]
         revealTarget = node
     }
 
@@ -559,6 +586,9 @@ final class ScanController {
             selection = survivor
             selectedRowID = survivor.map { .dir(ObjectIdentifier($0)) }
         }
+        // Collapse the list selection onto the surviving primary row: any freed
+        // rows must not linger in `selectedRowIDs` (they'd point at detached nodes).
+        selectedRowIDs = selectedRowID.map { [$0] } ?? []
         if let r = revealTarget, r === node || Self.isDescendant(r, of: node) { revealTarget = nil }
         expanded = expanded.filter { $0 !== node && !Self.isDescendant($0, of: node) }
 
@@ -636,6 +666,7 @@ final class ScanController {
     private func setSelection(_ node: FSNode?) {
         selection = node
         selectedRowID = node.map { .dir(ObjectIdentifier($0)) }
+        selectedRowIDs = selectedRowID.map { [$0] } ?? []
     }
 
     func zoom(into node: FSNode) {
