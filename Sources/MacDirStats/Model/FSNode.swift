@@ -100,6 +100,14 @@ final class FSNode {
         _directFileCount.store(max(0, directFileCount + count), ordering: .relaxed)
     }
 
+    /// Zero this node's subtree aggregates ahead of an in-place re-scan (SPEC-02
+    /// `invalidate`): the re-scan re-propagates fresh direct-file totals into it.
+    func zeroAggregates() {
+        aggLogical.store(0, ordering: .relaxed)
+        aggPhysical.store(0, ordering: .relaxed)
+        fileCount.store(0, ordering: .relaxed)
+    }
+
     /// Called once by the owning worker after a directory's entries are read.
     func finishScan(
         children: [FSNode],

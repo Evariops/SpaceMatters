@@ -1,6 +1,15 @@
 # SPEC-02 — Invalidation & re-scan de sous-arbre
 
-> **Findings** : B1 (cure de fond — le garde-fou est déjà en place), **A6** (table des types périmée après suppression, non résolu), A7 (compteur dossiers — déjà patché ponctuellement), J4.4 (delete pendant scan — gaté), D1 (TOCTOU). Renvoie à D-B/S2 du plan.
+> **Findings** : B1 (cure de fond — le garde-fou est déjà en place), **A6** (table des types périmée après suppression), A7 (compteur dossiers), J4.4 (delete pendant scan — gaté), D1 (TOCTOU). Renvoie à D-B/S2 du plan.
+> **Statut** : ✅ **IMPLÉMENTÉ** — A6 résolu (chemin suppression, exact) + brique `invalidate(subtree:)` livrée pour SPEC-04.
+
+## 0. Résultat d'implémentation
+
+- **A6 résolu (exact) — suppression** : `remove(directory:)` walk le sous-arbre **avant** suppression (`DirectoryScanner.subtreeExtensions(path:)`, miroir exact du tally du scan : même `ExtKey`, mêmes tailles alloc/logique) et retranche cette contribution de la table `extStats` du scanner (`subtractExtensions`, entrées à zéro supprimées). `remove(file:)` retranche l'extension du fichier. Le panneau File-types se met à jour. Test : `deletingSubtreeUpdatesFileTypeTable` (les `.mp4` supprimés disparaissent, `.txt` intact).
+- **Brique `invalidate(subtree:)`** (réutilisée par SPEC-04) : re-scan **en place** du sous-arbre (seed sur le nœud → parents corrects), réconciliation **exacte** des agrégats ancêtres (delta ancien→neuf), du **dirCount** (A7), et **ré-résolution nav par chemin** (`node(at:)`) car les nœuds descendants deviennent des objets neufs (pas de dangling `unowned`). Test : `invalidateReflectsExternalChanges` (ajout fichier+dossier externe reflété, zoom re-lié par chemin).
+- **Approche = hybride recommandé (§4/§7)** : soustraction exacte des agrégats conservée (évite de re-scanner un parent potentiellement énorme) ; seul `extStats` est corrigé par delta.
+- **Limite documentée (extStats dans `invalidate` uniquement)** : pour une extension **partagée entre sous-arbres ET modifiée** dans le sous-arbre invalidé, le delta n'est pas exact (la sous-contribution d'origine n'est pas stockée par nœud — parti low-RAM assumé §3) ; erreur bornée au delta du changement, auto-corrigée au prochain rescan complet. **Le chemin suppression (le finding A6) reste exact** (walk avant changement). Tailles/comptes/dirCount toujours exacts.
+- **B1/A7/J4.4** : déjà en place, inchangés et toujours valides. **D1** : borné par le gating `!isScanning` ; détection live → SPEC-04.
 
 ## 1. Objectif
 

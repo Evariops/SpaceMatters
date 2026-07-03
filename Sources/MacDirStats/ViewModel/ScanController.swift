@@ -445,6 +445,30 @@ final class ScanController {
         return (base == "/" ? "/" : base + "/") + file.name
     }
 
+    /// Resolve a filesystem path back to its directory node by walking from the
+    /// nearest seed. Used to re-bind navigation state after `invalidate` rebuilds
+    /// a subtree's nodes as fresh objects (their identities change, paths don't).
+    func node(at target: String) -> FSNode? {
+        guard let root else { return nil }
+        // Seeds are the root itself (single scan) or root's direct children (multi-disk).
+        var seeds: [(FSNode, String)] = []
+        for n in [root] + root.children {
+            if let base = nodePaths[ObjectIdentifier(n)] { seeds.append((n, base)) }
+        }
+        let match = seeds
+            .filter { target == $0.1 || target.hasPrefix($0.1 == "/" ? "/" : $0.1 + "/") }
+            .max { $0.1.count < $1.1.count }
+        guard let (seedNode, base) = match else { return nil }
+        if target == base { return seedNode }
+        let rel = target.dropFirst(base == "/" ? 1 : base.count + 1)
+        var cur = seedNode
+        for comp in rel.split(separator: "/") {
+            guard let child = cur.children.first(where: { $0.name == String(comp) }) else { return nil }
+            cur = child
+        }
+        return cur
+    }
+
     /// Visible outline rows (root + descendants of expanded nodes), with each
     /// expanded folder's files mixed in, biggest-first. O(visible), not O(tree).
     func visibleRows() -> [OutlineRow] {
@@ -559,8 +583,22 @@ final class ScanController {
         let rowID = RowID.dir(ObjectIdentifier(node))
         deletingRows.insert(rowID)
         defer { deletingRows.remove(rowID) }
+
+        // A6: capture the subtree's per-extension breakdown *before* deleting it
+        // (off the main thread) so the File-types panel can be corrected after.
+        // Not stored per node, so it must be re-enumerated from disk while it exists.
+        let extDelta: [ExtKey: ExtStat] = isHostScan
+            ? await Task.detached(priority: .userInitiated) {
+                DirectoryScanner.subtreeExtensions(path: path)
+              }.value
+            : [:]
+
         guard await Self.diskRemove(path: path, permanently: permanently) else { return false }
         applyDirectoryRemoval(node)
+        if !extDelta.isEmpty {
+            scanner?.subtractExtensions(extDelta)
+            extRows = scanner?.snapshotExtensions(metric: metric, limit: 250) ?? extRows
+        }
         return true
     }
 
@@ -633,6 +671,12 @@ final class ScanController {
             a.fileCount.wrappingAdd(-1, ordering: .relaxed)
             p = a.parent
         }
+        // A6 (single file): drop this file's bytes from the File-types table too.
+        var d = ExtStat()
+        d.add(logical: file.logical, physical: file.physical)
+        scanner?.subtractExtensions([ExtKey(fileName: file.name): d])
+        extRows = scanner?.snapshotExtensions(metric: metric, limit: 250) ?? extRows
+
         fileCache[ObjectIdentifier(parent)] = nil // re-enumerate fresh next time
         sortCache.removeAll()
         refreshTotals()
@@ -650,6 +694,86 @@ final class ScanController {
                 return true
             } catch { return false }
         }.value
+    }
+
+    /// Re-scan a directory's subtree from disk and reconcile it into the live tree:
+    /// ancestor aggregates, the global File-types table, the folder count and the
+    /// node identities are all brought back in sync with what's actually on disk.
+    /// This is the shared "re-scan de sous-arbre" brick (SPEC-02) reused by the
+    /// FSEvents live refresh (SPEC-04). Only meaningful for host scans, and only
+    /// while no full scan is running (its atomics would collide).
+    @discardableResult
+    func invalidate(subtree node: FSNode) async -> Bool {
+        guard isHostScan, phase != .scanning, node.isDirectory, let path = path(for: node) else { return false }
+
+        // OLD subtree snapshot (aggregates, folder count, and per-extension bytes
+        // from disk — the same source as the fresh tally, so they reconcile exactly).
+        let oldL = node.aggLogical.load(ordering: .relaxed)
+        let oldP = node.aggPhysical.load(ordering: .relaxed)
+        let oldC = node.fileCount.load(ordering: .relaxed)
+        let oldDirs = Self.subtreeDirCount(node)
+        let oldExt = await Task.detached(priority: .userInitiated) {
+            DirectoryScanner.subtreeExtensions(path: path)
+        }.value
+
+        // Capture navigation state that points *into* the subtree — its descendant
+        // nodes are about to be replaced by fresh objects — then drop the strong
+        // refs so the old subtree is freed cleanly (no dangling `unowned` parents).
+        let selPath = selection.flatMap { Self.isDescendant($0, of: node) ? self.path(for: $0) : nil }
+        let zoomPathStr = zoomRoot.flatMap { Self.isDescendant($0, of: node) ? self.path(for: $0) : nil }
+        let revealPath = revealTarget.flatMap { Self.isDescendant($0, of: node) ? self.path(for: $0) : nil }
+        let expandedInside = expanded.compactMap { Self.isDescendant($0, of: node) ? self.path(for: $0) : nil }
+        if let s = selection, Self.isDescendant(s, of: node) { selection = node; selectedRowID = .dir(ObjectIdentifier(node)) }
+        if let z = zoomRoot, Self.isDescendant(z, of: node) { zoomRoot = node }
+        if let r = revealTarget, Self.isDescendant(r, of: node) { revealTarget = nil }
+        expanded = expanded.filter { !Self.isDescendant($0, of: node) }
+
+        // Detach the old subtree total from the ancestors; the node itself is
+        // rebuilt from zero and re-propagates its fresh total up.
+        var a = node.parent
+        while let n = a {
+            n.aggLogical.wrappingAdd(-oldL, ordering: .relaxed)
+            n.aggPhysical.wrappingAdd(-oldP, ordering: .relaxed)
+            n.fileCount.wrappingAdd(-oldC, ordering: .relaxed)
+            a = n.parent
+        }
+        node.zeroAggregates()
+
+        // Re-scan in place: children are created with `node` as their parent, so
+        // the parent chain stays intact all the way to the real root.
+        let skip = DirectoryScanner.recommendedSkipPaths(seedPaths: [path])
+        let sub = DirectoryScanner(root: node, seeds: [.init(path: path, node: node)], skipPaths: skip)
+        sub.start()
+        await Task.detached(priority: .userInitiated) { sub.waitUntilFinished() }.value
+
+        // Reconcile the global File-types table: subtract the subtree's old
+        // per-extension bytes, add the fresh ones. EXACT for the deletion path
+        // (there `oldExt` is walked *before* the change, so it equals what the
+        // scan booked) and for extensions unique to this subtree. Best-effort for
+        // an extension **also present elsewhere AND changed here** — the true old
+        // sub-contribution isn't stored per node (the low-RAM design), so the
+        // panel may be off by the change delta until the next full rescan. Sizes,
+        // counts and folder count above are always exact.
+        if let ds = scanner as? DirectoryScanner {
+            ds.subtractExtensions(oldExt)
+            ds.mergeExtensions(sub.snapshotRawExtensions())
+        }
+
+        // Folder count delta (A7 stays honest across the swap).
+        dirCount += (Self.subtreeDirCount(node) - oldDirs)
+
+        // Re-bind navigation to the rebuilt nodes by path (identities changed).
+        if let p = zoomPathStr, let n = self.node(at: p) { zoomRoot = n }
+        if let p = selPath, let n = self.node(at: p) { selection = n; selectedRowID = .dir(ObjectIdentifier(n)) }
+        if let p = revealPath, let n = self.node(at: p) { revealTarget = n }
+        for p in expandedInside { if let n = self.node(at: p) { expanded.insert(n) } }
+        selectedRowIDs = selectedRowID.map { [$0] } ?? []
+
+        sortCache.removeAll(); fileCache.removeAll()
+        refreshTotals()
+        extRows = scanner?.snapshotExtensions(metric: metric, limit: 250) ?? extRows
+        bump()
+        return true
     }
 
     private func refreshTotals() {

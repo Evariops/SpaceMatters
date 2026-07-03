@@ -96,4 +96,14 @@ struct ExtStat {
         physical += other.physical
         count += other.count
     }
+
+    /// Remove a subtree's contribution after it's been deleted (A6).
+    @inline(__always)
+    mutating func subtract(_ other: ExtStat) {
+        logical -= other.logical
+        physical -= other.physical
+        count -= other.count
+    }
+
+    var isEmpty: Bool { logical <= 0 && physical <= 0 && count <= 0 }
 }

@@ -142,6 +142,81 @@ import Foundation
         #expect(c.selectedRowIDs == c.selectedRowID.map { [$0] } ?? [])
     }
 
+    /// A6: after deleting a subtree, the File-types table must drop the deleted
+    /// files' extensions — not keep showing bytes that no longer exist on disk.
+    @Test func deletingSubtreeUpdatesFileTypeTable() async throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("mds-a6-\(UUID().uuidString)")
+        // `media/` holds the only .mp4 in the whole tree; `docs/` holds a .txt.
+        try fm.createDirectory(at: root.appendingPathComponent("media/clips"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: root.appendingPathComponent("docs"), withIntermediateDirectories: true)
+        try Data(count: 8192).write(to: root.appendingPathComponent("media/movie.mp4"))
+        try Data(count: 4096).write(to: root.appendingPathComponent("media/clips/trailer.mp4"))
+        try Data(count: 2048).write(to: root.appendingPathComponent("docs/readme.txt"))
+        defer { try? fm.removeItem(at: root) }
+
+        let c = ScanController()
+        c.scan(url: root)
+        await Self.waitForScan(c)
+
+        func mp4Bytes() -> Int64 {
+            c.extRows.first { $0.name == ".mp4" }?.physical ?? 0
+        }
+        #expect(mp4Bytes() > 0) // both .mp4 files counted before deletion
+
+        let media = try #require(Self.child(c.root!, "media"))
+        let ok = await c.remove(directory: media, permanently: true)
+        #expect(ok)
+
+        // The whole .mp4 contribution (both files, incl. the nested one) is gone.
+        #expect(c.extRows.first { $0.name == ".mp4" } == nil)
+        // The unrelated .txt row is untouched.
+        #expect(c.extRows.first { $0.name == ".txt" }?.count == 1)
+    }
+
+    /// SPEC-02 `invalidate(subtree:)`: an external disk change (new file + new
+    /// subfolder) is reflected after a targeted re-scan — totals, the File-types
+    /// table and the folder count all reconcile, and a zoom pointing at a rebuilt
+    /// descendant is re-bound by path to the fresh node.
+    @Test func invalidateReflectsExternalChanges() async throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("mds-inv-\(UUID().uuidString)")
+        let inner = root.appendingPathComponent("sub/inner")
+        try fm.createDirectory(at: inner, withIntermediateDirectories: true)
+        try Data(count: 4096).write(to: root.appendingPathComponent("sub/a.dat"))
+        try Data(count: 4096).write(to: inner.appendingPathComponent("i.dat"))
+        defer { try? fm.removeItem(at: root) }
+
+        let c = ScanController()
+        c.scan(url: root)
+        await Self.waitForScan(c)
+
+        let subNode = try #require(Self.child(c.root!, "sub"))
+        let innerNode = try #require(Self.child(subNode, "inner"))
+        c.zoom(into: innerNode)                     // zoom at a *descendant* of the re-scan target
+        let rootPhysBefore = c.root!.aggPhysical.load(ordering: .relaxed)
+        let dirsBefore = c.dirCount                 // root + sub + inner = 3
+        #expect(c.extRows.first { $0.name == ".xyz" } == nil)
+
+        // External changes below `sub`: a new big file (new extension) + a new folder.
+        try Data(count: 65536).write(to: root.appendingPathComponent("sub/new.xyz"))
+        try fm.createDirectory(at: root.appendingPathComponent("sub/child"), withIntermediateDirectories: true)
+        try Data(count: 8192).write(to: root.appendingPathComponent("sub/child/c.dat"))
+
+        let ok = await c.invalidate(subtree: subNode)
+        #expect(ok)
+
+        // Totals grew by the added bytes (≥ 64K); File-types shows .xyz now.
+        #expect(c.root!.aggPhysical.load(ordering: .relaxed) > rootPhysBefore + 65536)
+        #expect(c.extRows.first { $0.name == ".xyz" }?.count == 1)
+        // The new subfolder is counted (folders went 3 → 4).
+        #expect(c.dirCount == dirsBefore + 1)
+        // Zoom (at the rebuilt descendant) is re-bound by path to the fresh object.
+        #expect(c.zoomRoot?.name == "inner")
+        #expect(c.zoomRoot !== innerNode)           // fresh object after re-scan
+        #expect(c.path(for: c.zoomRoot!) == inner.path)
+    }
+
     @Test func deletingFileUpdatesAggregatesAndCount() async throws {
         let root = try Self.makeFixture()
         defer { try? FileManager.default.removeItem(at: root) }

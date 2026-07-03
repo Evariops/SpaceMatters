@@ -118,6 +118,29 @@ final class DirectoryScanner: ScanBackend {
         return finished || cancelled
     }
 
+    /// Block the calling (background) thread until the scan finishes or is
+    /// cancelled. Used by `ScanController.invalidate` to await a subtree re-scan.
+    func waitUntilFinished() {
+        cond.lock()
+        while !finished && !cancelled { cond.wait() }
+        cond.unlock()
+    }
+
+    /// Raw per-extension table (copy under lock) — for reconciling the global
+    /// File-types table after a subtree re-scan (SPEC-02).
+    func snapshotRawExtensions() -> [ExtKey: ExtStat] {
+        extLock.lock(); defer { extLock.unlock() }
+        return extStats
+    }
+
+    /// Merge another table into this one (add) — the inverse of `subtractExtensions`.
+    func mergeExtensions(_ other: [ExtKey: ExtStat]) {
+        guard !other.isEmpty else { return }
+        extLock.lock()
+        for (k, v) in other { extStats[k, default: ExtStat()].merge(v) }
+        extLock.unlock()
+    }
+
     /// Snapshot of the top `limit` extensions by `metric`, materialised as rows.
     func snapshotExtensions(metric: SizeMetric, limit: Int) -> [ExtRow] {
         extLock.lock()
@@ -132,6 +155,53 @@ final class DirectoryScanner: ScanBackend {
         }
         if rows.count > limit { rows.removeLast(rows.count - limit) }
         return rows
+    }
+
+    /// Subtract a deleted subtree's per-extension contribution from the live table
+    /// (A6). Entries that reach zero are dropped so the File-types panel doesn't
+    /// keep showing a stale row. Safe post-scan (deletion is gated `!isScanning`)
+    /// and guarded by `extLock` regardless.
+    func subtractExtensions(_ delta: [ExtKey: ExtStat]) {
+        guard !delta.isEmpty else { return }
+        extLock.lock()
+        for (key, d) in delta {
+            guard var s = extStats[key] else { continue }
+            s.subtract(d)
+            if s.isEmpty { extStats[key] = nil } else { extStats[key] = s }
+        }
+        extLock.unlock()
+    }
+
+    /// Tally the per-extension contribution of the subtree rooted at `path`,
+    /// exactly the way the scan does (same `ExtKey`, same alloc/logical sizes),
+    /// staying on the volume (mount points are not crossed — mirrors the scan).
+    /// Runs off the main thread; used to correct `extStats` after a deletion (A6).
+    static func subtreeExtensions(path: String) -> [ExtKey: ExtStat] {
+        var out: [ExtKey: ExtStat] = [:]
+        let buffer = UnsafeMutableRawPointer.allocate(byteCount: Self.bufferSize, alignment: 16)
+        defer { buffer.deallocate() }
+
+        var stack = [path]
+        while let dir = stack.popLast() {
+            let fd = open(dir, O_RDONLY | O_DIRECTORY)
+            guard fd >= 0 else { continue }
+            let prefix = dir == "/" ? "/" : dir + "/"
+            _ = enumerateDirectory(fd: fd, buffer: buffer, bufferSize: Self.bufferSize) { entry in
+                if entry.isDirectory {
+                    if entry.isMountPoint { return } // stay on volume, like the scan
+                    let name = String(
+                        decoding: UnsafeRawBufferPointer(start: entry.name, count: entry.nameLength),
+                        as: UTF8.self
+                    )
+                    stack.append(prefix + name)
+                } else {
+                    let key = ExtKey(name: entry.name, length: entry.nameLength)
+                    out[key, default: ExtStat()].add(logical: entry.logicalSize, physical: entry.physicalSize)
+                }
+            }
+            close(fd)
+        }
+        return out
     }
 
     // MARK: Worker
