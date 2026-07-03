@@ -261,6 +261,10 @@ private struct Breadcrumb: View {
         }
         .buttonStyle(.plain)
         .help(node.name)
+        .accessibilityLabel(node.name)
+        .accessibilityValue(Format.bytes(node.size(controller.metric)))
+        .accessibilityHint(isCurrent ? "Current folder" : "Zoom to this folder")
+        .accessibilityAddTraits(isCurrent ? [.isSelected, .isButton] : .isButton)
     }
 }
 
@@ -318,6 +322,7 @@ private struct ToolbarBar: View {
                 }
                 .pickerStyle(.segmented)
                 .fixedSize()
+                .accessibilityLabel("Size metric")
                 .help(
                     """
                     How sizes are measured:
@@ -338,6 +343,7 @@ private struct ToolbarBar: View {
                     .pickerStyle(.segmented)
                     .fixedSize()
                     .disabled(controller.isScanning)
+                    .accessibilityLabel("Counting mode")
                     .help(
                         """
                         How shared storage is counted (re-scans when changed):
@@ -363,6 +369,7 @@ private struct ToolbarBar: View {
             .buttonStyle(.plain)
             .foregroundStyle(theme.textSecondary)
             .help("Toggle theme")
+            .accessibilityLabel(isDark ? "Switch to light theme" : "Switch to dark theme")
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
@@ -622,7 +629,8 @@ private struct VolumeCard: View {
             .frame(height: 6)
 
             HStack {
-                Text("\(Format.bytes(volume.used)) used · \(Format.bytes(volume.available)) free")
+                // Percentage is a redundant, colour-blind-safe channel for the bar (J10.2).
+                Text("\(percent)% · \(Format.bytes(volume.used)) used · \(Format.bytes(volume.available)) free")
                     .foregroundStyle(theme.textSecondary)
                 Spacer()
                 Label("Analyze", systemImage: "play.fill")
@@ -632,6 +640,10 @@ private struct VolumeCard: View {
             .font(.system(size: 10).monospacedDigit())
         }
         .padding(14)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(volume.name), \(volume.kindLabel)")
+        .accessibilityValue("\(percent)% full, \(Format.bytes(volume.used)) used of \(Format.bytes(volume.total))")
+        .accessibilityHint("Analyze disk usage")
         .background(
             RoundedRectangle(cornerRadius: 12)
                 .fill(theme.panelBackground)
@@ -645,13 +657,8 @@ private struct VolumeCard: View {
         .onTapGesture(perform: action)
     }
 
-    private var usageColor: Color {
-        switch volume.usedFraction {
-        case ..<0.7: return Color(hex: 0x3FB950)
-        case ..<0.9: return Color(hex: 0xD29922)
-        default: return Color(hex: 0xF85149)
-        }
-    }
+    private var usageColor: Color { Theme.usageColor(volume.usedFraction) }
+    private var percent: Int { Int((volume.usedFraction * 100).rounded()) }
 }
 
 /// Splash card that opens the SSH connection form (SPEC-06).

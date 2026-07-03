@@ -96,5 +96,9 @@ private struct TypeRow: View {
         .contentShape(Rectangle())
         .onTapGesture(perform: onTap)
         .onHover { hovering = $0 }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(row.name), \(Format.bytes(row.size(metric))), \(Format.count(row.count)) files")
+        .accessibilityAddTraits(isSelected ? [.isSelected, .isButton] : .isButton)
+        .accessibilityHint("Filter the treemap by this file type")
     }
 }

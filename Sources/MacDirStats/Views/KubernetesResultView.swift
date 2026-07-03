@@ -201,8 +201,8 @@ private struct RowMetrics: View {
     }
 }
 
-/// A little consumption gauge: filled proportion, green → flashy orange (70%) →
-/// scarlet (85%).
+/// A little consumption gauge: filled proportion, green → amber (70%) → red (90%),
+/// the same thresholds as the disk volume gauges (F6).
 private struct PieGauge: View {
     let fraction: Double
     @Environment(\.theme) private var theme
@@ -220,15 +220,13 @@ private struct PieGauge: View {
             wedge.closeSubpath()
             ctx.fill(wedge, with: .color(color))
         }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Usage")
+        .accessibilityValue("\(Int((fraction * 100).rounded())) percent, \(Theme.usageLevel(fraction))")
     }
 
-    private var color: Color {
-        switch fraction {
-        case ..<0.7: return Color(hex: 0x3FB950)   // green
-        case ..<0.85: return Color(hex: 0xFF8A00)  // flashy orange
-        default: return Color(hex: 0xFF2400)       // scarlet
-        }
-    }
+    // Unified capacity thresholds (F6): same green/amber/red as disk volumes.
+    private var color: Color { Theme.usageColor(fraction) }
 }
 
 private struct TreeHeaderRow: View {

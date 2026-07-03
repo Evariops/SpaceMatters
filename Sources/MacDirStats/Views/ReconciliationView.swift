@@ -17,6 +17,8 @@ struct ReconciliationButton: View {
         .buttonStyle(.plain)
         .foregroundStyle(theme.textSecondary)
         .help("Why doesn't this match Finder?")
+        .accessibilityLabel("Storage reconciliation")
+        .accessibilityHint("Explains the gap with the volume's used space")
         .popover(isPresented: $showing, arrowEdge: .bottom) {
             ReconciliationPanel(recon: recon, loading: loading)
                 .environment(\.theme, theme)

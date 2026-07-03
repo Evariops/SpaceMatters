@@ -1,6 +1,18 @@
 # SPEC-08 — Accessibilité & internationalisation complètes
 
-> **Findings** : J10.1 (VoiceOver — **premier passage fait et vérifié en live**), J10.2 (daltonisme), J10.3 (tailles de texte figées), J10.4 + J9.5 (i18n, locale mixte).
+> **Findings** : J10.1 (VoiceOver), J10.2 (daltonisme), J10.3 (tailles de texte figées), J10.4 + J9.5 (i18n, locale mixte).
+> **Statut** : ✅ VoiceOver complété · ✅ daltonisme/F6 · ✅ J9.5 · 🔬 J10.3 & traduction complète = chantiers dédiés documentés.
+
+## 0. Résultat d'implémentation
+
+- **VoiceOver (J10.1 complété)** : labels/valeurs ajoutés sur — pickers *Size metric* / *Counting mode*, bascule de thème, bouton *Storage reconciliation*, lignes *File types* (nom + taille + nb, trait bouton/sélection), segments du *breadcrumb* (nom + taille + « current/zoom »), **cartes de volume** (label+valeur « N% full »), **jauge K8s** (`N percent, OK/High/Critical`). Le **treemap** (Canvas opaque) expose désormais un résumé parlé : dossier zoomé + ses plus gros enfants en %. S'ajoute au 1er passage (stats, lignes de liste, dézoom).
+- **Daltonisme (J10.2)** : le **pourcentage en texte** est un canal redondant sûr sur les jauges de volume (live-vérifié « 81% · … »), et un **niveau textuel** `OK/High/Critical` (`Theme.usageLevel`) dans l'accessibilité. **F6 corrigé** : seuils **unifiés 70/90** partout (`Theme.usageColor`) — volumes et K8s étaient 70/90 vs 70/85.
+- **i18n — J9.5 corrigé** (SPEC-03) : `Format.bytes` est **localisé** (séparateur décimal), cohérent avec `Format.count` — plus de locale mixte (live-vérifié : « 85,7 GiB »).
+
+## 0.b Chantiers dédiés restants (honnêtes)
+
+- **🔬 J10.3 (échelle de texte / Dynamic Type)** : l'app utilise des tailles `.system(size:)` **fixes** par choix de densité ; les rendre réactives à « Larger Text » est un **rétrofit design global** (≈200 sites) qui doit être calibré pour ne pas casser la mise en page dense — chantier dédié, pas un bolt-on (cohérent avec le parti « robustesse du design »). Non tenté à chaud.
+- **🔬 J10.4 (traduction complète)** : le **bug** de locale mixte (J9.5) est réglé ; la **traduction** dans d'autres langues (String Catalog `.xcstrings` peuplé) est un effort de localisation à part entière, hors v1.
 
 ## 1. Objectif
 

@@ -61,6 +61,26 @@ struct Theme {
         return Color(hue: hue / 360, saturation: sat, brightness: bri)
     }
 
+    /// Unified capacity-gauge colour (F6): the same green/orange/red thresholds
+    /// everywhere (volumes and Kubernetes were 70/90 vs 70/85 before).
+    static func usageColor(_ fraction: Double) -> Color {
+        switch fraction {
+        case ..<0.7: return Color(hex: 0x3FB950)   // green
+        case ..<0.9: return Color(hex: 0xD29922)   // amber
+        default:     return Color(hex: 0xF85149)   // red
+        }
+    }
+
+    /// A words-not-only-colour severity label for the same thresholds, so the
+    /// gauge is legible without relying on hue (J10.2, colour-blindness).
+    static func usageLevel(_ fraction: Double) -> String {
+        switch fraction {
+        case ..<0.7: return "OK"
+        case ..<0.9: return "High"
+        default:     return "Critical"
+        }
+    }
+
     // Deterministic (FNV-1a) so colors are stable across launches, unlike the
     // per-process-seeded standard Hasher.
     private static func fnv(_ s: String) -> UInt64 {

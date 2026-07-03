@@ -111,7 +111,7 @@ struct TreemapView: View {
             }
             .accessibilityElement(children: .ignore)
             .accessibilityLabel("Treemap")
-            .accessibilityValue(controller.zoomRoot.map { "showing \($0.name), \(Format.bytes($0.size(controller.metric)))" } ?? "")
+            .accessibilityValue(treemapSummary)
             .onAppear { recompute(size: geo.size) }
             .onChange(of: geo.size) { _, size in recompute(size: size) }
             .onChange(of: controller.version) { _, _ in recompute(size: lastSize) }
@@ -175,6 +175,19 @@ struct TreemapView: View {
     private func tileSize(_ tile: TreemapTile) -> Int64 {
         if let file = tile.file { return file.size }
         return tile.isFileBlock ? tile.node.directFilesSize(controller.metric) : tile.node.size(controller.metric)
+    }
+
+    /// A spoken summary of the (Canvas-opaque) treemap: the zoomed folder plus its
+    /// largest children by share — so VoiceOver conveys the shape of the map.
+    private var treemapSummary: String {
+        guard let zoom = controller.zoomRoot else { return "" }
+        let m = controller.metric
+        let head = "Showing \(zoom.name), \(Format.bytes(zoom.size(m)))."
+        let total = max(zoom.size(m), 1)
+        let kids = controller.sortedChildren(zoom).prefix(5).map {
+            "\($0.name) \(Int((Double($0.size(m)) / Double(total) * 100).rounded())) percent"
+        }
+        return kids.isEmpty ? head : head + " Largest: " + kids.joined(separator: ", ")
     }
 
     private func hitTest(_ point: CGPoint) -> TreemapTile? {
