@@ -4,7 +4,15 @@
 > **Branche** : `plan-execution` · 10 commits (Phase 0 → tests + vérif comportementale).
 > Chaque changement compile (`swift build`) et la suite (`swift test`, **10 tests**) passe. Les correctifs d'intégrité (A1, A2) sont **vérifiés empiriquement** (scan headless vs `du`).
 >
-> **Lancement réel** : l'app a été **lancée** (`--open <fixture>`) et tourne sans crash. Le pilotage/capture UI interactif n'est **pas** possible dans cet environnement (permissions macOS Screen Recording et Accessibility non accordées au contexte : `screencapture` → « could not create image from display », `osascript` System Events → erreur `-1719`). La logique GUI-adjacente (navigation, zoom, suppression) est donc vérifiée par des **tests ViewModel** qui pilotent un vrai `ScanController` sur un arbre scanné (`NavigationTests` : B1, F2, A7, zoomOut, suppressions async), pas par des clics simulés.
+> **Lancement réel + pilotage GUI vérifié** : après avoir accordé Screen Recording + Accessibility à VSCode (le process hôte), l'app a été **lancée et pilotée** (`--open <fixture>`, clics par coordonnées calibrés sur le cadre de fenêtre AX, captures d'écran). **Vérifié en live dans l'app qui tourne** :
+> - Rendu + données correctes : total **1.45 MB** (physique) / **6 files / 6 folders / 0.2s**, panneau File types exact (`.bin 1.44 MB (2)`, `.txt/.dat/[no extension]`) — identiques au scan headless.
+> - **J3.9** : titre de fenêtre = « fixture » (racine du scan).
+> - **Interaction métrique** : clic sur « Logical » → total bascule **1.45 → 1.43 MB** (physique→logique, exact vs headless), propagé aux stats + liste + breadcrumb.
+> - **E6 recherche** : ⌘F + « sub2 » → liste élaguée à `fixture > sub2`, régions non-matchantes du treemap assombries.
+> - **J10.1 accessibilité** : les labels ajoutés se lisent bien (ex. une ligne renvoie « Folder sub1, 979 KB » via l'API AX).
+> - **J1.3** : la bannière FDA s'affiche même sur un scan de dossier tmp ; **A8** est visible (le dossier `sub2` a une barre or = `.txt`, son fichier *direct*, pas bleu = `.bin` de son sous-arbre de 500 Ko).
+>
+> Limite résiduelle : la synthèse de **double-clic** via System Events n'est pas reconnue comme `TapGesture(count: 2)` par SwiftUI (le zoom par double-clic ne se déclenche donc pas via automation) ; la logique de zoom est couverte par `NavigationTests`. La logique GUI-adjacente est aussi vérifiée par tests ViewModel (`NavigationTests` : B1, F2, A7, zoomOut, suppressions async).
 
 ## Résumé
 
