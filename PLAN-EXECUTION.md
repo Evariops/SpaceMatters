@@ -91,8 +91,8 @@ Le plan lui-même classait la Phase 5 comme « continu / roadmap ». Le **cœur 
 
 ### ⏸️ Différés — et pourquoi
 
-**Nécessitent une validation GUI interactive** (impossible ici sans risquer des régressions non vérifiables — un choix aligné sur la priorité *robustesse/intégrité*) :
-- **D-E** — migration `List(selection:)` native : navigation flèches, multi-sélection, ⌘⌫ (J3.1, J4.2). Réécriture du composant liste central ; la sémantique de sélection/focus doit se tester à la souris + clavier.
+**Nécessitent une validation GUI interactive** (le pilotage est désormais possible, mais ces items restent différés pour la raison ci-dessous) :
+- **D-E** — navigation clavier / `List(selection:)` (J3.1, J4.2). **Tenté en live puis annulé** : avec Screen Recording accordé, `List(selection:)` + tags a été essayé et piloté (clic + flèches). Résultat : la `List` ne prend **pas** le focus clavier (flèches inertes) *et* la sélection native ne s'engage pas au simple clic tant que les lignes portent leurs propres gestes (`onTapGesture`/`contentShape`/double-clic) — retirer le `onTapGesture` a **cassé** le clic simple sans débloquer les flèches. Conclusion vérifiée : ce n'est pas un bolt-on ; il faut **repenser la liste** (soit `NSViewRepresentable` autour d'un `NSTableView`, soit refonte des lignes pour céder toute la sélection/focus à SwiftUI) — un chantier dédié, pas un quick win. Le composant liste actuel (clic simple + double-clic zoom + menu contextuel) a été **restauré intact**.
 - **A9** (tuile « non exploré »), **A8** (couleur dominante pondérée du sous-arbre), **C4** (rafraîchissement splash mount/unmount), **J2.4** (garde de quit pendant scan), **J6.2** (bouton démarrer VM) : changements visuels/comportementaux à observer.
 
 **Chantiers architecturaux volontairement non précipités** (B1 étant déjà sûr, l'urgence est levée) :
