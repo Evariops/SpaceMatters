@@ -1,6 +1,17 @@
 # SPEC-04 — FSEvents : du snapshot au tableau de bord vivant
 
 > **Findings** : S3 (différenciateur produit), J5.2 (données périmées sans indicateur), J4.5 (« Put Back » invisible), D1 (TOCTOU des suppressions). **Dépend de SPEC-02** (réutilise `invalidate(subtree:)`).
+> **Statut** : ✅ **IMPLÉMENTÉ & LIVE-VÉRIFIÉ** (bannière + timestamp capturés dans l'app).
+
+## 0. Résultat d'implémentation
+
+- **`FSWatcher`** ([FSWatcher.swift](../Sources/MacDirStats/Scanner/FSWatcher.swift)) : `FSEventStreamCreate` sur les seed paths, granularité **répertoire** (pas `FileEvents`), débounce `latency` (1 s), livraison sur une **dispatch queue** privée (`kFSEventStreamCreateFlagUseCFTypes | NoDefer`).
+- **Cycle de vie** : démarre à la fin du scan (hôte), s'arrête sur `goHome`/nouveau scan/`deinit`.
+- **Suivi des sales par chemin** (pas par identité — `invalidate` recrée les nœuds) : `handleDiskChanges` → `nearestNode(toPath:)` **symlink-tolérant** (canonicalisation : FSEvents rapporte `/private/var/…`, bug trouvé et corrigé), `dirtyPaths` + `diskChanged`.
+- **UI** : bannière « The disk changed — [Refresh] » (`DiskChangedBanner`), **pastille par ligne** sur les dossiers sales, **« scanned N ago »** dans la barre de stats (J5.2, `TimelineView` 30 s). **Live-vérifié** (bannière + « just now » capturés).
+- **Refresh = `invalidate(subtree:)`** (SPEC-02) sur les sous-arbres sales, ancêtres subsumant les descendants (un seul re-scan). **Portée** : seeds hôtes uniquement.
+- **D1** : surfacé par la **bannière persistante** (l'utilisateur est prévenu que le disque a changé avant d'agir) plutôt qu'un modal par-suppression — plus simple, moins intrusif ; la suppression reste gatée `!isScanning`.
+- **Test** : `fsEventsMarkDirtyAndRefreshCatchesUp` (end-to-end : écriture externe → `diskChanged` → `refreshDirty` → totaux rattrapés).
 
 ## 1. Objectif
 

@@ -149,10 +149,13 @@ struct DirectoryTable: NSViewRepresentable {
 
         func makeRowView(_ index: Int) -> OutlineRowView {
             let row = rows[index]
+            let isDirty: Bool
+            if case .directory(let node) = row.kind { isDirty = controller.isDirty(node) } else { isDirty = false }
             return OutlineRowView(
                 row: row,
                 isSelected: controller.selectedRowIDs.contains(row.id),
                 isHovered: index == hoveredRow,
+                isDirty: isDirty,
                 metric: controller.metric,
                 controller: controller,
                 theme: theme

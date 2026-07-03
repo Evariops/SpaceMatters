@@ -65,6 +65,11 @@ private struct FilesystemResultView: View {
                 Divider().overlay(theme.separator)
             }
 
+            if controller.diskChanged {
+                DiskChangedBanner(controller: controller)
+                Divider().overlay(theme.separator)
+            }
+
             HSplitView {
                 VSplitView {
                     DirectoryListView(controller: controller)
@@ -103,6 +108,40 @@ private struct ErrorBanner: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
         .background(Color(hex: 0xD29922).opacity(0.12))
+    }
+}
+
+/// Live-dashboard banner (SPEC-04): FSEvents saw the disk change under the
+/// current result. Refresh re-scans only the touched subtrees (`invalidate`).
+private struct DiskChangedBanner: View {
+    let controller: ScanController
+    @Environment(\.theme) private var theme
+    @State private var refreshing = false
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "arrow.triangle.2.circlepath")
+                .font(.system(size: 13))
+                .foregroundStyle(theme.accent)
+            Text("The disk changed since this scan.")
+                .font(.system(size: 11))
+                .foregroundStyle(theme.textPrimary)
+            Spacer(minLength: 8)
+            Button {
+                refreshing = true
+                Task { await controller.refreshDirty(); refreshing = false }
+            } label: {
+                HStack(spacing: 5) {
+                    if refreshing { ProgressView().controlSize(.mini) }
+                    Text(refreshing ? "Refreshing…" : "Refresh")
+                }
+            }
+            .buttonStyle(PrimaryButtonStyle())
+            .disabled(refreshing)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(theme.accent.opacity(0.10))
     }
 }
 
@@ -375,11 +414,25 @@ private struct StatsStrip: View {
                 Stat(value: Format.rate(controller.filesPerSecond), label: "scan", theme: theme, accent: true)
             } else if controller.phase == .finished {
                 Stat(value: String(format: "%.1fs", controller.elapsed), label: "done in", theme: theme)
+                if let date = controller.scanDate {
+                    // J5.2: how stale the result is, refreshed every 30 s.
+                    TimelineView(.periodic(from: .now, by: 30)) { _ in
+                        Stat(value: Self.ago(date), label: "scanned", theme: theme)
+                    }
+                }
             }
             if controller.errorCount > 0 {
                 Stat(value: Format.count(controller.errorCount), label: "skipped", theme: theme)
             }
         }
+    }
+
+    static func ago(_ date: Date) -> String {
+        let s = Int(Date().timeIntervalSince(date))
+        if s < 60 { return "just now" }
+        if s < 3600 { return "\(s / 60)m ago" }
+        if s < 86400 { return "\(s / 3600)h ago" }
+        return "\(s / 86400)d ago"
     }
 }
 

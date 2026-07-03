@@ -118,6 +118,26 @@ final class ScanController {
     private(set) var isHostScan = true
 
     private var scanner: (any ScanBackend)?
+
+    // MARK: Live disk watching (SPEC-04)
+
+    /// True once FSEvents reports a change under the scanned tree — drives the
+    /// "disk changed" banner and the Refresh affordance.
+    private(set) var diskChanged = false
+    /// When the current result finished scanning (for "scanned N ago", J5.2).
+    private(set) var scanDate: Date?
+    /// Paths of the nearest existing nodes touched since the scan — tracked by
+    /// path (not identity), because `invalidate` rebuilds nodes as fresh objects.
+    @ObservationIgnored private(set) var dirtyPaths: Set<String> = []
+    @ObservationIgnored private var watcher: FSWatcher?
+    @ObservationIgnored private var watchPaths: [String] = []
+
+    /// Whether a node sits on a changed path (drives the per-row "dirty" dot).
+    func isDirty(_ node: FSNode) -> Bool {
+        guard !dirtyPaths.isEmpty, let p = path(for: node) else { return false }
+        return dirtyPaths.contains(p)
+    }
+
     private var timer: Timer?
     private var scanActivity: NSObjectProtocol?
     private var startTime = Date()
@@ -239,6 +259,9 @@ final class ScanController {
         sortCache.removeAll()
         fileCache.removeAll()
         self.nodePaths = nodePaths
+        stopWatching()
+        self.watchPaths = isHost ? Array(nodePaths.values) : []
+        self.scanDate = nil
 
         totalLogical = 0; totalPhysical = 0; fileCount = 0; dirCount = 0; errorCount = 0
         filesPerSecond = 0; elapsed = 0; extRows = []
@@ -270,6 +293,8 @@ final class ScanController {
     func goHome() {
         scanner?.cancel()
         stopTimer()
+        stopWatching()
+        scanDate = nil
         scanner = nil
         root = nil
         zoomRoot = nil
@@ -456,24 +481,45 @@ final class ScanController {
     /// nearest seed. Used to re-bind navigation state after `invalidate` rebuilds
     /// a subtree's nodes as fresh objects (their identities change, paths don't).
     func node(at target: String) -> FSNode? {
+        resolveNode(toPath: target, lenient: false)
+    }
+
+    /// Deepest *existing* directory node on `target`'s path — the node to mark
+    /// dirty / re-scan when a change lands anywhere under it. Unlike `node(at:)`,
+    /// it returns the last matching ancestor instead of `nil` when the tail isn't
+    /// in the tree (e.g. a change in a file, or in a folder created since the scan).
+    func nearestNode(toPath target: String) -> FSNode? {
+        resolveNode(toPath: target, lenient: true)
+    }
+
+    /// Symlink-tolerant path→node resolution. Both the target and the seed bases
+    /// are canonicalized, because FSEvents reports *resolved* paths (e.g.
+    /// `/private/var/…`) that wouldn't otherwise match a seed picked as `/var/…`.
+    private func resolveNode(toPath target: String, lenient: Bool) -> FSNode? {
         guard let root else { return nil }
-        // Seeds are the root itself (single scan) or root's direct children (multi-disk).
+        let t = Self.canonical(target)
         var seeds: [(FSNode, String)] = []
         for n in [root] + root.children {
-            if let base = nodePaths[ObjectIdentifier(n)] { seeds.append((n, base)) }
+            if let base = nodePaths[ObjectIdentifier(n)] { seeds.append((n, Self.canonical(base))) }
         }
         let match = seeds
-            .filter { target == $0.1 || target.hasPrefix($0.1 == "/" ? "/" : $0.1 + "/") }
+            .filter { t == $0.1 || t.hasPrefix($0.1 == "/" ? "/" : $0.1 + "/") }
             .max { $0.1.count < $1.1.count }
         guard let (seedNode, base) = match else { return nil }
-        if target == base { return seedNode }
-        let rel = target.dropFirst(base == "/" ? 1 : base.count + 1)
+        if t == base { return seedNode }
+        let rel = t.dropFirst(base == "/" ? 1 : base.count + 1)
         var cur = seedNode
         for comp in rel.split(separator: "/") {
-            guard let child = cur.children.first(where: { $0.name == String(comp) }) else { return nil }
+            guard let child = cur.children.first(where: { $0.name == String(comp) }) else {
+                return lenient ? cur : nil
+            }
             cur = child
         }
         return cur
+    }
+
+    private static func canonical(_ path: String) -> String {
+        URL(fileURLWithPath: path).resolvingSymlinksInPath().path
     }
 
     /// Visible outline rows (root + descendants of expanded nodes), with each
@@ -783,6 +829,58 @@ final class ScanController {
         return true
     }
 
+    // MARK: Live disk watching (SPEC-04)
+
+    private func startWatching() {
+        stopWatching()
+        guard isHostScan, !watchPaths.isEmpty else { return }
+        let w = FSWatcher(paths: watchPaths) { [weak self] changed in
+            Task { @MainActor in self?.handleDiskChanges(changed) }
+        }
+        w.start()
+        watcher = w
+    }
+
+    private func stopWatching() {
+        watcher?.stop()
+        watcher = nil
+        dirtyPaths.removeAll()
+        diskChanged = false
+    }
+
+    /// FSEvents batch → mark the nearest existing node on each changed path dirty.
+    private func handleDiskChanges(_ paths: [String]) {
+        guard isHostScan, phase == .finished else { return }
+        var changed = false
+        for p in paths {
+            guard let node = nearestNode(toPath: p), let np = path(for: node) else { continue }
+            if dirtyPaths.insert(np).inserted { changed = true }
+        }
+        if changed {
+            diskChanged = true
+            bump() // repaint the dirty dots + banner
+        }
+    }
+
+    /// Re-scan the dirty subtrees (SPEC-02 `invalidate`) and clear the badge.
+    /// Ancestors subsume descendants, so a change deep in an already-dirty parent
+    /// is covered by a single re-scan.
+    func refreshDirty() async {
+        guard !dirtyPaths.isEmpty else { diskChanged = false; return }
+        // Keep only the topmost dirty paths (drop any that sit under another).
+        let sorted = dirtyPaths.sorted { $0.count < $1.count }
+        var roots: [String] = []
+        for p in sorted where !roots.contains(where: { p == $0 || p.hasPrefix($0 == "/" ? "/" : $0 + "/") }) {
+            roots.append(p)
+        }
+        dirtyPaths.removeAll()
+        diskChanged = false
+        for p in roots {
+            if let node = nearestNode(toPath: p) { await invalidate(subtree: node) }
+        }
+        scanDate = Date()
+    }
+
     private func refreshTotals() {
         guard let root else { return }
         totalLogical = root.aggLogical.load(ordering: .relaxed)
@@ -897,6 +995,8 @@ final class ScanController {
                 failureMessage = f
             } else {
                 phase = .finished
+                scanDate = Date()
+                startWatching() // begin watching the disk for changes (SPEC-04)
             }
             filesPerSecond = 0
             stopTimer()

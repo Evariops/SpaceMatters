@@ -217,6 +217,39 @@ import Foundation
         #expect(c.path(for: c.zoomRoot!) == inner.path)
     }
 
+    /// SPEC-04 end-to-end: after a scan finishes the disk is watched; an external
+    /// write flips `diskChanged`, and `refreshDirty` re-scans the touched subtree
+    /// so the totals catch up. (FSEvents has ~1 s latency, hence the polling.)
+    @Test func fsEventsMarkDirtyAndRefreshCatchesUp() async throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("mds-fse-\(UUID().uuidString)")
+        try fm.createDirectory(at: root.appendingPathComponent("sub"), withIntermediateDirectories: true)
+        try Data(count: 4096).write(to: root.appendingPathComponent("sub/a.dat"))
+        defer { try? fm.removeItem(at: root) }
+
+        let c = ScanController()
+        c.scan(url: root)
+        await Self.waitForScan(c)
+        #expect(c.phase == .finished)
+        #expect(!c.diskChanged)
+        let physBefore = c.root!.aggPhysical.load(ordering: .relaxed)
+
+        // External change: a big new file appears under `sub`.
+        try Data(count: 200_000).write(to: root.appendingPathComponent("sub/big.new"))
+
+        // Wait (polling, yielding) for FSEvents to flip the flag.
+        let deadline = Date().addingTimeInterval(10)
+        while !c.diskChanged && Date() < deadline {
+            try await Task.sleep(for: .milliseconds(200))
+        }
+        #expect(c.diskChanged, "FSEvents should have reported the change")
+
+        await c.refreshDirty()
+        #expect(!c.diskChanged)                 // badge cleared
+        #expect(c.dirtyPaths.isEmpty)
+        #expect(c.root!.aggPhysical.load(ordering: .relaxed) > physBefore + 200_000)
+    }
+
     @Test func deletingFileUpdatesAggregatesAndCount() async throws {
         let root = try Self.makeFixture()
         defer { try? FileManager.default.removeItem(at: root) }

@@ -83,6 +83,7 @@ struct OutlineRowView: View {
     let row: ScanController.OutlineRow
     let isSelected: Bool
     let isHovered: Bool
+    let isDirty: Bool
     let metric: SizeMetric
     let controller: ScanController
     let theme: Theme
@@ -141,6 +142,13 @@ struct OutlineRowView: View {
                 .foregroundStyle(isDirectory ? theme.textPrimary : theme.textSecondary)
                 .lineLimit(1)
                 .truncationMode(.middle)
+
+            if isDirty {
+                Circle()
+                    .fill(theme.accent)
+                    .frame(width: 5, height: 5)
+                    .help("Changed on disk — Refresh to re-scan")
+            }
 
             Spacer(minLength: 8)
 
