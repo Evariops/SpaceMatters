@@ -1,5 +1,5 @@
 #!/bin/bash
-# Generate Resources/AppIcon.icns from the app's pie-chart mark (J1.2). No design
+# Generate Packaging/AppIcon.icns from the app's pie-chart mark (J1.2). No design
 # asset needed: renders the `chart.pie.fill` SF Symbol on the app's dark panel,
 # then builds every iconset size with sips + iconutil. Re-run after a look change.
 set -euo pipefail
@@ -51,6 +51,5 @@ for s in 16 32 128 256 512; do
     sips -z "$((s*2))" "$((s*2))" "$MASTER" --out "$ICONSET/icon_${s}x${s}@2x.png" >/dev/null
 done
 
-mkdir -p Resources
-iconutil -c icns "$ICONSET" -o Resources/AppIcon.icns
-echo "wrote Resources/AppIcon.icns"
+iconutil -c icns "$ICONSET" -o Packaging/AppIcon.icns
+echo "wrote Packaging/AppIcon.icns"

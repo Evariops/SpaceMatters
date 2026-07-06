@@ -81,7 +81,7 @@ jobs:
       - name: Build DMG
         run: |
           echo "DMG=MacDirStats-${TAG_NAME#v}.dmg" >> "$GITHUB_ENV"
-          ./Scripts/make-dmg.sh MacDirStats.app "MacDirStats-${TAG_NAME#v}.dmg"
+          ./Packaging/make-dmg.sh MacDirStats.app "MacDirStats-${TAG_NAME#v}.dmg"
 
       - name: Sign, notarize & staple DMG
         if: env.HAS_SIGNING == 'true' && env.HAS_NOTARY == 'true'

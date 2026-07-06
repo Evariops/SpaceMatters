@@ -1,7 +1,7 @@
 #!/bin/bash
 # Package an .app bundle into a compressed DMG with an /Applications alias.
 # Shared by release.sh (local) and .github/workflows/release.yml (CI).
-# Usage: Scripts/make-dmg.sh <App.app> <output.dmg>
+# Usage: Packaging/make-dmg.sh <App.app> <output.dmg>
 set -euo pipefail
 
 APP="${1:?usage: make-dmg.sh <App.app> <output.dmg>}"

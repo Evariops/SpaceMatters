@@ -6,7 +6,7 @@
 
 ## 0. Résultat d'implémentation
 
-- **Icône** (J1.2) : [`Scripts/make-icon.sh`](../Scripts/make-icon.sh) rend `chart.pie.fill` (accent sur fond panneau) → `Resources/AppIcon.icns` (généré, commité) ; `bundle.sh` la copie + `CFBundleIconFile`. Vérifié visuellement.
+- **Icône** (J1.2) : [`Packaging/make-icon.sh`](../Packaging/make-icon.sh) rend `chart.pie.fill` (accent sur fond panneau) → `Packaging/AppIcon.icns` (généré, commité) ; `bundle.sh` la copie + `CFBundleIconFile`. Vérifié visuellement.
 - **Usage descriptions TCC** (J1.4) : `NSDesktop/Documents/Downloads/RemovableVolumes/NetworkVolumes UsageDescription` ajoutées au plist. `plutil -lint` OK.
 - **Version depuis git** (J1.5) : `CFBundleShortVersionString` = `git describe --tags` (repli `0.1.0`), `CFBundleVersion` = nb de commits. Vérifié (`0.1.0` / build `26`).
 - **`release.sh`** : build → `bundle.sh` (Developer ID) → **hardened-runtime sign + verify** → DMG (`hdiutil`, app + alias `/Applications`) → sign DMG → `notarytool submit --wait` → `stapler staple` → `spctl` check → **`gh release create`**. Prérequis externes documentés en tête (cert Developer ID + profil `notarytool` + `gh auth`).

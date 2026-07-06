@@ -17,10 +17,10 @@ mkdir -p "$APP/Contents/MacOS"
 mkdir -p "$APP/Contents/Resources"
 cp "$BIN_PATH" "$APP/Contents/MacOS/$BIN_NAME"
 
-# App icon (J1.2). Regenerate with ./Scripts/make-icon.sh if the look changes.
+# App icon (J1.2). Regenerate with ./Packaging/make-icon.sh if the look changes.
 ICON_KEY=""
-if [ -f "Resources/AppIcon.icns" ]; then
-    cp "Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+if [ -f "Packaging/AppIcon.icns" ]; then
+    cp "Packaging/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
     ICON_KEY="    <key>CFBundleIconFile</key>        <string>AppIcon</string>"
 fi
 

@@ -37,7 +37,7 @@ codesign --force --deep --options runtime --timestamp --sign "$DEVELOPER_ID" "$A
 codesign --verify --strict --verbose=2 "$APP"
 
 echo "▸ Building DMG"
-./Scripts/make-dmg.sh "$APP" "$DMG"
+./Packaging/make-dmg.sh "$APP" "$DMG"
 
 echo "▸ Signing, notarizing & stapling DMG (this can take a few minutes)"
 codesign --force --sign "$DEVELOPER_ID" "$DMG"
