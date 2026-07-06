@@ -1,0 +1,127 @@
+name: Release
+
+# Fires when a draft (from Release Drafter) is published: builds the app at
+# the release tag, packages MacDirStats-<version>.dmg, and attaches it to the
+# release with a SHA-256 checksum.
+#
+# Signing is opportunistic (SPEC-07: Developer ID is an external prerequisite):
+#   - With the secrets below set, the DMG is Developer ID-signed, notarized
+#     and stapled — it opens without a Gatekeeper warning.
+#   - Without them, the build falls back to ad-hoc signing and the step
+#     summary says so (users must right-click ▸ Open on first launch).
+#
+# Optional repository secrets:
+#   MACOS_CERT_P12                base64 of the "Developer ID Application" .p12
+#   MACOS_CERT_PASSWORD           password protecting the .p12
+#   APPLE_ID                      Apple ID that owns the certificate
+#   APPLE_TEAM_ID                 10-char team identifier
+#   APPLE_APP_SPECIFIC_PASSWORD   app-specific password for notarytool
+
+on:
+  release:
+    types: [published]
+
+# Least privilege by default; the job elevates only what it needs.
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+
+jobs:
+  dmg:
+    name: Build & attach DMG
+    runs-on: macos-15
+    timeout-minutes: 30
+    permissions:
+      contents: write # upload the DMG to the release
+    env:
+      TAG_NAME: ${{ github.event.release.tag_name }}
+      HAS_SIGNING: ${{ secrets.MACOS_CERT_P12 != '' }}
+      HAS_NOTARY: ${{ secrets.APPLE_ID != '' && secrets.APPLE_TEAM_ID != '' && secrets.APPLE_APP_SPECIFIC_PASSWORD != '' }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # CFBundleVersion = commit count (bundle.sh)
+
+      - name: Select latest Xcode
+        run: sudo xcode-select -s "$(ls -d /Applications/Xcode_*.app | sort -V | tail -n 1)/Contents/Developer"
+
+      - name: Import Developer ID certificate
+        if: env.HAS_SIGNING == 'true'
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/release.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 1800 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          printf '%s' "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$MACOS_CERT_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" \
+            | sed -n 's/.*"\(Developer ID Application: .*\)"/\1/p' | head -n 1)"
+          [ -n "$IDENTITY" ] || { echo "error: no Developer ID Application identity in the imported .p12" >&2; exit 1; }
+          echo "CODESIGN_ID=$IDENTITY" >> "$GITHUB_ENV"
+
+      - name: Build app bundle
+        run: VERSION="${TAG_NAME#v}" ./bundle.sh release
+
+      - name: Hardened-runtime sign + verify
+        if: env.HAS_SIGNING == 'true'
+        run: |
+          codesign --force --deep --options runtime --timestamp --sign "$CODESIGN_ID" MacDirStats.app
+          codesign --verify --strict --verbose=2 MacDirStats.app
+
+      - name: Build DMG
+        run: |
+          echo "DMG=MacDirStats-${TAG_NAME#v}.dmg" >> "$GITHUB_ENV"
+          ./Scripts/make-dmg.sh MacDirStats.app "MacDirStats-${TAG_NAME#v}.dmg"
+
+      - name: Sign, notarize & staple DMG
+        if: env.HAS_SIGNING == 'true' && env.HAS_NOTARY == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          codesign --force --sign "$CODESIGN_ID" "$DMG"
+          xcrun notarytool submit "$DMG" --wait \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD"
+          xcrun stapler staple "$DMG"
+          spctl -a -vv -t open --context context:primary-signature "$DMG"
+
+      - name: Checksum
+        run: shasum -a 256 "$DMG" | tee "$DMG.sha256"
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG_NAME" "$DMG" "$DMG.sha256" --clobber
+
+      - name: Summary
+        run: |
+          {
+            echo "## $DMG"
+            if [ "$HAS_SIGNING" = "true" ] && [ "$HAS_NOTARY" = "true" ]; then
+              echo "✅ Developer ID-signed, notarized and stapled."
+            elif [ "$HAS_SIGNING" = "true" ]; then
+              echo "⚠️ Developer ID-signed but **not notarized** (Apple ID secrets missing)."
+            else
+              echo "⚠️ **Ad-hoc signature** (no signing secrets configured): Gatekeeper will warn; right-click ▸ Open."
+            fi
+            echo
+            cat "$DMG.sha256"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove temporary keychain
+        if: always() && env.HAS_SIGNING == 'true'
+        run: |
+          if [ -f "$RUNNER_TEMP/release.keychain-db" ]; then
+            security delete-keychain "$RUNNER_TEMP/release.keychain-db"
+          fi

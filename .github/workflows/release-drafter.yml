@@ -1,0 +1,60 @@
+name: Release Drafter
+
+# Keeps a draft release up to date on every push to main, and labels PRs
+# from their titles/changed files (config: .github/release-drafter.yml).
+# Publishing the draft triggers release.yml, which attaches the DMG.
+#
+# With no previous release the drafter would resolve to 1.0.0 — for the first
+# draft (v0.0.1), run this workflow manually with an explicit version.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, reopened, synchronize, edited]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Explicit version for the draft (e.g. 0.0.1); empty = auto-resolve'
+        required: false
+        default: ''
+
+# Least privilege by default; each job elevates only what it needs.
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  draft:
+    name: Update release draft
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write # create/update the draft release
+      pull-requests: read # list merged PRs for the notes
+    steps:
+      - uses: release-drafter/release-drafter@b1476f6e6eb133afa41ed8589daba6dc69b4d3f5 # v7.5.1
+        with:
+          disable-autolabeler: true
+          # Empty on push events; the action treats '' as unset.
+          version: ${{ inputs.version }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  autolabel:
+    name: Autolabel PR
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read # read .github/release-drafter.yml
+      pull-requests: write # apply labels
+    steps:
+      - uses: release-drafter/release-drafter@b1476f6e6eb133afa41ed8589daba6dc69b4d3f5 # v7.5.1
+        with:
+          disable-releaser: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

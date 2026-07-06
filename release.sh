@@ -1,6 +1,11 @@
 #!/bin/bash
 # Build a signed + notarized DMG and publish it as a GitHub Release (SPEC-07 v1).
 #
+# NOTE: the normal path is now CI — Release Drafter keeps a draft release up to
+# date, and publishing it triggers .github/workflows/release.yml which builds
+# and attaches the DMG. Keep this script for fully-local releases (it *creates*
+# the release, so don't mix it with an already-published draft for the same tag).
+#
 # One-time external prerequisites:
 #   - An Apple "Developer ID Application" certificate in your login keychain.
 #   - A notarytool keychain profile:
@@ -32,12 +37,7 @@ codesign --force --deep --options runtime --timestamp --sign "$DEVELOPER_ID" "$A
 codesign --verify --strict --verbose=2 "$APP"
 
 echo "▸ Building DMG"
-rm -f "$DMG"
-STAGING="$(mktemp -d)"
-cp -R "$APP" "$STAGING/"
-ln -s /Applications "$STAGING/Applications"
-hdiutil create -volname "MacDirStats" -srcfolder "$STAGING" -ov -format UDZO "$DMG"
-rm -rf "$STAGING"
+./Scripts/make-dmg.sh "$APP" "$DMG"
 
 echo "▸ Signing, notarizing & stapling DMG (this can take a few minutes)"
 codesign --force --sign "$DEVELOPER_ID" "$DMG"

@@ -1,0 +1,68 @@
+# Release Drafter config (SPEC-07). Consumed by .github/workflows/release-drafter.yml.
+#
+# Flow: every merge to main updates a draft release (next version resolved from
+# PR labels). Publishing the draft fires .github/workflows/release.yml, which
+# builds and attaches MacDirStats-<version>.dmg.
+#
+# Note: release-drafter only sees *merged PRs* — commits pushed directly to
+# main never appear in the notes. Labels are applied automatically from PR
+# titles/files (autolabeler below); add `skip-changelog` to hide a PR.
+
+name-template: 'v$RESOLVED_VERSION'
+tag-template: 'v$RESOLVED_VERSION'
+
+categories:
+  - title: '🚀 Features'
+    labels: ['enhancement', 'feature']
+  - title: '🐛 Bug Fixes'
+    labels: ['bug']
+  - title: '⚡ Performance'
+    labels: ['performance']
+  - title: '📚 Documentation'
+    labels: ['documentation']
+  - title: '🔧 CI & Tooling'
+    labels: ['ci']
+  - title: '📦 Dependencies'
+    labels: ['dependencies']
+    collapse-after: 3
+
+exclude-labels: ['skip-changelog']
+
+change-template: '- $TITLE (#$NUMBER)'
+change-title-escapes: '\<*_&' # markdown metacharacters in PR titles
+
+version-resolver:
+  major:
+    labels: ['breaking']
+  minor:
+    labels: ['enhancement', 'feature', 'performance']
+  patch:
+    labels: ['bug', 'documentation', 'ci', 'dependencies']
+  default: patch
+
+autolabeler:
+  - label: 'documentation'
+    files: ['**/*.md']
+  - label: 'ci'
+    files: ['.github/**', '.pre-commit-config.yaml', '.swiftlint.yml', 'renovate.json']
+  - label: 'dependencies'
+    files: ['Package.swift', 'Package.resolved']
+  - label: 'bug'
+    title: ['/\b(fix(es|ed)?|bug|crash|regression)\b/i']
+  - label: 'enhancement'
+    title: ['/\b(add(s|ed)?|feat(ure)?|implement(s|ed)?|support)\b/i']
+  - label: 'performance'
+    title: ['/\b(perf(ormance)?|speed|faster|optimi[sz]e[sd]?)\b/i']
+
+template: |
+  ## What's Changed
+
+  $CHANGES
+
+  ---
+
+  **Install**: download `MacDirStats-$RESOLVED_VERSION.dmg` below, open it, and drag MacDirStats into Applications. The DMG is attached automatically a few minutes after this release is published.
+
+  **Full Changelog**: https://github.com/$OWNER/$REPOSITORY/compare/$PREVIOUS_TAG...v$RESOLVED_VERSION
+
+no-changes-template: '- No merged pull requests since the last release.'

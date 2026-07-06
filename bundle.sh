@@ -25,10 +25,11 @@ if [ -f "Resources/AppIcon.icns" ]; then
 fi
 
 # Version derived from git so About/Finder reflect the actual build (J1.5).
+# CI overrides VERSION from the release tag (git describe needs local tags).
 # The `|| true` keeps `set -o pipefail` from aborting when there's no tag yet.
-VERSION="$( { git describe --tags --abbrev=0 2>/dev/null || true; } | sed 's/^v//')"
+VERSION="${VERSION:-$( { git describe --tags --abbrev=0 2>/dev/null || true; } | sed 's/^v//')}"
 [ -z "$VERSION" ] && VERSION="0.1.0"
-BUILD="$(git rev-list --count HEAD 2>/dev/null || echo 1)"
+BUILD="${BUILD:-$(git rev-list --count HEAD 2>/dev/null || echo 1)}"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
