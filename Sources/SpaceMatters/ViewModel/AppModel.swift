@@ -8,17 +8,19 @@ import Observation
 @MainActor
 @Observable
 final class AppModel {
-    enum Route: Equatable { case splash, filesystem, containers, kubernetes }
+    enum Route: Equatable { case splash, filesystem, containers, kubernetes, cleanup }
     private(set) var route: Route = .splash
 
     let filesystem = ScanController()
     let containers = ContainerController()
     let kubernetes = KubernetesController()
+    let cleanup = CleanupController()
 
     func showSplash() {
         filesystem.goHome()
         containers.stop()
         kubernetes.stop()
+        cleanup.stop()
         route = .splash
     }
 
@@ -76,5 +78,12 @@ final class AppModel {
     func analyzeKubernetes(context: String) {
         route = .kubernetes
         kubernetes.load(context: context)
+    }
+
+    // MARK: Cleanup mode (Low-Hanging Fruits)
+
+    func analyzeCleanup() {
+        route = .cleanup
+        cleanup.load()
     }
 }

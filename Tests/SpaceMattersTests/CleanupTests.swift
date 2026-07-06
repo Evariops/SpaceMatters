@@ -1,0 +1,176 @@
+import Testing
+import Foundation
+@testable import SpaceMatters
+
+/// Safety invariants of the Low-Hanging Fruits mode. Cleaning deletes real
+/// files, so every fence is pinned the same way as `DeletionGuardTests`:
+/// contents-only removal, no symlink following, no reach outside the allowed
+/// root, and no cleaning while sizes are still being measured.
+@MainActor
+@Suite struct CleanupTests {
+
+    /// allowedRoot/cache/{a.bin, sub/b.bin} — a fake cache inside a fake home.
+    static func makeFixture() throws -> (root: URL, cache: URL) {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("sm-cleanup-\(UUID().uuidString)")
+        let cache = root.appendingPathComponent("cache")
+        try fm.createDirectory(at: cache.appendingPathComponent("sub"), withIntermediateDirectories: true)
+        try Data(count: 100_000).write(to: cache.appendingPathComponent("a.bin"))
+        try Data(count: 50_000).write(to: cache.appendingPathComponent("sub/b.bin"))
+        return (root, cache)
+    }
+
+    static func cleanable(_ paths: [String]) -> Cleanable {
+        Cleanable(id: "test-cache", name: "Test cache", category: "Test",
+                  icon: "shippingbox", note: "fixture", paths: paths)
+    }
+
+    static func waitForReady(_ c: CleanupController, timeout: TimeInterval = 5) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while c.state != .ready && Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+            await Task.yield()
+        }
+    }
+
+    // MARK: Catalog
+
+    @Test func catalogStaysInsideHome() {
+        let home = NSHomeDirectory()
+        let items = CleanupEngine.catalog()
+        #expect(!items.isEmpty)
+        #expect(Set(items.map(\.id)).count == items.count)
+        for item in items {
+            for path in item.paths {
+                #expect(path.hasPrefix(home + "/"), "\(item.id): \(path) escapes home")
+                #expect(!path.hasSuffix("/"))
+            }
+        }
+    }
+
+    // MARK: Engine
+
+    @Test func sizingMeasuresFixture() throws {
+        let (root, cache) = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let measure = CleanupEngine.size(of: Self.cleanable([cache.path]))
+        guard case .sized(let bytes) = measure else {
+            Issue.record("expected .sized, got \(measure)")
+            return
+        }
+        #expect(bytes >= 150_000) // physical ≥ logical of the two files
+    }
+
+    @Test func cleanRemovesContentsButKeepsRoot() throws {
+        let (root, cache) = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let result = CleanupEngine.clean(Self.cleanable([cache.path]), allowedRoot: root.path)
+        #expect(result.removed == 2) // a.bin + sub (recursively)
+        #expect(result.failed == 0 && result.refused == 0)
+        var isDir: ObjCBool = false
+        #expect(FileManager.default.fileExists(atPath: cache.path, isDirectory: &isDir) && isDir.boolValue)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: cache.path).isEmpty)
+    }
+
+    /// A symlink placed inside a cache must be removed as a link — its target,
+    /// outside the cache, survives.
+    @Test func cleanNeverFollowsSymlinks() throws {
+        let (root, cache) = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let victimDir = root.appendingPathComponent("victim")
+        try FileManager.default.createDirectory(at: victimDir, withIntermediateDirectories: true)
+        try Data(count: 4096).write(to: victimDir.appendingPathComponent("keep.bin"))
+        try FileManager.default.createSymbolicLink(
+            at: cache.appendingPathComponent("link"), withDestinationURL: victimDir)
+
+        _ = CleanupEngine.clean(Self.cleanable([cache.path]), allowedRoot: root.path)
+
+        #expect(!FileManager.default.fileExists(atPath: cache.appendingPathComponent("link").path))
+        #expect(FileManager.default.fileExists(atPath: victimDir.appendingPathComponent("keep.bin").path))
+    }
+
+    /// A cache root that is itself a symlink is refused — never resolved and
+    /// chased to wherever it points.
+    @Test func cleanRefusesSymlinkedRoot() throws {
+        let (root, _) = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let outside = FileManager.default.temporaryDirectory
+            .appendingPathComponent("sm-outside-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: outside) }
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try Data(count: 4096).write(to: outside.appendingPathComponent("keep.bin"))
+        let link = root.appendingPathComponent("linked-cache")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: outside)
+
+        let result = CleanupEngine.clean(Self.cleanable([link.path]), allowedRoot: root.path)
+
+        #expect(result.refused == 1 && result.removed == 0)
+        #expect(FileManager.default.fileExists(atPath: outside.appendingPathComponent("keep.bin").path))
+    }
+
+    /// Paths outside the fence are refused wholesale, whatever the catalog says.
+    @Test func cleanRefusesOutsideFence() throws {
+        let (root, cache) = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let elsewhere = FileManager.default.temporaryDirectory
+            .appendingPathComponent("sm-fence-\(UUID().uuidString)")
+        let result = CleanupEngine.clean(
+            Self.cleanable([cache.path]), allowedRoot: elsewhere.path)
+        #expect(result.refused == 1 && result.removed == 0)
+        #expect(FileManager.default.fileExists(atPath: cache.appendingPathComponent("a.bin").path))
+    }
+
+    // MARK: Controller
+
+    @Test func controllerSizesSelectsAndCleans() async throws {
+        let (root, cache) = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let c = CleanupController(catalog: [Self.cleanable([cache.path])], allowedRoot: root.path)
+        c.load()
+        await Self.waitForReady(c)
+
+        #expect(c.rows.count == 1)
+        #expect(c.totalFound >= 150_000)
+
+        c.toggle("test-cache")
+        #expect(c.totalSelected == c.totalFound)
+
+        await c.cleanSelected()
+        #expect(c.state == .ready)
+        #expect(c.lastFreed >= 150_000)
+        #expect(c.lastFailures == 0)
+        #expect(c.totalFound == 0) // re-measured after cleaning, not assumed
+        #expect(try FileManager.default.contentsOfDirectory(atPath: cache.path).isEmpty)
+    }
+
+    /// Mid-sizing, cleaning is refused — sizes aren't trustworthy yet.
+    @Test func cleanRefusedWhileSizing() async throws {
+        let (root, cache) = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let c = CleanupController(catalog: [Self.cleanable([cache.path])], allowedRoot: root.path)
+        c.load()
+        #expect(c.state == .sizing)
+
+        c.toggle("test-cache")
+        await c.cleanSelected() // refused: still sizing
+        #expect(FileManager.default.fileExists(atPath: cache.appendingPathComponent("a.bin").path))
+
+        await Self.waitForReady(c)
+        #expect(c.totalFound >= 150_000) // nothing was cleaned
+    }
+
+    /// Entries whose paths don't exist disappear; existing ones keep only their
+    /// existing paths.
+    @Test func detectFiltersMissingPaths() throws {
+        let (root, cache) = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let ghost = root.appendingPathComponent("nope").path
+        let detected = CleanupEngine.detect([
+            Self.cleanable([cache.path, ghost]),
+            Cleanable(id: "ghost", name: "Ghost", category: "Test",
+                      icon: "shippingbox", note: "", paths: [ghost]),
+        ])
+        #expect(detected.count == 1)
+        #expect(detected[0].paths == [cache.path])
+    }
+}

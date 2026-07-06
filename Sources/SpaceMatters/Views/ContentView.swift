@@ -26,6 +26,8 @@ struct ContentView: View {
                 ContainerResultView(controller: app.containers, app: app, isDark: $isDark)
             case .kubernetes:
                 KubernetesResultView(controller: app.kubernetes, app: app, isDark: $isDark)
+            case .cleanup:
+                CleanupResultView(controller: app.cleanup, app: app, isDark: $isDark)
             }
         }
         .environment(\.theme, theme)
@@ -45,6 +47,7 @@ struct ContentView: View {
         case .filesystem: return app.filesystem.rootName.isEmpty ? "SpaceMatters" : app.filesystem.rootName
         case .containers: return app.containers.engineName.isEmpty ? "Containers" : app.containers.engineName
         case .kubernetes: return app.kubernetes.contextName.isEmpty ? "Kubernetes" : app.kubernetes.contextName
+        case .cleanup: return "Low-Hanging Fruits"
         }
     }
 }
@@ -501,6 +504,7 @@ private struct EmptyState: View {
                         ForEach(volumes) { volume in
                             VolumeCard(volume: volume, theme: theme) { app.scan(volumes: [volume]) }
                         }
+                        CleanupCard(theme: theme) { app.analyzeCleanup() }
                     }
                     .frame(maxWidth: 780)
                 }
@@ -659,6 +663,45 @@ private struct VolumeCard: View {
 
     private var usageColor: Color { Theme.usageColor(volume.usedFraction) }
     private var percent: Int { Int((volume.usedFraction * 100).rounded()) }
+}
+
+/// Splash card for the Low-Hanging Fruits mode: known-safe cleanup (Trash and
+/// well-known dev caches), sitting next to the disks it helps relieve.
+private struct CleanupCard: View {
+    let theme: Theme
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "sparkles")
+                .font(.system(size: 22))
+                .foregroundStyle(theme.accent)
+                .frame(width: 32, height: 32)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Low-Hanging Fruits")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(theme.textPrimary)
+                Text("Safe cleanup · Trash & dev caches")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(theme.textSecondary)
+                    .textCase(.uppercase)
+            }
+            Spacer()
+            Image(systemName: "chevron.right")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(hovering ? theme.accent : theme.textSecondary)
+        }
+        .padding(14)
+        .accessibilityElement(children: .combine)
+        .accessibilityHint("Find and empty the Trash and well-known development caches")
+        .background(RoundedRectangle(cornerRadius: 12).fill(theme.panelBackground))
+        .overlay(RoundedRectangle(cornerRadius: 12)
+            .strokeBorder(hovering ? theme.accent : theme.separator, lineWidth: hovering ? 2 : 1))
+        .contentShape(RoundedRectangle(cornerRadius: 12))
+        .onHover { hovering = $0 }
+        .onTapGesture(perform: action)
+    }
 }
 
 /// Splash card that opens the SSH connection form (SPEC-06).
