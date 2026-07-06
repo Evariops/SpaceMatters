@@ -2,22 +2,13 @@
 
 ## Supported versions
 
-Only the latest release of MacDirStats is supported with security updates.
+Only the latest release (and `main`) receives security fixes.
 
 ## Reporting a vulnerability
 
-Please report vulnerabilities privately via
-[GitHub private vulnerability reporting](https://github.com/rducom/MacDirStats/security/advisories/new).
-Do not open a public issue for security problems.
+Please **do not open a public issue** for security problems.
 
-You can expect an initial response within a week. Please include steps to
-reproduce and the affected version (`git describe --tags`).
+Report privately via [GitHub private vulnerability reporting](https://github.com/rducom/MacDirStats/security/advisories/new).
+("Report a vulnerability"). You should get an acknowledgement within a few days.
 
-## Scope notes
-
-MacDirStats is a local macOS disk-usage analyzer. It reads filesystem metadata,
-may invoke local tools (`du`, `find`, container/Kubernetes CLIs) and can scan
-remote hosts over SSH using your existing SSH configuration. It never sends
-data anywhere else. Reports about privilege escalation, sandbox/TCC bypasses,
-or command injection through scanned paths or remote output are especially
-welcome.
+Please include a description of the issue, steps to reproduce, and the affected version or commit.
