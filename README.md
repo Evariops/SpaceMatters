@@ -1,6 +1,6 @@
 # SpaceMatters
 
-A disk usage visualizer for macOS, in the spirit of WinDirStat. It scans fast, shows results while it scans, and keeps memory use low.
+A space usage visualizer for Disks, VMs, Kubernetes and even ssh. It scans fast, shows results while it scans, and keeps memory use low.
 
 ![swift](https://img.shields.io/badge/Swift-6-orange) ![macOS](https://img.shields.io/badge/macOS-15%2B-blue)
 
@@ -8,7 +8,7 @@ A disk usage visualizer for macOS, in the spirit of WinDirStat. It scans fast, s
 
 ## What it does
 
-Pick a folder and SpaceMatters maps everything inside it as a squarified treemap, next to a sortable directory outline and a breakdown by file type. The view fills in live during the scan instead of appearing at the end. Toggle between on-disk and logical sizes, and rescan just what changed when the disk moves under you.
+Pick a disk, a cluster, a VM, and SpaceMatters maps everything inside it as a squarified treemap, next to a sortable directory outline and a breakdown by file type. The view fills in live during the scan instead of appearing at the end. Toggle between on-disk and logical sizes, and rescan just what changed when the disk moves under you.
 
 ## Beyond the local disk
 
@@ -36,6 +36,8 @@ Grab the latest signed and notarized `.dmg` from the [Releases page](../../relea
 
 ## Good to know
 
+- This project is vibe-coded.
+- Feedbacks are welcome ;)
 - The physical total matches `du -skx` in testing. The scan stays on the volume you picked and does not cross into mounted filesystems (swap, Preboot, external disks, DMGs), like `du -x`.
 - Symlinks are counted by their own size and never followed, so no cycles.
 - Files with hard links are counted once per link, as WinDirStat does.
