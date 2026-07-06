@@ -7,7 +7,7 @@ import CoreServices
 /// offer a targeted re-scan (SPEC-04). Delivered on a private dispatch queue.
 final class FSWatcher {
     private var stream: FSEventStreamRef?
-    private let queue = DispatchQueue(label: "com.macdirstats.fswatcher", qos: .utility)
+    private let queue = DispatchQueue(label: "com.spacematters.fswatcher", qos: .utility)
     private let paths: [String]
     private let latency: CFTimeInterval
     private let handler: ([String]) -> Void

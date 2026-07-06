@@ -41,8 +41,8 @@ struct ContentView: View {
 
     private var windowTitle: String {
         switch app.route {
-        case .splash: return "MacDirStats"
-        case .filesystem: return app.filesystem.rootName.isEmpty ? "MacDirStats" : app.filesystem.rootName
+        case .splash: return "SpaceMatters"
+        case .filesystem: return app.filesystem.rootName.isEmpty ? "SpaceMatters" : app.filesystem.rootName
         case .containers: return app.containers.engineName.isEmpty ? "Containers" : app.containers.engineName
         case .kubernetes: return app.kubernetes.contextName.isEmpty ? "Kubernetes" : app.kubernetes.contextName
         }
@@ -485,7 +485,7 @@ private struct EmptyState: View {
                     Image(systemName: "chart.pie.fill")
                         .font(.system(size: 48))
                         .foregroundStyle(theme.accent.opacity(0.9))
-                    Text("MacDirStats")
+                    Text("SpaceMatters")
                         .font(.system(size: 24, weight: .bold))
                         .foregroundStyle(theme.textPrimary)
                     Text("Choose what to analyze")

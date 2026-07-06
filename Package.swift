@@ -2,15 +2,15 @@
 import PackageDescription
 
 let package = Package(
-    name: "MacDirStats",
+    name: "SpaceMatters",
     platforms: [.macOS(.v15)],
     products: [
-        .executable(name: "MacDirStats", targets: ["MacDirStats"])
+        .executable(name: "SpaceMatters", targets: ["SpaceMatters"])
     ],
     targets: [
         .executableTarget(
-            name: "MacDirStats",
-            path: "Sources/MacDirStats",
+            name: "SpaceMatters",
+            path: "Sources/SpaceMatters",
             swiftSettings: [
                 // Pragmatic: the scanner uses a hand-rolled thread pool with
                 // manual synchronization, which fights Swift 6 strict concurrency.
@@ -19,9 +19,9 @@ let package = Package(
             ]
         ),
         .testTarget(
-            name: "MacDirStatsTests",
-            dependencies: ["MacDirStats"],
-            path: "Tests/MacDirStatsTests",
+            name: "SpaceMattersTests",
+            dependencies: ["SpaceMatters"],
+            path: "Tests/SpaceMattersTests",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
     ]

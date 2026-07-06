@@ -1,6 +1,6 @@
 import Testing
 import Foundation
-@testable import MacDirStats
+@testable import SpaceMatters
 
 /// The golden correctness test: a controlled fixture scanned by `DirectoryScanner`
 /// must agree with `du` to the kilobyte. This is what would catch a regression in

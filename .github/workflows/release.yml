@@ -1,7 +1,7 @@
 name: Release
 
 # Fires when a draft (from Release Drafter) is published: builds the app at
-# the release tag, packages MacDirStats-<version>.dmg, and attaches it to the
+# the release tag, packages SpaceMatters-<version>.dmg, and attaches it to the
 # release with a SHA-256 checksum.
 #
 # Signing is opportunistic (SPEC-07: Developer ID is an external prerequisite):
@@ -75,13 +75,13 @@ jobs:
       - name: Hardened-runtime sign + verify
         if: env.HAS_SIGNING == 'true'
         run: |
-          codesign --force --deep --options runtime --timestamp --sign "$CODESIGN_ID" MacDirStats.app
-          codesign --verify --strict --verbose=2 MacDirStats.app
+          codesign --force --deep --options runtime --timestamp --sign "$CODESIGN_ID" SpaceMatters.app
+          codesign --verify --strict --verbose=2 SpaceMatters.app
 
       - name: Build DMG
         run: |
-          echo "DMG=MacDirStats-${TAG_NAME#v}.dmg" >> "$GITHUB_ENV"
-          ./Packaging/make-dmg.sh MacDirStats.app "MacDirStats-${TAG_NAME#v}.dmg"
+          echo "DMG=SpaceMatters-${TAG_NAME#v}.dmg" >> "$GITHUB_ENV"
+          ./Packaging/make-dmg.sh SpaceMatters.app "SpaceMatters-${TAG_NAME#v}.dmg"
 
       - name: Sign, notarize & staple DMG
         if: env.HAS_SIGNING == 'true' && env.HAS_NOTARY == 'true'

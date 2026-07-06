@@ -1,6 +1,6 @@
 import Testing
 import Foundation
-@testable import MacDirStats
+@testable import SpaceMatters
 
 /// Safety invariants on `ScanController.remove` (J4.4). The UI disables deletion
 /// for remote scans and while scanning, but the *model* — the layer that actually

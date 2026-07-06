@@ -23,7 +23,7 @@ final class AppModel {
     }
 
     /// `--open <path>`: scan a folder straight from the GUI launch (handy for a
-    /// "reveal in / open with MacDirStats" flow, and for driving the app in tests).
+    /// "reveal in / open with SpaceMatters" flow, and for driving the app in tests).
     @ObservationIgnored private var didHandleLaunch = false
     func handleLaunchArgumentsOnce() {
         guard !didHandleLaunch else { return }

@@ -2,7 +2,7 @@
 #
 # Flow: every merge to main updates a draft release (next version resolved from
 # PR labels). Publishing the draft fires .github/workflows/release.yml, which
-# builds and attaches MacDirStats-<version>.dmg.
+# builds and attaches SpaceMatters-<version>.dmg.
 #
 # Note: release-drafter only sees *merged PRs* — commits pushed directly to
 # main never appear in the notes. Labels are applied automatically from PR
@@ -61,7 +61,7 @@ template: |
 
   ---
 
-  **Install**: download `MacDirStats-$RESOLVED_VERSION.dmg` below, open it, and drag MacDirStats into Applications. The DMG is attached automatically a few minutes after this release is published.
+  **Install**: download `SpaceMatters-$RESOLVED_VERSION.dmg` below, open it, and drag SpaceMatters into Applications. The DMG is attached automatically a few minutes after this release is published.
 
   **Full Changelog**: https://github.com/$OWNER/$REPOSITORY/compare/$PREVIOUS_TAG...v$RESOLVED_VERSION
 

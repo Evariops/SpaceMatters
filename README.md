@@ -1,4 +1,4 @@
-# MacDirStats
+# SpaceMatters
 
 A disk usage visualizer for macOS, in the spirit of WinDirStat. It scans fast, shows results while it scans, and keeps memory use low.
 
@@ -6,19 +6,19 @@ A disk usage visualizer for macOS, in the spirit of WinDirStat. It scans fast, s
 
 ## What it does
 
-Pick a folder and MacDirStats maps everything inside it as a squarified treemap, next to a sortable directory outline and a breakdown by file type. The view fills in live during the scan instead of appearing at the end.
+Pick a folder and SpaceMatters maps everything inside it as a squarified treemap, next to a sortable directory outline and a breakdown by file type. The view fills in live during the scan instead of appearing at the end.
 
 ## How it stays fast and lean
 
-The scanner relies on [`getattrlistbulk(2)`](Sources/MacDirStats/Scanner/FSAttr.swift), a syscall that returns many directory entries with their sizes in one call, so there is no `readdir` plus `stat` for every file. A pool of worker threads walks subtrees in parallel.
+The scanner relies on [`getattrlistbulk(2)`](Sources/SpaceMatters/Scanner/FSAttr.swift), a syscall that returns many directory entries with their sizes in one call, so there is no `readdir` plus `stat` for every file. A pool of worker threads walks subtrees in parallel.
 
-Memory stays low because the tree keeps one [`FSNode`](Sources/MacDirStats/Model/FSNode.swift) per directory only. Files collapse into aggregates inside their parent folder, and [`ExtKey`](Sources/MacDirStats/Model/ExtKey.swift) packs each extension into two integers, so no `String` is allocated per file.
+Memory stays low because the tree keeps one [`FSNode`](Sources/SpaceMatters/Model/FSNode.swift) per directory only. Files collapse into aggregates inside their parent folder, and [`ExtKey`](Sources/SpaceMatters/Model/ExtKey.swift) packs each extension into two integers, so no `String` is allocated per file.
 
 Sizes are atomic counters propagated up the ancestor chain as each directory completes, and the UI reads them ten times per second. That is what makes the live view possible.
 
 ## Download
 
-Grab the latest signed and notarized `.dmg` from the [Releases page](../../releases/latest), open it, and drag MacDirStats into Applications. It launches without a Gatekeeper warning.
+Grab the latest signed and notarized `.dmg` from the [Releases page](../../releases/latest), open it, and drag SpaceMatters into Applications. It launches without a Gatekeeper warning.
 
 ## Good to know
 

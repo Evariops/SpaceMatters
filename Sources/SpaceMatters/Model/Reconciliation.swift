@@ -1,6 +1,6 @@
 import Foundation
 
-/// Explains the gap between what MacDirStats scanned and the "used" space the OS
+/// Explains the gap between what SpaceMatters scanned and the "used" space the OS
 /// reports for a volume (finding J9 — "why doesn't this match Finder/df?").
 ///
 /// Every figure is an honest best-effort. `unaccounted` is whatever's left after
