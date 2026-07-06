@@ -4,9 +4,23 @@ A disk usage visualizer for macOS, in the spirit of WinDirStat. It scans fast, s
 
 ![swift](https://img.shields.io/badge/Swift-6-orange) ![macOS](https://img.shields.io/badge/macOS-15%2B-blue)
 
+![Scanning a 327 GiB system volume: sortable directory outline, file-type breakdown and squarified treemap, filled in live — 4 million files in 23 seconds](docs/screenshots/scan-local-disk.avif)
+
 ## What it does
 
-Pick a folder and SpaceMatters maps everything inside it as a squarified treemap, next to a sortable directory outline and a breakdown by file type. The view fills in live during the scan instead of appearing at the end.
+Pick a folder and SpaceMatters maps everything inside it as a squarified treemap, next to a sortable directory outline and a breakdown by file type. The view fills in live during the scan instead of appearing at the end. Toggle between on-disk and logical sizes, and rescan just what changed when the disk moves under you.
+
+## Beyond the local disk
+
+The home screen lists everything worth analyzing, not just volumes.
+
+![Home screen: internal disk, Low-Hanging Fruits safe cleanup, Podman virtual machines and Kubernetes contexts](docs/screenshots/home.avif)
+
+- **Low-Hanging Fruits** — a safe one-click cleanup pass over the usual suspects: Trash, `DerivedData`, npm and NuGet caches, and friends. It only ever touches locations that are safe to regenerate.
+- **Virtual machines** — Podman machines, scanned from inside the VM.
+- **Kubernetes** — pick a kube context and see every PVC by namespace, provisioned capacity against actual usage, as the same treemap.
+
+![Kubernetes view: 26 PVCs across 8 namespaces, capacity vs. used, with a per-PVC treemap](docs/screenshots/kubernetes-pvcs.avif)
 
 ## How it stays fast and lean
 
