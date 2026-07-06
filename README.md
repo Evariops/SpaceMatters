@@ -1,81 +1,33 @@
 # MacDirStats
 
-A fast, modern macOS disk-usage visualizer — like WinDirStat, rebuilt for macOS
-with an obsession for **scan speed**, **live UI feedback**, and **low memory use**.
+A disk usage visualizer for macOS, in the spirit of WinDirStat. It scans fast, shows results while it scans, and keeps memory use low.
 
-![dark](https://img.shields.io/badge/theme-dark--first-0E1116) ![swift](https://img.shields.io/badge/Swift-6-orange) ![macOS](https://img.shields.io/badge/macOS-15%2B-blue)
+![swift](https://img.shields.io/badge/Swift-6-orange) ![macOS](https://img.shields.io/badge/macOS-15%2B-blue)
 
-## Highlights
+## What it does
 
-- **~220,000 files/second.** Measured: 801k files / 133k folders / 94 GB scanned in **3.6 s** on an Apple Silicon SSD.
-- **~35 MB peak RAM** for that same 800k-file scan.
-- **Live treemap + folder list** that fill in *during* the scan, not after.
-- **Dark theme first**, with a light toggle. Hand-built palette, no system-material guesswork.
-- Squarified treemap, sortable directory outline, and a file-type (extension) breakdown.
+Pick a folder and MacDirStats maps everything inside it as a squarified treemap, next to a sortable directory outline and a breakdown by file type. The view fills in live during the scan instead of appearing at the end.
 
-## How it's fast and lean
+## How it stays fast and lean
 
-| Concern | Approach |
-|---|---|
-| Scan speed | [`getattrlistbulk(2)`](Sources/MacDirStats/Scanner/FSAttr.swift) — one syscall returns many directory entries *with* sizes, avoiding `readdir`+`stat` per file. A LIFO worker-thread pool walks subtrees in parallel. |
-| Low RAM | One node **per directory only** ([`FSNode`](Sources/MacDirStats/Model/FSNode.swift)); files collapse into per-directory aggregates. Object count tracks *folders*, not *files*. |
-| Per-extension stats | [`ExtKey`](Sources/MacDirStats/Model/ExtKey.swift) packs the extension into two `UInt64`s inline — **zero `String` allocations per file**. |
-| Live UI | Sizes are atomics propagated up the ancestor chain as each directory completes; the UI re-reads them at 10 Hz. |
+The scanner relies on [`getattrlistbulk(2)`](Sources/MacDirStats/Scanner/FSAttr.swift), a syscall that returns many directory entries with their sizes in one call, so there is no `readdir` plus `stat` for every file. A pool of worker threads walks subtrees in parallel.
+
+Memory stays low because the tree keeps one [`FSNode`](Sources/MacDirStats/Model/FSNode.swift) per directory only. Files collapse into aggregates inside their parent folder, and [`ExtKey`](Sources/MacDirStats/Model/ExtKey.swift) packs each extension into two integers, so no `String` is allocated per file.
+
+Sizes are atomic counters propagated up the ancestor chain as each directory completes, and the UI reads them ten times per second. That is what makes the live view possible.
 
 ## Download
 
-Grab the latest signed & notarized `.dmg` from the **[Releases page](../../releases/latest)**,
-open it, and drag **MacDirStats** into Applications. It launches without a
-Gatekeeper warning (Developer ID signed + notarized).
+Grab the latest signed and notarized `.dmg` from the [Releases page](../../releases/latest), open it, and drag MacDirStats into Applications. It launches without a Gatekeeper warning.
 
-Maintainers cut a release with [`./release.sh`](release.sh) (build → sign →
-notarize → staple → `gh release create`); see the script header for the one-time
-Apple Developer ID / `notarytool` setup.
+## Good to know
 
-## Build & run
-
-```bash
-# Build a double-clickable app bundle
-./bundle.sh
-open MacDirStats.app
-
-# …or run directly during development
-swift run -c release
-```
-
-Pick a folder with **Open Folder** (⌘O) and watch it fill in.
-
-### Headless mode (benchmark / scripting)
-
-```bash
-swift build -c release
-.build/release/MacDirStats --scan /some/path
-```
-
-Prints totals, timing, throughput, and the top file types.
-
-## Using the UI
-
-- **Left:** live directory outline (sorted by size) over a file-type breakdown.
-- **Right:** squarified treemap. **Hover** for a path + size tooltip, **click**
-  to select, **double-click** a folder to zoom in. Zoom back out with the
-  **↖︎** breadcrumb button, **⌘↑**, or a **double-click** on empty space.
-  **Right-click** any tile for Reveal in Finder / Copy Path / Move to Trash.
-- **On disk / Logical** toggle switches between allocated and content size.
-- Sun/moon toggles the theme.
-
-## Notes & current limits
-
-- Size accuracy: the physical (on-disk) total matches `du -skx` exactly in
-  testing — the scan stays on the volume you picked and does not cross into
-  mounted filesystems (swap, Preboot, external disks, DMGs), matching `du -x`.
-- Symlinks are counted by their own size and **not** followed (no cycles).
-- Hard-linked files are counted once per link (same as WinDirStat).
-- Scanning system locations may require granting access; per-entry permission
-  errors are skipped and surfaced as a "skipped" count.
-- The treemap is directory-granular (files aggregate per folder) — a deliberate
-  RAM trade-off. Per-file treemap detail is a possible future addition.
+- The physical total matches `du -skx` in testing. The scan stays on the volume you picked and does not cross into mounted filesystems (swap, Preboot, external disks, DMGs), like `du -x`.
+- Symlinks are counted by their own size and never followed, so no cycles.
+- Files with hard links are counted once per link, as WinDirStat does.
+- Scanning system locations may require granting access. Entries that cannot be read are skipped and reported as a skipped count.
+- The treemap works at directory granularity, files aggregate into their folder. This is a deliberate memory tradeoff, and finer per file detail may come later.
 
 ## Requirements
 
-macOS 15+, Swift 6 toolchain (Xcode 16+).
+macOS 15 or later, with a Swift 6 toolchain (Xcode 16 or later).
