@@ -480,6 +480,9 @@ private struct EmptyState: View {
     @State private var showingRemote = false
 
     private let columns = [GridItem(.adaptive(minimum: 230, maximum: 320), spacing: 14)]
+    /// The disks row uses fixed columns so the cleanup card can be pinned to
+    /// the rightmost one whatever the volume count.
+    private let diskColumns = Array(repeating: GridItem(.flexible(), spacing: 14), count: 3)
 
     var body: some View {
         ScrollView {
@@ -500,10 +503,13 @@ private struct EmptyState: View {
                 if volumes.isEmpty {
                     ProgressView().controlSize(.small)
                 } else {
-                    LazyVGrid(columns: columns, spacing: 14) {
+                    LazyVGrid(columns: diskColumns, spacing: 14) {
                         ForEach(volumes) { volume in
                             VolumeCard(volume: volume, theme: theme) { app.scan(volumes: [volume]) }
                         }
+                        // Spacer cells so the cleanup card lands in the right column.
+                        let pad = (2 - volumes.count % 3 + 3) % 3
+                        ForEach(0..<pad, id: \.self) { _ in Color.clear }
                         CleanupCard(theme: theme) { app.analyzeCleanup() }
                     }
                     .frame(maxWidth: 780)
@@ -644,6 +650,7 @@ private struct VolumeCard: View {
             .font(.system(size: 10).monospacedDigit())
         }
         .padding(14)
+        .frame(height: splashCardHeight, alignment: .top)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("\(volume.name), \(volume.kindLabel)")
         .accessibilityValue("\(percent)% full, \(Format.bytes(volume.used)) used of \(Format.bytes(volume.total))")
@@ -665,35 +672,58 @@ private struct VolumeCard: View {
     private var percent: Int { Int((volume.usedFraction * 100).rounded()) }
 }
 
+/// Shared height of the disk-row splash cards (`VolumeCard`, `CleanupCard`):
+/// the volume stats line can wrap to two lines, so a fixed frame is the only
+/// way to keep the row's cards strictly the same size.
+private let splashCardHeight: CGFloat = 116
+
 /// Splash card for the Low-Hanging Fruits mode: known-safe cleanup (Trash and
-/// well-known dev caches), sitting next to the disks it helps relieve.
+/// well-known dev caches). Mirrors `VolumeCard`'s three-row layout so it lines
+/// up pixel-for-pixel with the disk cards it sits next to; the bar row is an
+/// empty track (nothing measured until the mode opens).
 private struct CleanupCard: View {
     let theme: Theme
     let action: () -> Void
     @State private var hovering = false
 
     var body: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "sparkles")
-                .font(.system(size: 22))
-                .foregroundStyle(theme.accent)
-                .frame(width: 32, height: 32)
-            VStack(alignment: .leading, spacing: 1) {
-                Text("Low-Hanging Fruits")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(theme.textPrimary)
-                Text("Safe cleanup · Trash & dev caches")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(theme.textSecondary)
-                    .textCase(.uppercase)
+        VStack(alignment: .leading, spacing: 11) {
+            HStack(spacing: 10) {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 24))
+                    .foregroundStyle(theme.accent)
+                    .frame(width: 32, height: 32)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Low-Hanging Fruits")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(theme.textPrimary)
+                        .lineLimit(1)
+                    Text("Safe cleanup")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(theme.textSecondary)
+                        .textCase(.uppercase)
+                }
+                Spacer()
             }
-            Spacer()
-            Image(systemName: "chevron.right")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(hovering ? theme.accent : theme.textSecondary)
+
+            Capsule().fill(theme.barTrack)
+                .frame(height: 6)
+
+            HStack {
+                Text("Trash · DerivedData · npm · NuGet…")
+                    .foregroundStyle(theme.textSecondary)
+                    .lineLimit(1)
+                Spacer()
+                Label("Analyze", systemImage: "play.fill")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(hovering ? theme.accent : theme.textSecondary)
+            }
+            .font(.system(size: 10).monospacedDigit())
         }
         .padding(14)
-        .accessibilityElement(children: .combine)
+        .frame(height: splashCardHeight, alignment: .top)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Low-Hanging Fruits, safe cleanup")
         .accessibilityHint("Find and empty the Trash and well-known development caches")
         .background(RoundedRectangle(cornerRadius: 12).fill(theme.panelBackground))
         .overlay(RoundedRectangle(cornerRadius: 12)

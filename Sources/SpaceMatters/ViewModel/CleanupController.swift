@@ -72,6 +72,27 @@ final class CleanupController {
         rows[idx].selected.toggle()
     }
 
+    // MARK: Select all (tri-state)
+
+    enum SelectAllState { case none, some, all }
+
+    /// Select-all checkbox state over the *selectable* rows (denied/pending
+    /// rows have no trustworthy size and never count).
+    var selectAllState: SelectAllState {
+        let selectable = rows.filter(\.size.isSelectable)
+        let selected = selectable.filter(\.selected).count
+        if selected == 0 { return .none }
+        return selected == selectable.count ? .all : .some
+    }
+
+    /// Standard macOS cycle: all → none; none or mixed → all.
+    func toggleAll() {
+        let target = selectAllState != .all
+        for idx in rows.indices {
+            rows[idx].selected = target && rows[idx].size.isSelectable
+        }
+    }
+
     // MARK: Derived totals
 
     var selectedRows: [Row] { rows.filter(\.selected) }
@@ -136,5 +157,12 @@ extension CleanupController.SizeState {
     var bytes: Int64 {
         if case .sized(let value) = self { return value }
         return 0
+    }
+
+    /// Only measured rows can be selected — a denied or still-sizing row has no
+    /// trustworthy size to confirm against.
+    var isSelectable: Bool {
+        if case .sized = self { return true }
+        return false
     }
 }

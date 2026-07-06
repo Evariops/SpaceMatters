@@ -98,53 +98,92 @@ struct CleanupResultView: View {
             }
             Spacer()
         }
-        .padding(.horizontal, 14).padding(.vertical, 10)
+        .padding(.horizontal, 14).padding(.vertical, 8)
         .background(theme.panelBackground)
     }
 
     private func summaryCard(_ title: String, value: String, subtitle: String, accent: Bool = false) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 2) {
             Text(title.uppercased())
                 .font(.system(size: 9, weight: .bold)).foregroundStyle(theme.textSecondary)
             Text(value)
-                .font(.system(size: 17, weight: .semibold).monospacedDigit())
+                .font(.system(size: 15, weight: .semibold).monospacedDigit())
                 .foregroundStyle(accent ? theme.accent : theme.textPrimary)
             Text(subtitle)
-                .font(.system(size: 10)).foregroundStyle(theme.textSecondary.opacity(0.8))
+                .font(.system(size: 9)).foregroundStyle(theme.textSecondary.opacity(0.8))
         }
-        .frame(width: 190, alignment: .leading)
-        .padding(12)
-        .background(RoundedRectangle(cornerRadius: 10).fill(theme.windowBackground))
-        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(theme.separator))
+        .frame(width: 170, alignment: .leading)
+        .padding(.horizontal, 10).padding(.vertical, 7)
+        .background(RoundedRectangle(cornerRadius: 8).fill(theme.windowBackground))
+        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(theme.separator))
     }
 
     // MARK: List
 
+    /// One table-like panel: a header row carrying the select-all checkbox
+    /// (same container and paddings as the rows, so the checkbox column lines
+    /// up exactly), category bands inside it, hairlines between rows. Full
+    /// width, aligned with the summary strip.
     private var list: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
+            VStack(spacing: 0) {
+                selectAllHeader
                 ForEach(controller.categories, id: \.self) { category in
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text(category)
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundStyle(theme.textSecondary)
-                            .textCase(.uppercase)
-                        VStack(spacing: 1) {
-                            ForEach(controller.rows(in: category)) { row in
-                                CleanupRowView(row: row, theme: theme,
-                                               disabled: controller.state == .cleaning) {
-                                    controller.toggle(row.id)
-                                }
-                            }
+                    Divider().overlay(theme.separator)
+                    Text(category)
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(theme.textSecondary)
+                        .textCase(.uppercase)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 10).padding(.vertical, 4)
+                        .background(theme.windowBackground.opacity(0.6))
+                    let rows = controller.rows(in: category)
+                    ForEach(Array(rows.enumerated()), id: \.element.id) { idx, row in
+                        if idx > 0 {
+                            Divider().overlay(theme.separator.opacity(0.5)).padding(.leading, 36)
                         }
-                        .background(RoundedRectangle(cornerRadius: 10).fill(theme.panelBackground))
-                        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(theme.separator))
+                        CleanupRowView(row: row, theme: theme,
+                                       disabled: controller.state == .cleaning) {
+                            controller.toggle(row.id)
+                        }
                     }
                 }
             }
+            .background(theme.panelBackground)
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(theme.separator))
             .padding(14)
-            .frame(maxWidth: 900, alignment: .leading)
-            .frame(maxWidth: .infinity)
+        }
+    }
+
+    /// Header row of the table: the tri-state select-all checkbox, in the same
+    /// column as the row checkboxes below it.
+    private var selectAllHeader: some View {
+        HStack(spacing: 8) {
+            CheckSquare(state: selectAllCheckState, theme: theme,
+                        disabled: controller.state == .cleaning) {
+                controller.toggleAll()
+            }
+            .accessibilityLabel("Select all")
+            Text("Select all")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(theme.textPrimary)
+            Spacer()
+            Text(Format.bytes(controller.totalSelected))
+                .font(.system(size: 11, weight: .medium).monospacedDigit())
+                .foregroundStyle(controller.totalSelected > 0 ? theme.textPrimary : theme.textSecondary.opacity(0.6))
+                .frame(width: 80, alignment: .trailing)
+        }
+        .padding(.horizontal, 10).padding(.vertical, 6)
+        .contentShape(Rectangle())
+        .onTapGesture { if controller.state != .cleaning { controller.toggleAll() } }
+    }
+
+    private var selectAllCheckState: CheckSquare.CheckState {
+        switch controller.selectAllState {
+        case .none: return .off
+        case .some: return .mixed
+        case .all: return .on
         }
     }
 
@@ -179,6 +218,37 @@ struct CleanupResultView: View {
     }
 }
 
+/// Checkbox drawn from SF Symbols so the select-all checkbox can show a mixed
+/// state (SwiftUI's native `.checkbox` toggle is two-state only) and every
+/// checkbox in the list shares one look.
+private struct CheckSquare: View {
+    enum CheckState { case off, on, mixed }
+    let state: CheckState
+    let theme: Theme
+    let disabled: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(state == .off ? theme.textSecondary : theme.accent)
+                .opacity(disabled ? 0.4 : 1)
+        }
+        .buttonStyle(.plain)
+        .disabled(disabled)
+        .accessibilityValue(state == .on ? "checked" : state == .mixed ? "partially checked" : "unchecked")
+    }
+
+    private var symbol: String {
+        switch state {
+        case .off: return "square"
+        case .on: return "checkmark.square.fill"
+        case .mixed: return "minus.square.fill"
+        }
+    }
+}
+
 private struct CleanupRowView: View {
     let row: CleanupController.Row
     let theme: Theme
@@ -186,28 +256,28 @@ private struct CleanupRowView: View {
     let toggle: () -> Void
 
     var body: some View {
-        HStack(spacing: 10) {
-            Toggle("", isOn: Binding(get: { row.selected }, set: { _ in toggle() }))
-                .toggleStyle(.checkbox)
-                .labelsHidden()
-                .disabled(disabled || !row.size.isSelectable)
+        HStack(spacing: 8) {
+            CheckSquare(state: row.selected ? .on : .off, theme: theme,
+                        disabled: disabled || !row.size.isSelectable, action: toggle)
 
             Image(systemName: row.item.icon)
-                .font(.system(size: 14))
+                .font(.system(size: 12))
                 .foregroundStyle(theme.accent)
-                .frame(width: 22)
+                .frame(width: 18)
 
-            VStack(alignment: .leading, spacing: 1) {
-                Text(row.item.name)
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(theme.textPrimary)
-                Text(row.item.note)
-                    .font(.system(size: 10))
-                    .foregroundStyle(theme.textSecondary)
-                    .lineLimit(1)
-            }
+            Text(row.item.name)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(theme.textPrimary)
+                .lineLimit(1)
+                .layoutPriority(2)
 
-            Spacer()
+            Text(row.item.note)
+                .font(.system(size: 10))
+                .foregroundStyle(theme.textSecondary)
+                .lineLimit(1)
+                .layoutPriority(1)
+
+            Spacer(minLength: 8)
 
             Text(row.item.paths.map(abbreviate).joined(separator: " · "))
                 .font(.system(size: 10))
@@ -216,9 +286,11 @@ private struct CleanupRowView: View {
                 .frame(maxWidth: 260, alignment: .trailing)
 
             sizeLabel
-                .frame(width: 90, alignment: .trailing)
+                .frame(width: 80, alignment: .trailing)
         }
-        .padding(.horizontal, 12).padding(.vertical, 8)
+        .padding(.horizontal, 10).padding(.vertical, 5)
+        .contentShape(Rectangle())
+        .onTapGesture { if !disabled && row.size.isSelectable { toggle() } }
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(row.item.name), \(sizeAccessibility)")
     }
@@ -254,14 +326,5 @@ private struct CleanupRowView: View {
     private func abbreviate(_ path: String) -> String {
         let home = NSHomeDirectory()
         return path.hasPrefix(home) ? "~" + path.dropFirst(home.count) : path
-    }
-}
-
-extension CleanupController.SizeState {
-    /// Only measured rows can be selected — a denied or still-sizing row has no
-    /// trustworthy size to confirm against.
-    var isSelectable: Bool {
-        if case .sized = self { return true }
-        return false
     }
 }

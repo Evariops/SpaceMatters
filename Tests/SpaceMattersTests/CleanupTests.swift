@@ -159,6 +159,36 @@ import Foundation
         #expect(c.totalFound >= 150_000) // nothing was cleaned
     }
 
+    /// Select-all checkbox cycle: none → all → none, and a partial selection
+    /// reads as `.some` and cycles up to `.all`.
+    @Test func toggleAllCyclesTriState() async throws {
+        let (root, cache) = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let cache2 = root.appendingPathComponent("cache2")
+        try FileManager.default.createDirectory(at: cache2, withIntermediateDirectories: true)
+        try Data(count: 4096).write(to: cache2.appendingPathComponent("c.bin"))
+
+        let second = Cleanable(id: "test-cache-2", name: "Second cache", category: "Test",
+                               icon: "shippingbox", note: "fixture", paths: [cache2.path])
+        let c = CleanupController(catalog: [Self.cleanable([cache.path]), second],
+                                  allowedRoot: root.path)
+        c.load()
+        await Self.waitForReady(c)
+
+        #expect(c.selectAllState == .none)
+        c.toggleAll()
+        #expect(c.selectAllState == .all)
+        #expect(c.selectedRows.count == 2)
+
+        c.toggle("test-cache-2")
+        #expect(c.selectAllState == .some)
+        c.toggleAll() // mixed → all
+        #expect(c.selectAllState == .all)
+        c.toggleAll() // all → none
+        #expect(c.selectAllState == .none)
+        #expect(c.selectedRows.isEmpty)
+    }
+
     /// Entries whose paths don't exist disappear; existing ones keep only their
     /// existing paths.
     @Test func detectFiltersMissingPaths() throws {
