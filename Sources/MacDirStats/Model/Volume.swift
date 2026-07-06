@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import DiskArbitration
 
 /// A mounted, browsable volume the user can pick from the splash screen.
 struct Volume: Identifiable, Hashable {
@@ -37,12 +38,15 @@ struct Volume: Identifiable, Hashable {
             options: [.skipHiddenVolumes]
         ) ?? []
 
+        let daSession = DASessionCreate(kCFAllocatorDefault)
+
         var result: [Volume] = []
         for url in urls {
             guard let v = try? url.resourceValues(forKeys: Set(keys)) else { continue }
             if v.volumeIsBrowsable == false { continue }
             let total = Int64(v.volumeTotalCapacity ?? 0)
             if total <= 0 { continue }
+            if let daSession, isDiskImage(url, session: daSession) { continue }
             let name = v.volumeLocalizedName ?? v.volumeName ?? url.lastPathComponent
             result.append(Volume(
                 url: url,
@@ -61,5 +65,15 @@ struct Volume: Identifiable, Hashable {
             return a.total > b.total
         }
         return result
+    }
+
+    /// True when the volume is backed by a mounted disk image (.dmg).
+    /// There is no URLResourceKey for this; DiskArbitration reports such
+    /// devices with the model "Disk Image".
+    private static func isDiskImage(_ url: URL, session: DASession) -> Bool {
+        guard let disk = DADiskCreateFromVolumePath(kCFAllocatorDefault, session, url as CFURL),
+              let desc = DADiskCopyDescription(disk) as? [CFString: Any]
+        else { return false }
+        return desc[kDADiskDescriptionDeviceModelKey] as? String == "Disk Image"
     }
 }
