@@ -1,7 +1,7 @@
 # Managed with prek (https://github.com/j178/prek) — install: `prek install`
 repos:
   - repo: https://github.com/betterleaks/betterleaks
-    rev: v1.4.1
+    rev: v1.6.1
     hooks:
       - id: betterleaks
   - repo: https://github.com/zizmorcore/zizmor-pre-commit
