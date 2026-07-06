@@ -9,23 +9,23 @@
 # One-time external prerequisites:
 #   - An Apple "Developer ID Application" certificate in your login keychain.
 #   - A notarytool keychain profile:
-#       xcrun notarytool store-credentials macdirstats-notary \
+#       xcrun notarytool store-credentials spacematters-notary \
 #         --apple-id you@example.com --team-id TEAMID --password <app-specific-password>
 #   - GitHub CLI authenticated: gh auth login
 #
 # Environment:
 #   DEVELOPER_ID    "Developer ID Application: Your Name (TEAMID)"   (required)
-#   NOTARY_PROFILE  keychain profile name                            (default: macdirstats-notary)
+#   NOTARY_PROFILE  keychain profile name                            (default: spacematters-notary)
 set -euo pipefail
 cd "$(dirname "$0")"
 
 : "${DEVELOPER_ID:?Set DEVELOPER_ID to your 'Developer ID Application: …' identity}"
-NOTARY_PROFILE="${NOTARY_PROFILE:-macdirstats-notary}"
+NOTARY_PROFILE="${NOTARY_PROFILE:-spacematters-notary}"
 
-APP="MacDirStats.app"
+APP="SpaceMatters.app"
 VERSION="$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//')"
 [ -z "$VERSION" ] && { echo "error: tag the release first, e.g. git tag v1.0.0" >&2; exit 1; }
-DMG="MacDirStats-${VERSION}.dmg"
+DMG="SpaceMatters-${VERSION}.dmg"
 
 echo "▸ Building & bundling ${VERSION} with ${DEVELOPER_ID}"
 # Bundle (icon, plist, git version) signed with the Developer ID — the stable
@@ -47,7 +47,7 @@ spctl -a -vv -t open --context context:primary-signature "$DMG" || true
 
 echo "▸ Publishing GitHub Release v${VERSION}"
 gh release create "v${VERSION}" "$DMG" \
-  --title "MacDirStats ${VERSION}" \
-  --notes "Signed & notarized build. Download the .dmg, open it, and drag MacDirStats into Applications. macOS opens it without a Gatekeeper warning."
+  --title "SpaceMatters ${VERSION}" \
+  --notes "Signed & notarized build. Download the .dmg, open it, and drag SpaceMatters into Applications. macOS opens it without a Gatekeeper warning."
 
 echo "✓ Released v${VERSION} → ${DMG}"

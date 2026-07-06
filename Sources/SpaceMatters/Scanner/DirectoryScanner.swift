@@ -108,7 +108,7 @@ final class DirectoryScanner: ScanBackend {
 
         for i in 0..<workerCount {
             let thread = Thread { [weak self] in self?.workerLoop() }
-            thread.name = "macdirstats.scanner.\(i)"
+            thread.name = "spacematters.scanner.\(i)"
             thread.stackSize = 2 << 20
             threads.append(thread)
             thread.start()

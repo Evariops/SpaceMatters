@@ -5,7 +5,7 @@ DerivedData/
 *.xcodeproj
 
 # App bundle produced by bundle.sh
-MacDirStats.app/
+SpaceMatters.app/
 
 # Claude Code local settings (machine-specific)
 .claude/settings.local.json

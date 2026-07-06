@@ -1,6 +1,6 @@
 import Testing
 import Foundation
-@testable import MacDirStats
+@testable import SpaceMatters
 
 /// ViewModel-level tests for the navigation & deletion logic changed in Phase 0/2.
 /// They drive a real `ScanController` over a real scanned tree — no GUI required —

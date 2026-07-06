@@ -68,7 +68,7 @@ final class CommandScanner: ScanBackend {
             self?.readLoop(outPipe.fileHandleForReading, errHandle: errPipe.fileHandleForReading, process: process)
         }
         thread.stackSize = 4 << 20
-        thread.name = "macdirstats.vm-scanner"
+        thread.name = "spacematters.vm-scanner"
         self.thread = thread
 
         do {

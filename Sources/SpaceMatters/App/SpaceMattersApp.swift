@@ -29,11 +29,11 @@ enum Entry {
         if let idx = args.firstIndex(of: "--scan"), idx + 1 < args.count {
             exit(HeadlessScan.run(paths: Array(args[(idx + 1)...])))
         }
-        MacDirStatsApp.main()
+        SpaceMattersApp.main()
     }
 }
 
-struct MacDirStatsApp: App {
+struct SpaceMattersApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var app = AppModel()
 

@@ -1,8 +1,8 @@
 import Foundation
 
 /// Headless scan used for benchmarking / correctness checks:
-///   MacDirStats --scan /path [/more/paths ...]
-///   MacDirStats --volumes
+///   SpaceMatters --scan /path [/more/paths ...]
+///   SpaceMatters --volumes
 /// Prints totals and timing, then exits. Lets the engine be validated without
 /// bringing up the GUI.
 enum HeadlessScan {
@@ -11,7 +11,7 @@ enum HeadlessScan {
     @discardableResult
     static func run(paths: [String]) -> Int32 {
         guard !paths.isEmpty else {
-            print("usage: MacDirStats --scan <path> [more paths ...]")
+            print("usage: SpaceMatters --scan <path> [more paths ...]")
             return 2
         }
         let fm = FileManager.default

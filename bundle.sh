@@ -1,11 +1,11 @@
 #!/bin/bash
-# Build MacDirStats and assemble a double-clickable MacDirStats.app bundle.
+# Build SpaceMatters and assemble a double-clickable SpaceMatters.app bundle.
 set -euo pipefail
 cd "$(dirname "$0")"
 
 CONFIG="${1:-release}"
-APP="MacDirStats.app"
-BIN_NAME="MacDirStats"
+APP="SpaceMatters.app"
+BIN_NAME="SpaceMatters"
 
 echo "Building (${CONFIG})..."
 swift build -c "$CONFIG"
@@ -36,10 +36,10 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleName</key>            <string>MacDirStats</string>
-    <key>CFBundleDisplayName</key>     <string>MacDirStats</string>
-    <key>CFBundleIdentifier</key>      <string>com.macdirstats.app</string>
-    <key>CFBundleExecutable</key>      <string>MacDirStats</string>
+    <key>CFBundleName</key>            <string>SpaceMatters</string>
+    <key>CFBundleDisplayName</key>     <string>SpaceMatters</string>
+    <key>CFBundleIdentifier</key>      <string>com.spacematters.app</string>
+    <key>CFBundleExecutable</key>      <string>SpaceMatters</string>
     <key>CFBundlePackageType</key>     <string>APPL</string>
     <key>CFBundleShortVersionString</key> <string>${VERSION}</string>
     <key>CFBundleVersion</key>         <string>${BUILD}</string>
@@ -49,11 +49,11 @@ ${ICON_KEY}
     <key>NSPrincipalClass</key>        <string>NSApplication</string>
     <key>LSApplicationCategoryType</key> <string>public.app-category.utilities</string>
     <!-- TCC usage descriptions (J1.4): shown when macOS prompts for access. -->
-    <key>NSDesktopFolderUsageDescription</key>     <string>MacDirStats measures the size of your Desktop to show what's using disk space.</string>
-    <key>NSDocumentsFolderUsageDescription</key>   <string>MacDirStats measures the size of your Documents to show what's using disk space.</string>
-    <key>NSDownloadsFolderUsageDescription</key>   <string>MacDirStats measures the size of your Downloads to show what's using disk space.</string>
-    <key>NSRemovableVolumesUsageDescription</key>  <string>MacDirStats scans external drives you choose to analyze their disk usage.</string>
-    <key>NSNetworkVolumesUsageDescription</key>    <string>MacDirStats scans network volumes you choose to analyze their disk usage.</string>
+    <key>NSDesktopFolderUsageDescription</key>     <string>SpaceMatters measures the size of your Desktop to show what's using disk space.</string>
+    <key>NSDocumentsFolderUsageDescription</key>   <string>SpaceMatters measures the size of your Documents to show what's using disk space.</string>
+    <key>NSDownloadsFolderUsageDescription</key>   <string>SpaceMatters measures the size of your Downloads to show what's using disk space.</string>
+    <key>NSRemovableVolumesUsageDescription</key>  <string>SpaceMatters scans external drives you choose to analyze their disk usage.</string>
+    <key>NSNetworkVolumesUsageDescription</key>    <string>SpaceMatters scans network volumes you choose to analyze their disk usage.</string>
 </dict>
 </plist>
 PLIST
@@ -62,8 +62,8 @@ PLIST
 # rebuild, so macOS TCC grants like Full Disk Access don't persist across builds.
 # Set CODESIGN_ID to a stable self-signed identity to keep those grants:
 #   1) Keychain Access ▸ Certificate Assistant ▸ Create a Certificate…
-#      name "MacDirStats", type "Code Signing", self-signed.
-#   2) export CODESIGN_ID="MacDirStats"   (then re-run ./bundle.sh)
+#      name "SpaceMatters", type "Code Signing", self-signed.
+#   2) export CODESIGN_ID="SpaceMatters"   (then re-run ./bundle.sh)
 SIGN_ID="${CODESIGN_ID:--}"
 # Prefer a hardened runtime; fall back without it (needed for a debuggable
 # ad-hoc build). Only a *total* signing failure is fatal — don't mask it.

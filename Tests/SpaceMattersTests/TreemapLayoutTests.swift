@@ -1,6 +1,6 @@
 import Testing
 import Foundation
-@testable import MacDirStats
+@testable import SpaceMatters
 
 /// Property tests for the squarified treemap layout (F1): area is conserved,
 /// tiles stay inside the target rect, none overlap, and degenerate inputs are

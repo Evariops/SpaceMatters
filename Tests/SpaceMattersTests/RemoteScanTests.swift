@@ -1,6 +1,6 @@
 import Testing
 import Foundation
-@testable import MacDirStats
+@testable import SpaceMatters
 
 /// SPEC-06: the SSH backend is `CommandScanner` fed the right `find` command.
 /// These lock the command construction and the streamed-`find` parser it relies
