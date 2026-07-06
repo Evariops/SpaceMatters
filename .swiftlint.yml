@@ -1,0 +1,39 @@
+# SwiftLint — run in strict mode in CI (warnings fail the build).
+# Deliberately idiom/correctness-focused: line wrapping, brace placement and
+# other layout choices are hand-crafted in this codebase and NOT enforced by a
+# formatter. Every disabled rule below states why.
+
+included:
+  - Sources
+  - Tests
+  - Package.swift
+
+disabled_rules:
+  # Geometry-heavy treemap code legitimately uses x/y/w/h and other short names.
+  - identifier_name
+  # Layout is hand-crafted (aligned format strings, deliberate wrapping);
+  # these rules would rewrite it.
+  - line_length
+  - trailing_comma
+  - opening_brace
+  - statement_position
+  - implicit_optional_initialization
+  # Size metrics: SwiftUI view bodies and the hand-rolled scanner exceed the
+  # defaults by design; complexity work is tracked in AUDIT.md / PLAN-*.md.
+  - function_body_length
+  - file_length
+  - type_body_length
+  - cyclomatic_complexity
+  - nesting
+  - large_tuple
+  - function_parameter_count
+  # TODOs are intentional markers, tracked in the PLAN documents.
+  - todo
+  # `let _ = x` is required inside @ViewBuilder bodies to register @Observable
+  # reads (`_ = x` alone is an expression the builder rejects); the "redundant"
+  # let is load-bearing there.
+  - redundant_discardable_let
+  # String(data:encoding:) is used deliberately: nil on invalid bytes is the
+  # desired behavior when parsing external tool output (vs lossy decoding).
+  - optional_data_string_conversion
+  - non_optional_string_data_conversion

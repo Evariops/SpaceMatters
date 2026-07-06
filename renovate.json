@@ -1,0 +1,18 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:best-practices", ":semanticCommits", ":timezone(Europe/Paris)"],
+  "schedule": ["before 7am on monday"],
+  "minimumReleaseAge": "2 days",
+  "labels": ["dependencies"],
+  "vulnerabilityAlerts": { "enabled": true, "schedule": ["at any time"], "labels": ["security"] },
+  "pre-commit": { "enabled": true },
+  "packageRules": [
+    {
+      "matchManagers": ["github-actions"],
+      "groupName": "github-actions",
+      "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
+      "automerge": true
+    },
+    { "matchDatasources": ["docker"], "groupName": "docker base images" }
+  ]
+}

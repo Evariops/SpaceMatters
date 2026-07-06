@@ -5,14 +5,86 @@ on:
     branches: [main]
   pull_request:
 
+# Least privilege by default; no job in this workflow needs write access.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  test:
-    runs-on: macos-15
+  hooks:
+    name: Hooks (betterleaks + zizmor)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
-      - name: Show Swift version
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      # CI mirror of the local prek hooks — local hooks are bypassable.
+      - name: prek run --all-files
+        run: pipx run prek run --all-files
+
+  zizmor:
+    name: Workflow security (zizmor)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      # Version matches the zizmor-pre-commit rev in .pre-commit-config.yaml.
+      - name: zizmor (pedantic)
+        run: pipx run zizmor==1.25.2 --persona=pedantic --no-online-audits .github/workflows/
+
+  lint:
+    name: Lint (SwiftLint, strict)
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Install SwiftLint 0.65.0 (SHA256-verified)
+        run: |
+          curl -fsSLo swiftlint.zip https://github.com/realm/SwiftLint/releases/download/0.65.0/portable_swiftlint.zip
+          echo "d6cb0aa7a2f5f1ef306fc9e37bcb54dc9a26facc8f7784ac0c3dd3eccf5c6ba6  swiftlint.zip" | shasum -a 256 --check
+          unzip -oq swiftlint.zip -d "$RUNNER_TEMP/swiftlint"
+
+      - name: SwiftLint (strict)
+        run: |
+          "$RUNNER_TEMP/swiftlint/swiftlint" lint --strict
+
+  test:
+    name: Build & Test
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Select latest Xcode
+        run: sudo xcode-select -s "$(ls -d /Applications/Xcode_*.app | sort -V | tail -n 1)/Contents/Developer"
+
+      - name: Swift version
         run: swift --version
+
       - name: Build
         run: swift build
-      - name: Test
-        run: swift test
+
+      - name: Test (with coverage)
+        run: swift test --enable-code-coverage
+
+      - name: Coverage summary
+        run: |
+          BIN=$(swift build --show-bin-path)
+          XCTEST=$(find "$BIN" -maxdepth 1 -name '*.xctest')
+          xcrun llvm-cov report \
+            "$XCTEST/Contents/MacOS/$(basename "$XCTEST" .xctest)" \
+            -instr-profile "$BIN/codecov/default.profdata" \
+            -ignore-filename-regex 'Tests/'
