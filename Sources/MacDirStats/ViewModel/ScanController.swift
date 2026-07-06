@@ -253,7 +253,9 @@ final class ScanController {
         )
     }
 
-    private func startBackend(
+    /// Shared entry for every scan flavor (host, VM, SSH). Internal — not
+    /// private — so controller-level tests can drive it with a stub backend.
+    func startBackend(
         root: FSNode,
         scanner: any ScanBackend,
         displayPath: String,
@@ -650,9 +652,16 @@ final class ScanController {
     /// Trash or delete a directory. The disk I/O runs off the main thread (a big
     /// `node_modules` no longer beach-balls the UI); the tree/aggregate updates
     /// are applied back on the main actor once it succeeds.
+    ///
+    /// Refuses on non-host scans — the node's path is a *remote* path, and
+    /// FileManager would hit whatever sits at that same path on the local disk —
+    /// and mid-scan (J4.4: the scanner's thread pool is still mutating these
+    /// nodes; totals would corrupt). The UI disables these cases, but the model
+    /// must not rely on every entry point remembering to.
     @discardableResult
     func remove(directory node: FSNode, permanently: Bool) async -> Bool {
-        guard node.parent != nil, let path = path(for: node) else { return false }
+        guard isHostScan, phase != .scanning,
+              node.parent != nil, let path = path(for: node) else { return false }
         let rowID = RowID.dir(ObjectIdentifier(node))
         deletingRows.insert(rowID)
         defer { deletingRows.remove(rowID) }
@@ -728,9 +737,11 @@ final class ScanController {
         return false
     }
 
+    /// Same safety guards as `remove(directory:)`.
     @discardableResult
     func remove(file: FileItem, parent: FSNode, permanently: Bool) async -> Bool {
-        guard let path = path(forFile: file, parent: parent) else { return false }
+        guard isHostScan, phase != .scanning,
+              let path = path(forFile: file, parent: parent) else { return false }
         let rowID = RowID.file(ObjectIdentifier(parent), file.name)
         deletingRows.insert(rowID)
         defer { deletingRows.remove(rowID) }
