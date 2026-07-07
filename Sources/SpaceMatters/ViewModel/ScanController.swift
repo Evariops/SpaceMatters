@@ -450,9 +450,11 @@ final class ScanController {
     /// reused on resize — only the rect placement reruns per frame. Same output as
     /// a fresh `TreemapLayout.compute`; the cache tracks the tree via (metric,
     /// version), like `sortCache`/`fileCache`.
-    func treemapLayout(root: FSNode, rect: CGRect, rootFiles: [FileTileInfo]?) -> TreemapLayout.Result {
+    func treemapLayout(root: FSNode, rect: CGRect, rootFiles: [FileTileInfo]?,
+                       needsRegions: Bool = true) -> TreemapLayout.Result {
         layoutCache.invalidate(metric: metric, version: version)
-        return TreemapLayout.compute(root: root, rect: rect, metric: metric, rootFiles: rootFiles, cache: layoutCache)
+        return TreemapLayout.compute(root: root, rect: rect, metric: metric, rootFiles: rootFiles,
+                                     cache: layoutCache, needsRegions: needsRegions)
     }
 
     func sortedChildren(_ node: FSNode) -> [FSNode] {

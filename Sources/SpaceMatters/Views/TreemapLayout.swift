@@ -70,20 +70,26 @@ enum TreemapLayout {
     /// resize — same tree, changing rect — the sort and item-building are skipped
     /// and only the rect placement is redone. Pass `nil` for a one-shot layout
     /// (e.g. tests); a persistent cache must be invalidated via `Cache.invalidate`.
+    /// `needsRegions` builds the per-node bounding-rect map used to outline a
+    /// selection. It's only consulted when something is selected, so skip it
+    /// otherwise — that's N `ObjectIdentifier`-keyed dict inserts saved on every
+    /// resize frame, for nothing on screen.
     static func compute(
         root: FSNode,
         rect: CGRect,
         metric: SizeMetric,
         rootFiles: [FileTileInfo]? = nil,
         cache: Cache? = nil,
+        needsRegions: Bool = true,
         minSide: CGFloat = 5,
         maxDepth: Int = 14
     ) -> Result {
         var result = Result()
         result.tiles.reserveCapacity(2048)
-        result.regions.reserveCapacity(2048)
+        if needsRegions { result.regions.reserveCapacity(2048) }
         layout(node: root, rect: rect, depth: 0, metric: metric, files: rootFiles,
-               minSide: minSide, maxDepth: maxDepth, cache: cache ?? Cache(), into: &result)
+               minSide: minSide, maxDepth: maxDepth, cache: cache ?? Cache(),
+               needsRegions: needsRegions, into: &result)
         return result
     }
 
@@ -103,9 +109,10 @@ enum TreemapLayout {
         minSide: CGFloat,
         maxDepth: Int,
         cache: Cache,
+        needsRegions: Bool,
         into result: inout Result
     ) {
-        result.regions[ObjectIdentifier(node)] = rect
+        if needsRegions { result.regions[ObjectIdentifier(node)] = rect }
 
         // Too small or too deep → draw as a solid leaf tile.
         if rect.width < minSide * 2 || rect.height < minSide * 2 || depth >= maxDepth {
@@ -138,12 +145,12 @@ enum TreemapLayout {
             } else if item.isFileBlock || !item.node.isDirectory {
                 result.tiles.append(TreemapTile(rect: r, node: item.node, depth: depth + 1, isFileBlock: item.isFileBlock))
             } else if r.width < minSide * 2 || r.height < minSide * 2 {
-                result.regions[ObjectIdentifier(item.node)] = r
+                if needsRegions { result.regions[ObjectIdentifier(item.node)] = r }
                 result.tiles.append(TreemapTile(rect: r, node: item.node, depth: depth + 1, isFileBlock: false))
             } else {
                 // Sub-directories: no file refinement (files: nil) — B2.
                 layout(node: item.node, rect: r, depth: depth + 1, metric: metric, files: nil,
-                       minSide: minSide, maxDepth: maxDepth, cache: cache, into: &result)
+                       minSide: minSide, maxDepth: maxDepth, cache: cache, needsRegions: needsRegions, into: &result)
             }
         }
     }
