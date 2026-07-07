@@ -52,7 +52,14 @@ struct Theme {
     /// extension). `weight` (size relative to the biggest tile, 0…1) modulates
     /// brightness so heavy items glow and light ones sit back, while staying vivid.
     func treemapTypeColor(extName: String, weight: Double) -> Color {
-        let hue = Theme.paletteHues[Theme.stableIndex(extName, Theme.paletteHues.count)]
+        treemapTypeColor(hueIndex: Theme.stableIndex(extName, Theme.paletteHues.count), weight: weight)
+    }
+
+    /// Same as `treemapTypeColor(extName:weight:)` but keyed on the already-resolved
+    /// palette index — lets the treemap memoise colours by `(hueIndex, weight)`
+    /// without re-hashing an extension string on the resize hot path.
+    func treemapTypeColor(hueIndex: Int, weight: Double) -> Color {
+        let hue = Theme.paletteHues[hueIndex]
         let w = max(0, min(1, weight))
         let sat = isDark ? 0.74 : 0.80
         var bri = (isDark ? 0.60 : 0.56) + 0.30 * w

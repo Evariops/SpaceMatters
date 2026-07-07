@@ -40,25 +40,60 @@ enum TreemapLayout {
         var regions: [ObjectIdentifier: CGRect] = [:]
     }
 
+    /// Size-independent layout structure, memoised per node: each node's children
+    /// and file blocks as `Item`s, sorted by weight (descending), with a parallel
+    /// `weights` array. These depend only on the tree and metric — never on the
+    /// rect — so across a resize they're computed once and reused; only the rect
+    /// *placement* (`squarifySorted`) reruns per frame. The model half of the
+    /// layout, held by the controller alongside `sortCache`/`fileCache`.
+    final class Cache {
+        fileprivate var entries: [ObjectIdentifier: (items: [Item], weights: [Double])] = [:]
+        private var metric: SizeMetric?
+        private var version: UInt64 = .max
+
+        /// Drop the memo when the tree (version) or metric changed; keep it across
+        /// pure resizes. Mirrors `ScanController.sortCache`'s invalidation.
+        func invalidate(metric: SizeMetric, version: UInt64) {
+            if self.metric != metric || self.version != version {
+                entries.removeAll(keepingCapacity: true)
+                self.metric = metric
+                self.version = version
+            }
+        }
+    }
+
     /// `rootFiles` are the direct files of `root` (the zoom root) — when present,
     /// the root's own-files region is subdivided into individual file tiles
     /// (SPEC-05, B2). Sub-directories always stay aggregated until you zoom in.
+    ///
+    /// `cache` memoises the size-independent structure (see `Cache`). Across a
+    /// resize — same tree, changing rect — the sort and item-building are skipped
+    /// and only the rect placement is redone. Pass `nil` for a one-shot layout
+    /// (e.g. tests); a persistent cache must be invalidated via `Cache.invalidate`.
+    /// `needsRegions` builds the per-node bounding-rect map used to outline a
+    /// selection. It's only consulted when something is selected, so skip it
+    /// otherwise — that's N `ObjectIdentifier`-keyed dict inserts saved on every
+    /// resize frame, for nothing on screen.
     static func compute(
         root: FSNode,
         rect: CGRect,
         metric: SizeMetric,
         rootFiles: [FileTileInfo]? = nil,
+        cache: Cache? = nil,
+        needsRegions: Bool = true,
         minSide: CGFloat = 5,
         maxDepth: Int = 14
     ) -> Result {
         var result = Result()
         result.tiles.reserveCapacity(2048)
+        if needsRegions { result.regions.reserveCapacity(2048) }
         layout(node: root, rect: rect, depth: 0, metric: metric, files: rootFiles,
-               minSide: minSide, maxDepth: maxDepth, into: &result)
+               minSide: minSide, maxDepth: maxDepth, cache: cache ?? Cache(),
+               needsRegions: needsRegions, into: &result)
         return result
     }
 
-    private struct Item {
+    fileprivate struct Item {
         let weight: Double
         let node: FSNode
         let isFileBlock: Bool
@@ -73,9 +108,11 @@ enum TreemapLayout {
         files: [FileTileInfo]?,
         minSide: CGFloat,
         maxDepth: Int,
+        cache: Cache,
+        needsRegions: Bool,
         into result: inout Result
     ) {
-        result.regions[ObjectIdentifier(node)] = rect
+        if needsRegions { result.regions[ObjectIdentifier(node)] = rect }
 
         // Too small or too deep → draw as a solid leaf tile.
         if rect.width < minSide * 2 || rect.height < minSide * 2 || depth >= maxDepth {
@@ -83,6 +120,46 @@ enum TreemapLayout {
             return
         }
 
+        // Size-independent half: build (and cache) this node's sorted items once.
+        let entry: (items: [Item], weights: [Double])
+        if let cached = cache.entries[ObjectIdentifier(node)] {
+            entry = cached
+        } else {
+            entry = buildItems(node: node, depth: depth, metric: metric, files: files)
+            cache.entries[ObjectIdentifier(node)] = entry
+        }
+
+        if entry.items.isEmpty {
+            result.tiles.append(TreemapTile(rect: rect, node: node, depth: depth, isFileBlock: false))
+            return
+        }
+
+        // Size-dependent half: place the (already-sorted) items in this rect.
+        let rects = squarifySorted(entry.weights, into: rect)
+        for i in entry.items.indices {
+            let item = entry.items[i]
+            let r = rects[i]
+            if r.width <= 0 || r.height <= 0 { continue }
+            if item.file != nil {
+                result.tiles.append(TreemapTile(rect: r, node: item.node, depth: depth + 1, isFileBlock: false, file: item.file))
+            } else if item.isFileBlock || !item.node.isDirectory {
+                result.tiles.append(TreemapTile(rect: r, node: item.node, depth: depth + 1, isFileBlock: item.isFileBlock))
+            } else if r.width < minSide * 2 || r.height < minSide * 2 {
+                if needsRegions { result.regions[ObjectIdentifier(item.node)] = r }
+                result.tiles.append(TreemapTile(rect: r, node: item.node, depth: depth + 1, isFileBlock: false))
+            } else {
+                // Sub-directories: no file refinement (files: nil) — B2.
+                layout(node: item.node, rect: r, depth: depth + 1, metric: metric, files: nil,
+                       minSide: minSide, maxDepth: maxDepth, cache: cache, needsRegions: needsRegions, into: &result)
+            }
+        }
+    }
+
+    /// Build a node's size-independent items, sorted by weight (descending) so
+    /// `squarifySorted` can place them without re-sorting on every resize frame.
+    private static func buildItems(
+        node: FSNode, depth: Int, metric: SizeMetric, files: [FileTileInfo]?
+    ) -> (items: [Item], weights: [Double]) {
         var items: [Item] = []
         for child in node.children {
             let w = Double(child.size(metric))
@@ -104,30 +181,70 @@ enum TreemapLayout {
                 items.append(Item(weight: directFiles, node: node, isFileBlock: true, file: nil))
             }
         }
+        items.sort { $0.weight > $1.weight }
+        return (items, items.map(\.weight))
+    }
 
-        if items.isEmpty {
-            result.tiles.append(TreemapTile(rect: rect, node: node, depth: depth, isFileBlock: false))
-            return
-        }
+    /// Place already-sorted (descending) `weights` inside `rect`, returning one rect
+    /// per weight in the same order. The squarified packing is identical to
+    /// `squarify(_:into:)` — this variant just skips the internal sort because the
+    /// caller pre-sorted, which is the whole point on the resize hot path.
+    static func squarifySorted(_ weights: [Double], into rect: CGRect) -> [CGRect] {
+        var result = [CGRect](repeating: .zero, count: weights.count)
+        let total = weights.reduce(0, +)
+        guard total > 0 else { return result }
+        let scale = (Double(rect.width) * Double(rect.height)) / total
 
-        let weights = items.map(\.weight)
-        let rects = squarify(weights, into: rect)
-        for (i, item) in items.enumerated() {
-            let r = rects[i]
-            if r.width <= 0 || r.height <= 0 { continue }
-            if item.file != nil {
-                result.tiles.append(TreemapTile(rect: r, node: item.node, depth: depth + 1, isFileBlock: false, file: item.file))
-            } else if item.isFileBlock || !item.node.isDirectory {
-                result.tiles.append(TreemapTile(rect: r, node: item.node, depth: depth + 1, isFileBlock: item.isFileBlock))
-            } else if r.width < minSide * 2 || r.height < minSide * 2 {
-                result.regions[ObjectIdentifier(item.node)] = r
-                result.tiles.append(TreemapTile(rect: r, node: item.node, depth: depth + 1, isFileBlock: false))
-            } else {
-                // Sub-directories: no file refinement (files: nil) — B2.
-                layout(node: item.node, rect: r, depth: depth + 1, metric: metric, files: nil,
-                       minSide: minSide, maxDepth: maxDepth, into: &result)
+        var x = Double(rect.minX)
+        var y = Double(rect.minY)
+        var w = Double(rect.width)
+        var h = Double(rect.height)
+
+        var i = 0
+        let n = weights.count
+        while i < n {
+            let shorter = min(w, h)
+            var rowSum = weights[i] * scale
+            var rowMax = rowSum
+            var rowMin = rowSum
+            var k = i + 1
+            while k < n {
+                let v = weights[k] * scale
+                let withNext = worstRatio(rowSum: rowSum + v, maxV: max(rowMax, v), minV: min(rowMin, v), side: shorter)
+                let without = worstRatio(rowSum: rowSum, maxV: rowMax, minV: rowMin, side: shorter)
+                if withNext <= without {
+                    rowSum += v
+                    rowMax = max(rowMax, v)
+                    rowMin = min(rowMin, v)
+                    k += 1
+                } else {
+                    break
+                }
             }
+
+            let thickness = shorter == 0 ? 0 : rowSum / shorter
+            if w >= h {
+                var yy = y
+                for m in i..<k {
+                    let len = thickness == 0 ? 0 : (weights[m] * scale) / thickness
+                    result[m] = CGRect(x: x, y: yy, width: thickness, height: len)
+                    yy += len
+                }
+                x += thickness
+                w -= thickness
+            } else {
+                var xx = x
+                for m in i..<k {
+                    let len = thickness == 0 ? 0 : (weights[m] * scale) / thickness
+                    result[m] = CGRect(x: xx, y: y, width: len, height: thickness)
+                    xx += len
+                }
+                y += thickness
+                h -= thickness
+            }
+            i = k
         }
+        return result
     }
 
     /// Lay out `weights` (any positive scale) inside `rect`, returning one rect
