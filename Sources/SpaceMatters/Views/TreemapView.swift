@@ -199,17 +199,21 @@ final class TreemapNSView: NSView, CALayerDelegate {
         }
         super.init(frame: frameRect)
         wantsLayer = true
-        layerContentsRedrawPolicy = .duringViewResize
+        // Metal path: the CAMetalLayer is the view's *backing* layer (see makeBackingLayer),
+        // so AppKit resizes it in lockstep with the view — no sublayer-frame lag / black
+        // bands during a live drag. The overlay is a sublayer above it. AppKit must not try
+        // to CG-redraw the metal layer, so its content-redraw policy is `.never`.
+        layerContentsRedrawPolicy = renderer == nil ? .duringViewResize : .never
         layer?.masksToBounds = true
 
-        // Metal draws itself (no CALayerDelegate); the CG fallback layer uses `draw`.
         if metalLayer == nil {
+            // Fallback: a CG-rendered tile sublayer under the overlay.
             tileLayer.delegate = self
             tileLayer.needsDisplayOnBoundsChange = true
             tileLayer.contentsScale = 2
+            tileLayer.frame = bounds
+            layer?.addSublayer(tileLayer)
         }
-        tileLayer.frame = bounds
-        layer?.addSublayer(tileLayer)
 
         overlayLayer.delegate = self
         overlayLayer.needsDisplayOnBoundsChange = true
@@ -218,6 +222,12 @@ final class TreemapNSView: NSView, CALayerDelegate {
         layer?.addSublayer(overlayLayer)
 
         rebuildThemeColors()   // seed background/border (CG + Metal comps) from the default theme
+    }
+
+    /// Metal path: hand AppKit the `CAMetalLayer` as the backing layer, so it's resized in
+    /// lockstep with the view — the fix for resize lag / black bands. Fallback: default layer.
+    override func makeBackingLayer() -> CALayer {
+        metalLayer ?? super.makeBackingLayer()
     }
 
     @available(*, unavailable)
@@ -323,11 +333,13 @@ final class TreemapNSView: NSView, CALayerDelegate {
         let changed = newSize != frame.size
         super.setFrameSize(newSize)
         guard changed else { return }
-        tileLayer.frame = bounds
         overlayLayer.frame = bounds
         if let metalLayer {
+            // Backing-layer frame is managed by AppKit; we only resize the drawable + redraw.
             let scale = window?.backingScaleFactor ?? 2
             metalLayer.drawableSize = CGSize(width: bounds.width * scale, height: bounds.height * scale)
+        } else {
+            tileLayer.frame = bounds
         }
         relayout()
         presentTiles()
@@ -500,7 +512,7 @@ final class TreemapNSView: NSView, CALayerDelegate {
         // The layer context is native Core Graphics: bottom-left, y-up, text upright.
         // The tile rects are top-left, so each is flipped into this space at draw time
         // (`flip`). No context or text-matrix flips — so glyphs can never mirror.
-        if layer === tileLayer {
+        if layer === tileLayer, renderer == nil {
             drawTiles(in: ctx, height: layer.bounds.height)
         } else if layer === overlayLayer {
             drawOverlay(in: ctx, size: layer.bounds.size)
