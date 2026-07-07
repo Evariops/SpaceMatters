@@ -30,17 +30,20 @@ struct TileInstance {
 struct Camera {
     var viewProjection: simd_float4x4
 
-    /// Orthographic top-down over a `width`×`height` (points) ground plane, mapping the
-    /// layout's top-left pixel rects exactly onto the drawable: world X 0→W to NDC −1→+1,
-    /// world Z 0→H (top→bottom) to NDC +1→−1. Ortho of flat tiles preserves proportions,
-    /// so the result is iso-visual with the CoreGraphics map. z is a constant mid-depth
-    /// (flat tiles never overlap); the Y column stays 0 until boxes are extruded.
-    static func orthoTopDown(width: Float, height: Float) -> Camera {
-        let w = max(width, 1), h = max(height, 1)
-        let col0 = SIMD4<Float>(2 / w, 0, 0, 0)   // X → clip.x
-        let col1 = SIMD4<Float>(0, 0, 0, 0)       // Y (height) → nothing yet
-        let col2 = SIMD4<Float>(0, -2 / h, 0, 0)  // Z → clip.y (top-left flip)
-        let col3 = SIMD4<Float>(-1, 1, 0.5, 1)    // translation + constant depth
+    /// Orthographic top-down mapping the world rect `viewport` (points, top-left) exactly
+    /// onto the drawable: worldX vx→vx+vw to NDC −1→+1, worldZ vy→vy+vh (top→bottom) to
+    /// NDC +1→−1. The full-view camera passes the whole bounds; an animated zoom passes a
+    /// shrinking/growing sub-rect so the map pushes toward (or pulls back from) a folder.
+    /// Ortho of flat tiles preserves proportions, so the result is iso-visual with the
+    /// CoreGraphics map. z is a constant mid-depth; the Y column stays 0 until boxes extrude.
+    static func ortho(viewport v: CGRect) -> Camera {
+        let vw = max(Double(v.width), 1), vh = max(Double(v.height), 1)
+        let vx = Double(v.minX), vy = Double(v.minY)
+        let col0 = SIMD4<Float>(Float(2 / vw), 0, 0, 0)                 // X → clip.x
+        let col1 = SIMD4<Float>(0, 0, 0, 0)                            // Y (height) → nothing yet
+        let col2 = SIMD4<Float>(0, Float(-2 / vh), 0, 0)               // Z → clip.y (top-left flip)
+        let col3 = SIMD4<Float>(Float(-2 * vx / vw - 1),               // translation + constant depth
+                                Float(2 * vy / vh + 1), 0.5, 1)
         return Camera(viewProjection: simd_float4x4(col0, col1, col2, col3))
     }
 }
