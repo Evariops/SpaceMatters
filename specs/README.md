@@ -22,5 +22,6 @@ Principe directeur (repris du plan) : **intégrité > performance > robustesse >
 | [SPEC-06](SPEC-06-pluggable-backends.md) | Backends pluggables | S6 | ~1 j/backend | — |
 | [SPEC-07](SPEC-07-distribution.md) | Distribution **DMG signé/notarisé via GitHub** (v1) | J1.1–J1.5, D4 | 1–2 j | — |
 | [SPEC-08](SPEC-08-accessibility.md) | Accessibilité & i18n complètes | J10.1–J10.4, J9.5 | 1–2 j | SPEC-01 (partiel) |
+| [SPEC-09](SPEC-09-gpu-treemap-rendering.md) | Rendu GPU **3D-natif** du treemap (Metal, projection 2D ortho) | perf-resize (PR #17) | 2–3 j | PR #17 (couture NSView, faite) |
 
 **Ordre recommandé** : SPEC-02 (débloque SPEC-04 et ferme A6/A7 proprement) → SPEC-01 → SPEC-03 → SPEC-08 → SPEC-04 → SPEC-05/06/07 selon priorités produit.
