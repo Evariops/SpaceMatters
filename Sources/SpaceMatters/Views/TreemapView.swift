@@ -1,5 +1,7 @@
 import SwiftUI
 import AppKit
+import Metal
+import QuartzCore
 
 /// Treemap view. The map itself is drawn by a plain AppKit `NSView`
 /// (`TreemapNSView`) rather than a SwiftUI `Canvas`, so a window resize is driven
@@ -124,13 +126,18 @@ final class TreemapNSView: NSView, CALayerDelegate {
 
     // Layout state.
     private var tiles: [TreemapTile] = []
-    private var colors: [CGColor] = []
+    private var colors: [CGColor] = []            // CG fallback path
+    private var instances: [TileInstance] = []    // Metal path (culled to visible tiles)
     private var regions: [ObjectIdentifier: CGRect] = [:]
     private var regionsBuilt = false
     private var hovered: TreemapTile?
 
-    // Layers: tiles (cached) and overlay (hover/selection).
-    private let tileLayer = CALayer()
+    // Tile layer: a `CAMetalLayer` when a GPU is available (the fast path — SPEC-09),
+    // else a plain `CALayer` rasterised by CoreGraphics (defensive fallback). The
+    // selection/hover overlay stays a CG layer above it (Phase 1).
+    private let tileLayer: CALayer
+    private let metalLayer: CAMetalLayer?
+    private let renderer: TreemapMetalRenderer?
     private let overlayLayer = CALayer()
 
     // MARK: Caches (persist across relayouts)
@@ -139,6 +146,7 @@ final class TreemapNSView: NSView, CALayerDelegate {
     private let paletteCount = Theme.paletteHues.count
     private var hueIndexCache: [ObjectIdentifier: Int] = [:]
     private var colorLUT: [CGColor?] = []
+    private var colorLUTf: [SIMD4<Float>?] = []
     private var colorKey: ColorKey?
     private var sizeScratch: [Int64] = []
 
@@ -149,6 +157,9 @@ final class TreemapNSView: NSView, CALayerDelegate {
     private var backgroundCG = CGColor(gray: 0, alpha: 1)
     private var borderCG = CGColor(gray: 0, alpha: 0.45)
     private var accentShadowCG = CGColor(gray: 0.3, alpha: 0.9)
+    // Theme-derived sRGB components for the Metal clear + border uniform.
+    private var backgroundComps = SIMD4<Float>(0, 0, 0, 1)
+    private var borderComps = SIMD4<Float>(0, 0, 0, 0.45)
     private static let dimCG = CGColor(gray: 0, alpha: 0.72)
     private static let spotlightDimCG = CGColor(gray: 0, alpha: 0.5)
     private static let blackBorderCG = CGColor(gray: 0, alpha: 0.85)
@@ -170,17 +181,53 @@ final class TreemapNSView: NSView, CALayerDelegate {
     // MARK: Setup
 
     override init(frame frameRect: NSRect) {
+        if let renderer = TreemapMetalRenderer() {
+            let ml = CAMetalLayer()
+            ml.device = renderer.device
+            ml.pixelFormat = .bgra8Unorm            // non-sRGB: store sRGB values as-is → matches CG
+            ml.framebufferOnly = true
+            ml.isOpaque = true
+            ml.presentsWithTransaction = true       // atomic present with bounds during live-resize
+            ml.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
+            self.renderer = renderer
+            self.metalLayer = ml
+            self.tileLayer = ml
+        } else {
+            self.renderer = nil
+            self.metalLayer = nil
+            self.tileLayer = CALayer()
+        }
         super.init(frame: frameRect)
         wantsLayer = true
-        layerContentsRedrawPolicy = .duringViewResize
+        // Metal path: the CAMetalLayer is the view's *backing* layer (see makeBackingLayer),
+        // so AppKit resizes it in lockstep with the view — no sublayer-frame lag / black
+        // bands during a live drag. The overlay is a sublayer above it. AppKit must not try
+        // to CG-redraw the metal layer, so its content-redraw policy is `.never`.
+        layerContentsRedrawPolicy = renderer == nil ? .duringViewResize : .never
         layer?.masksToBounds = true
-        for sub in [tileLayer, overlayLayer] {
-            sub.delegate = self
-            sub.needsDisplayOnBoundsChange = true
-            sub.contentsScale = 2
-            sub.frame = bounds
-            layer?.addSublayer(sub)
+
+        if metalLayer == nil {
+            // Fallback: a CG-rendered tile sublayer under the overlay.
+            tileLayer.delegate = self
+            tileLayer.needsDisplayOnBoundsChange = true
+            tileLayer.contentsScale = 2
+            tileLayer.frame = bounds
+            layer?.addSublayer(tileLayer)
         }
+
+        overlayLayer.delegate = self
+        overlayLayer.needsDisplayOnBoundsChange = true
+        overlayLayer.contentsScale = 2
+        overlayLayer.frame = bounds
+        layer?.addSublayer(overlayLayer)
+
+        rebuildThemeColors()   // seed background/border (CG + Metal comps) from the default theme
+    }
+
+    /// Metal path: hand AppKit the `CAMetalLayer` as the backing layer, so it's resized in
+    /// lockstep with the view — the fix for resize lag / black bands. Fallback: default layer.
+    override func makeBackingLayer() -> CALayer {
+        metalLayer ?? super.makeBackingLayer()
     }
 
     @available(*, unavailable)
@@ -195,24 +242,31 @@ final class TreemapNSView: NSView, CALayerDelegate {
     }
 
     private func setScale(_ scale: CGFloat) {
-        tileLayer.contentsScale = scale
+        if let metalLayer {
+            metalLayer.contentsScale = scale
+            metalLayer.drawableSize = CGSize(width: bounds.width * scale, height: bounds.height * scale)
+            presentTiles()
+        } else {
+            tileLayer.contentsScale = scale
+            tileLayer.setNeedsDisplay()
+        }
         overlayLayer.contentsScale = scale
-        tileLayer.setNeedsDisplay()
         overlayLayer.setNeedsDisplay()
     }
 
-    // The map is CPU-rasterised into the layer, and filling the big solid tiles at 2×
-    // retina is the resize bottleneck (memory bandwidth). During a live drag, fill ¼
-    // the pixels (1× backing) — slightly soft while dragging, re-rendered crisp the
-    // instant the drag ends. Motion hides the softness; the still frame stays sharp.
+    // Fallback (no-GPU) path only: CPU rasterisation of the big solid tiles at 2× retina
+    // is the resize bottleneck, so during a live drag we fill ¼ the pixels (1× backing)
+    // and re-render crisp when it ends. Metal renders full-res cheaply — it skips this.
     override func viewWillStartLiveResize() {
         super.viewWillStartLiveResize()
+        guard renderer == nil else { return }
         tileLayer.contentsScale = 1
         overlayLayer.contentsScale = 1
     }
 
     override func viewDidEndLiveResize() {
         super.viewDidEndLiveResize()
+        guard renderer == nil else { return }
         setScale(window?.backingScaleFactor ?? 2)
     }
 
@@ -244,14 +298,15 @@ final class TreemapNSView: NSView, CALayerDelegate {
 
         if structural {
             relayout()
-            tileLayer.setNeedsDisplay()
+            presentTiles()
             overlayLayer.setNeedsDisplay()
         } else {
             if selectionChanged && selection != nil && !regionsBuilt {
                 relayout()               // need the region map to outline the new selection
-                tileLayer.setNeedsDisplay()
+                presentTiles()
             } else if highlightChanged {
-                tileLayer.setNeedsDisplay()   // dimming changed; rects unchanged
+                computeColors()          // dimming changed; rects unchanged → repack (Metal folds dim in)
+                presentTiles()
             }
             if selectionChanged { overlayLayer.setNeedsDisplay() }
         }
@@ -262,6 +317,14 @@ final class TreemapNSView: NSView, CALayerDelegate {
         borderCG = NSColor(theme.treemapBorder).cgColor
         accentShadowCG = NSColor(theme.accent).withAlphaComponent(0.9).cgColor
         layer?.backgroundColor = backgroundCG
+        backgroundComps = srgbComps(theme.treemapBackground)
+        borderComps = srgbComps(theme.treemapBorder)
+    }
+
+    private func srgbComps(_ color: Color) -> SIMD4<Float> {
+        let ns = NSColor(color).usingColorSpace(.sRGB) ?? NSColor(color)
+        return SIMD4<Float>(Float(ns.redComponent), Float(ns.greenComponent),
+                            Float(ns.blueComponent), Float(ns.alphaComponent))
     }
 
     // MARK: Resize (AppKit-driven — the hot path)
@@ -270,10 +333,19 @@ final class TreemapNSView: NSView, CALayerDelegate {
         let changed = newSize != frame.size
         super.setFrameSize(newSize)
         guard changed else { return }
-        tileLayer.frame = bounds
         overlayLayer.frame = bounds
+        if let metalLayer {
+            // Backing-layer frame is managed by AppKit; we only resize the drawable + redraw.
+            let scale = window?.backingScaleFactor ?? 2
+            metalLayer.drawableSize = CGSize(width: bounds.width * scale, height: bounds.height * scale)
+        } else {
+            tileLayer.frame = bounds
+        }
+        // The squarified layout is now monotone under resize (TreemapLayout freezes the
+        // discrete row/orientation/recurse decisions and reruns only continuous geometry),
+        // so a full relayout every frame flows smoothly — no freeze/settle needed.
         relayout()
-        tileLayer.setNeedsDisplay()
+        presentTiles()
         overlayLayer.setNeedsDisplay()
     }
 
@@ -282,7 +354,8 @@ final class TreemapNSView: NSView, CALayerDelegate {
     private func relayout() {
         hovered = nil
         guard let controller, let zoomRoot, bounds.width > 1, bounds.height > 1 else {
-            tiles = []; colors.removeAll(keepingCapacity: true); regions = [:]; regionsBuilt = false
+            tiles = []; colors.removeAll(keepingCapacity: true); instances.removeAll(keepingCapacity: true)
+            regions = [:]; regionsBuilt = false
             return
         }
         let rect = bounds.insetBy(dx: 1, dy: 1)
@@ -305,6 +378,7 @@ final class TreemapNSView: NSView, CALayerDelegate {
         if colorKey != key {
             hueIndexCache.removeAll(keepingCapacity: true)
             colorLUT = Array(repeating: nil, count: paletteCount * Self.brightnessBuckets)
+            colorLUTf = Array(repeating: nil, count: paletteCount * Self.brightnessBuckets)
             colorKey = key
         }
         if sizeScratch.count < n { sizeScratch = [Int64](repeating: 0, count: n) }
@@ -315,11 +389,43 @@ final class TreemapNSView: NSView, CALayerDelegate {
             if s > maxSize { maxSize = s }
         }
         let denom = Double(maxSize)
-        colors.removeAll(keepingCapacity: true)
-        colors.reserveCapacity(n)
+        if renderer != nil {
+            packInstances(denom: denom)
+        } else {
+            colors.removeAll(keepingCapacity: true)
+            colors.reserveCapacity(n)
+            for i in 0..<n {
+                let weight = min(1.0, max(0.0, pow(Double(sizeScratch[i]) / denom, 0.40)))
+                colors.append(cgColor(for: tiles[i], weight: weight))
+            }
+        }
+    }
+
+    /// Pack `tiles` into GPU `instances` (Metal path): world rect on the ground plane
+    /// (top-left, height 0), packed sRGB colour, dim folded in. Sub-pixel tiles are
+    /// culled here — `instances` may be shorter than `tiles`; hit-testing uses `tiles`.
+    private func packInstances(denom: Double) {
+        let n = tiles.count
+        instances.removeAll(keepingCapacity: true)
+        instances.reserveCapacity(n)
+        let highlightName = selectedExt?.displayName
+        let hasSearch = highlightName == nil && !searchMatchIDs.isEmpty
         for i in 0..<n {
+            let tile = tiles[i]
+            let r = tile.rect
+            if r.width <= 0.5 || r.height <= 0.5 { continue }
             let weight = min(1.0, max(0.0, pow(Double(sizeScratch[i]) / denom, 0.40)))
-            colors.append(cgColor(for: tiles[i], weight: weight))
+            var dim: Float = 0
+            if let highlightName {
+                let tileExt = tile.file?.extName ?? tile.node.dominantExt.displayName
+                if tileExt != highlightName { dim = 1 }
+            } else if hasSearch, !isUnderMatch(tile.node) {
+                dim = 1
+            }
+            instances.append(TileInstance(
+                origin: SIMD4<Float>(Float(r.minX), 0, Float(r.minY), 0),
+                size: SIMD4<Float>(Float(r.width), 0, Float(r.height), dim),
+                color: floatColor(for: tile, weight: weight)))
         }
     }
 
@@ -343,6 +449,43 @@ final class TreemapNSView: NSView, CALayerDelegate {
             hueIndex: hueIdx, weight: (Double(bucket) + 0.5) / Double(Self.brightnessBuckets))).cgColor
         colorLUT[lutKey] = color
         return color
+    }
+
+    /// sRGB RGBA for a tile (Metal path), memoised in the same `(hueIndex, bucket)` LUT
+    /// shape as `cgColor` — no per-frame `NSColor`/hashing on the resize hot path.
+    private func floatColor(for tile: TreemapTile, weight: Double) -> SIMD4<Float> {
+        let hueIdx: Int
+        if let ext = tile.file?.extName {
+            hueIdx = Theme.stableIndex(ext, paletteCount)
+        } else {
+            let oid = ObjectIdentifier(tile.node)
+            if let cached = hueIndexCache[oid] {
+                hueIdx = cached
+            } else {
+                hueIdx = Theme.stableIndex(tile.node.dominantExt.displayName, paletteCount)
+                hueIndexCache[oid] = hueIdx
+            }
+        }
+        let bucket = min(Self.brightnessBuckets - 1, Int(weight * Double(Self.brightnessBuckets)))
+        let lutKey = hueIdx * Self.brightnessBuckets + bucket
+        if let cached = colorLUTf[lutKey] { return cached }
+        let ns = NSColor(theme.treemapTypeColor(
+            hueIndex: hueIdx, weight: (Double(bucket) + 0.5) / Double(Self.brightnessBuckets)))
+        let s = ns.usingColorSpace(.sRGB) ?? ns
+        let v = SIMD4<Float>(Float(s.redComponent), Float(s.greenComponent), Float(s.blueComponent), 1)
+        colorLUTf[lutKey] = v
+        return v
+    }
+
+    /// Push the current tiles to screen: a GPU render (Metal) or a layer redraw (CG).
+    private func presentTiles() {
+        if let renderer, let metalLayer {
+            renderer.render(into: metalLayer, instances: instances,
+                            camera: Camera.orthoTopDown(width: Float(bounds.width), height: Float(bounds.height)),
+                            clearColor: backgroundComps, borderColor: borderComps)
+        } else {
+            tileLayer.setNeedsDisplay()
+        }
     }
 
     private func tileSize(_ tile: TreemapTile) -> Int64 {
@@ -372,7 +515,7 @@ final class TreemapNSView: NSView, CALayerDelegate {
         // The layer context is native Core Graphics: bottom-left, y-up, text upright.
         // The tile rects are top-left, so each is flipped into this space at draw time
         // (`flip`). No context or text-matrix flips — so glyphs can never mirror.
-        if layer === tileLayer {
+        if layer === tileLayer, renderer == nil {
             drawTiles(in: ctx, height: layer.bounds.height)
         } else if layer === overlayLayer {
             drawOverlay(in: ctx, size: layer.bounds.size)

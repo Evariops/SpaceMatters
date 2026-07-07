@@ -452,7 +452,7 @@ final class ScanController {
     /// version), like `sortCache`/`fileCache`.
     func treemapLayout(root: FSNode, rect: CGRect, rootFiles: [FileTileInfo]?,
                        needsRegions: Bool = true) -> TreemapLayout.Result {
-        layoutCache.invalidate(metric: metric, version: version)
+        layoutCache.invalidate(metric: metric, version: version, root: root)
         return TreemapLayout.compute(root: root, rect: rect, metric: metric, rootFiles: rootFiles,
                                      cache: layoutCache, needsRegions: needsRegions)
     }
