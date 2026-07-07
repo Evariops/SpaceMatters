@@ -143,7 +143,7 @@ struct TreemapView: View {
         // granular; only the folder you've entered shows its files.
         let rootFiles = rootFileTiles(for: zoom)
 
-        let result = TreemapLayout.compute(root: zoom, rect: rect, metric: controller.metric, rootFiles: rootFiles)
+        let result = controller.treemapLayout(root: zoom, rect: rect, rootFiles: rootFiles)
         let newTiles = result.tiles
 
         var maxSize: Int64 = 1

@@ -401,6 +401,10 @@ final class ScanController {
     /// Resolved paths for seed (root/volume) nodes, so any node's full path can be
     /// rebuilt on demand without storing a path on every node.
     @ObservationIgnored private var nodePaths: [ObjectIdentifier: String] = [:]
+    /// Size-independent treemap structure (per-node sorted children/weights). Lives
+    /// here, with the other model caches, so a window resize reuses it and only the
+    /// rect placement reruns per frame. Invalidated on (metric, version) inside.
+    @ObservationIgnored private var layoutCache = TreemapLayout.Cache()
 
     private static let maxFilesPerFolder = 2000
 
@@ -441,6 +445,16 @@ final class ScanController {
 
     /// Children sorted by current metric, cached after the scan so repeated
     /// outline rebuilds are O(1) lookups, not sorts.
+    /// Squarified treemap layout for `root` at `rect`. The size-independent
+    /// structure (per-node sorted children + weights) is memoised across calls and
+    /// reused on resize — only the rect placement reruns per frame. Same output as
+    /// a fresh `TreemapLayout.compute`; the cache tracks the tree via (metric,
+    /// version), like `sortCache`/`fileCache`.
+    func treemapLayout(root: FSNode, rect: CGRect, rootFiles: [FileTileInfo]?) -> TreemapLayout.Result {
+        layoutCache.invalidate(metric: metric, version: version)
+        return TreemapLayout.compute(root: root, rect: rect, metric: metric, rootFiles: rootFiles, cache: layoutCache)
+    }
+
     func sortedChildren(_ node: FSNode) -> [FSNode] {
         let children = node.children
         if phase == .scanning {
