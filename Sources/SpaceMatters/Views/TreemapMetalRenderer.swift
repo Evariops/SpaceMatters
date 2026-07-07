@@ -64,8 +64,11 @@ final class TreemapMetalRenderer {
     private var instanceBuffers: [MTLBuffer?]
     private var frameIndex = 0
 
+    private let sampleCount: Int
+    private let transientStorage: MTLStorageMode
+    private var msaaTexture: MTLTexture?
     private var depthTexture: MTLTexture?
-    private var depthSize = CGSize.zero
+    private var attachmentSize = CGSize.zero
 
     init?() {
         guard let device = MTLCreateSystemDefaultDevice(),
@@ -76,15 +79,24 @@ final class TreemapMetalRenderer {
               let vfn = library.makeFunction(name: "treemapVertex"),
               let ffn = library.makeFunction(name: "treemapFragment") else { return nil }
 
+        // 4× MSAA smooths the tile seams so they don't shimmer as fractional edges crawl
+        // across the pixel grid during a live resize. Near-free on Apple Silicon (TBDR:
+        // memoryless samples resolved in-tile). Falls back to 1× where unsupported.
+        let sc = device.supportsTextureSampleCount(4) ? 4 : 1
+        let transient: MTLStorageMode = device.supportsFamily(.apple2) ? .memoryless : .private
+
         let pd = MTLRenderPipelineDescriptor()
         pd.vertexFunction = vfn
         pd.fragmentFunction = ffn
         pd.colorAttachments[0].pixelFormat = .bgra8Unorm   // non-sRGB: store sRGB values as-is → matches CG
         pd.depthAttachmentPixelFormat = .depth32Float
+        pd.sampleCount = sc
         guard let pipeline = try? device.makeRenderPipelineState(descriptor: pd) else { return nil }
 
+        // Coplanar flat tiles never overlap, so `.lessEqual` (equal-z samples pass,
+        // painter's order wins) avoids MSAA seam rejection; ready for real depth in 3D.
         let dsd = MTLDepthStencilDescriptor()
-        dsd.depthCompareFunction = .less
+        dsd.depthCompareFunction = .lessEqual
         dsd.isDepthWriteEnabled = true
         guard let depthState = device.makeDepthStencilState(descriptor: dsd) else { return nil }
 
@@ -92,6 +104,8 @@ final class TreemapMetalRenderer {
         self.queue = queue
         self.pipeline = pipeline
         self.depthState = depthState
+        self.sampleCount = sc
+        self.transientStorage = transient
         self.instanceBuffers = Array(repeating: nil, count: Self.maxInflight)
     }
 
@@ -101,7 +115,7 @@ final class TreemapMetalRenderer {
                 clearColor: SIMD4<Float>, borderColor: SIMD4<Float>) {
         let size = layer.drawableSize
         guard size.width > 0, size.height > 0 else { return }
-        ensureDepth(size)
+        ensureAttachments(size)
         guard let drawable = layer.nextDrawable() else { return }
 
         inflight.wait()
@@ -116,9 +130,16 @@ final class TreemapMetalRenderer {
         var uniforms = Uniforms(viewProj: camera.viewProjection, borderColor: borderColor)
 
         let rpd = MTLRenderPassDescriptor()
-        rpd.colorAttachments[0].texture = drawable.texture
+        if sampleCount > 1 {
+            // Render into the MSAA texture, resolve down into the drawable on store.
+            rpd.colorAttachments[0].texture = msaaTexture
+            rpd.colorAttachments[0].resolveTexture = drawable.texture
+            rpd.colorAttachments[0].storeAction = .multisampleResolve
+        } else {
+            rpd.colorAttachments[0].texture = drawable.texture
+            rpd.colorAttachments[0].storeAction = .store
+        }
         rpd.colorAttachments[0].loadAction = .clear
-        rpd.colorAttachments[0].storeAction = .store
         rpd.colorAttachments[0].clearColor = MTLClearColor(
             red: Double(clearColor.x), green: Double(clearColor.y), blue: Double(clearColor.z), alpha: 1)
         rpd.depthAttachment.texture = depthTexture
@@ -166,15 +187,28 @@ final class TreemapMetalRenderer {
         return buf
     }
 
-    private func ensureDepth(_ size: CGSize) {
-        guard depthTexture == nil || depthSize != size else { return }
-        let d = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .depth32Float,
-            width: max(1, Int(size.width)), height: max(1, Int(size.height)), mipmapped: false)
-        d.usage = .renderTarget
-        d.storageMode = .private
-        depthTexture = device.makeTexture(descriptor: d)
-        depthSize = size
+    private func ensureAttachments(_ size: CGSize) {
+        guard depthTexture == nil || attachmentSize != size else { return }
+        let w = max(1, Int(size.width)), h = max(1, Int(size.height))
+
+        let dd = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .depth32Float, width: w, height: h, mipmapped: false)
+        dd.textureType = sampleCount > 1 ? .type2DMultisample : .type2D
+        dd.sampleCount = sampleCount
+        dd.usage = .renderTarget
+        dd.storageMode = transientStorage
+        depthTexture = device.makeTexture(descriptor: dd)
+
+        if sampleCount > 1 {
+            let cd = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .bgra8Unorm, width: w, height: h, mipmapped: false)
+            cd.textureType = .type2DMultisample
+            cd.sampleCount = sampleCount
+            cd.usage = .renderTarget
+            cd.storageMode = transientStorage
+            msaaTexture = device.makeTexture(descriptor: cd)
+        }
+        attachmentSize = size
     }
 
     // MARK: - Shader (MSL, compiled at launch)
