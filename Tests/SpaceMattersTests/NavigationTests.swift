@@ -218,8 +218,10 @@ import Foundation
     }
 
     /// SPEC-04 end-to-end: after a scan finishes the disk is watched; an external
-    /// write flips `diskChanged`, and `refreshDirty` re-scans the touched subtree
-    /// so the totals catch up. (FSEvents has ~1 s latency, hence the polling.)
+    /// write marks the touched subtree dirty, and `refreshDirty` re-scans it so the
+    /// totals catch up. A small write stays under the banner's size budget, so it
+    /// doesn't raise `diskChanged` (issue #14) — the reliable signal here is
+    /// `dirtyPaths`. (FSEvents has ~1 s latency, hence the polling.)
     @Test func fsEventsMarkDirtyAndRefreshCatchesUp() async throws {
         let fm = FileManager.default
         let root = fm.temporaryDirectory.appendingPathComponent("mds-fse-\(UUID().uuidString)")
@@ -232,17 +234,18 @@ import Foundation
         await Self.waitForScan(c)
         #expect(c.phase == .finished)
         #expect(!c.diskChanged)
+        #expect(c.dirtyPaths.isEmpty)
         let physBefore = c.root!.aggPhysical.load(ordering: .relaxed)
 
-        // External change: a big new file appears under `sub`.
+        // External change: a new file appears under `sub`.
         try Data(count: 200_000).write(to: root.appendingPathComponent("sub/big.new"))
 
-        // Wait (polling, yielding) for FSEvents to flip the flag.
+        // Wait (polling, yielding) for FSEvents to mark the subtree dirty.
         let deadline = Date().addingTimeInterval(10)
-        while !c.diskChanged && Date() < deadline {
+        while c.dirtyPaths.isEmpty && Date() < deadline {
             try await Task.sleep(for: .milliseconds(200))
         }
-        #expect(c.diskChanged, "FSEvents should have reported the change")
+        #expect(!c.dirtyPaths.isEmpty, "FSEvents should have marked the subtree dirty")
 
         await c.refreshDirty()
         #expect(!c.diskChanged)                 // badge cleared

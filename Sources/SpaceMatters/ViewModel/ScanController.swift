@@ -121,9 +121,22 @@ final class ScanController {
 
     // MARK: Live disk watching (SPEC-04)
 
-    /// True once FSEvents reports a change under the scanned tree — drives the
-    /// "disk changed" banner and the Refresh affordance.
+    /// True once the disk has changed *enough* under the scanned tree to be worth
+    /// surfacing — drives the "disk changed" banner and the Refresh affordance.
+    /// Gated by `diskChangeBudget` so ordinary per-second churn doesn't keep it
+    /// lit (issue #14).
     private(set) var diskChanged = false
+    /// Signed net change in the scanned volume's used space since the current
+    /// result finished — positive means it grew, negative means space was freed.
+    /// Shown in the banner and compared against `diskChangeBudget` to gate it.
+    private(set) var changedBytes: Int64 = 0
+    /// Free bytes on the scanned volume when the result was captured — the
+    /// baseline `changedBytes` is measured against.
+    @ObservationIgnored private var baselineFreeBytes: Int64?
+    /// Last `changedBytes` we repainted for, to avoid needless bumps each batch.
+    @ObservationIgnored private var shownBytes: Int64 = 0
+    /// Minimum absolute net swing before the "disk changed" banner appears.
+    private let diskChangeBudget: Int64 = 128 * 1024 * 1024 // 128 MB
     /// When the current result finished scanning (for "scanned N ago", J5.2).
     private(set) var scanDate: Date?
     /// Paths of the nearest existing nodes touched since the scan — tracked by
@@ -877,18 +890,42 @@ final class ScanController {
         watcher = nil
         dirtyPaths.removeAll()
         diskChanged = false
+        changedBytes = 0
+        shownBytes = 0
+        baselineFreeBytes = nil
     }
 
-    /// FSEvents batch → mark the nearest existing node on each changed path dirty.
+    /// Free bytes on the scanned volume, best-effort. Uses raw `statfs(2)`
+    /// (`f_bavail`, what `df` reports) rather than `volumeAvailableCapacityKey`,
+    /// which folds in macOS "purgeable" space and so doesn't track a write of a
+    /// few hundred MB. `nil` when the root path can't be read.
+    private func volumeFreeBytes() -> Int64? {
+        guard !rootPath.isEmpty else { return nil }
+        var s = statfs()
+        guard statfs(rootPath, &s) == 0 else { return nil }
+        return Int64(s.f_bavail) * Int64(s.f_bsize)
+    }
+
+    /// FSEvents batch → mark the nearest existing node on each changed path dirty,
+    /// then decide whether the change is big enough to raise the banner.
     private func handleDiskChanges(_ paths: [String]) {
         guard isHostScan, phase == .finished else { return }
-        var changed = false
+        var touched = false
         for p in paths {
             guard let node = nearestNode(toPath: p), let np = path(for: node) else { continue }
-            if dirtyPaths.insert(np).inserted { changed = true }
+            if dirtyPaths.insert(np).inserted { touched = true }
         }
-        if changed {
-            diskChanged = true
+        // Gate the banner on net used-space movement so ordinary per-second churn
+        // (logs, caches ticking over) doesn't keep it lit (issue #14). The dirty
+        // dots still track every touched subtree for the targeted Refresh.
+        if let base = baselineFreeBytes, let free = volumeFreeBytes() {
+            changedBytes = base - free
+        }
+        let show = !dirtyPaths.isEmpty && abs(changedBytes) >= diskChangeBudget
+        let repaint = touched || show != diskChanged || (show && changedBytes != shownBytes)
+        diskChanged = show
+        if repaint {
+            shownBytes = changedBytes
             bump() // repaint the dirty dots + banner
         }
     }
@@ -897,7 +934,11 @@ final class ScanController {
     /// Ancestors subsume descendants, so a change deep in an already-dirty parent
     /// is covered by a single re-scan.
     func refreshDirty() async {
-        guard !dirtyPaths.isEmpty else { diskChanged = false; return }
+        guard !dirtyPaths.isEmpty else {
+            diskChanged = false; changedBytes = 0; shownBytes = 0
+            baselineFreeBytes = volumeFreeBytes()
+            return
+        }
         // Keep only the topmost dirty paths (drop any that sit under another).
         let sorted = dirtyPaths.sorted { $0.count < $1.count }
         var roots: [String] = []
@@ -910,6 +951,10 @@ final class ScanController {
             if let node = nearestNode(toPath: p) { await invalidate(subtree: node) }
         }
         scanDate = Date()
+        // Re-baseline the budget so the banner measures drift from *this* refresh.
+        baselineFreeBytes = volumeFreeBytes()
+        changedBytes = 0
+        shownBytes = 0
     }
 
     private func refreshTotals() {
@@ -1028,6 +1073,11 @@ final class ScanController {
                 phase = .finished
                 scanDate = Date()
                 startWatching() // begin watching the disk for changes (SPEC-04)
+                // Capture the budget baseline *after* startWatching — it resets
+                // watch state (including the baseline) on entry (issue #14).
+                baselineFreeBytes = volumeFreeBytes()
+                changedBytes = 0
+                shownBytes = 0
             }
             filesPerSecond = 0
             stopTimer()
