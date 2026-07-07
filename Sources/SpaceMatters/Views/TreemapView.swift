@@ -18,6 +18,10 @@ struct TreemapView: View {
     // mutating it never invalidates the view — it's pure side storage, not an input.
     @State private var cache = RenderCache()
 
+    /// Brightness quantisation for the colour LUT: one step is below a single
+    /// 8-bit channel, so bucketing is imperceptible while bounding the LUT size.
+    private static let brightnessBuckets = 256
+
     var body: some View {
         GeometryReader { geo in
             ZStack(alignment: .topLeading) {
@@ -149,14 +153,49 @@ struct TreemapView: View {
         }
         let denom = Double(maxSize)
 
+        // Colour by file type (matches the legend); size → brightness. Both inputs
+        // are size-independent, so a resize never changes a tile's colour — only the
+        // tile set/order. Memoise so the loop takes no lock and, once warm, allocates
+        // no String/Color: hue indices are cached per node, and finished colours are
+        // reused from a bounded LUT. Invalidate only when the theme or tree changes.
+        let paletteCount = Theme.paletteHues.count
+        let colorKey = ColorCacheKey(isDark: theme.isDark, version: controller.version)
+        if cache.colorKey != colorKey {
+            cache.hueIndex.removeAll(keepingCapacity: true)
+            cache.colorLUT = Array(repeating: nil, count: paletteCount * Self.brightnessBuckets)
+            cache.colorKey = colorKey
+        }
+
         var newColors = [Color]()
         newColors.reserveCapacity(newTiles.count)
         for tile in newTiles {
-            // Colour by file type (matches the legend); size → brightness. File
-            // tiles use their own extension; directory tiles their dominant one.
-            let weight = pow(Double(tileSize(tile)) / denom, 0.40)
-            let extName = tile.file?.extName ?? tile.node.dominantExt.displayName
-            newColors.append(theme.treemapTypeColor(extName: extName, weight: weight))
+            let weight = min(1.0, max(0.0, pow(Double(tileSize(tile)) / denom, 0.40)))
+            // File tiles carry their own extension (a plain field); directory tiles
+            // read the dominant one under a lock + string-decode, so cache that index.
+            let hueIdx: Int
+            if let ext = tile.file?.extName {
+                hueIdx = Theme.stableIndex(ext, paletteCount)
+            } else {
+                let oid = ObjectIdentifier(tile.node)
+                if let cached = cache.hueIndex[oid] {
+                    hueIdx = cached
+                } else {
+                    hueIdx = Theme.stableIndex(tile.node.dominantExt.displayName, paletteCount)
+                    cache.hueIndex[oid] = hueIdx
+                }
+            }
+            let bucket = min(Self.brightnessBuckets - 1, Int(weight * Double(Self.brightnessBuckets)))
+            let lutKey = hueIdx * Self.brightnessBuckets + bucket
+            if let cached = cache.colorLUT[lutKey] {
+                newColors.append(cached)
+            } else {
+                // Colour from the bucket centre so the LUT is a pure function of its
+                // key, independent of which tile happened to fill the slot first.
+                let color = theme.treemapTypeColor(
+                    hueIndex: hueIdx, weight: (Double(bucket) + 0.5) / Double(Self.brightnessBuckets))
+                cache.colorLUT[lutKey] = color
+                newColors.append(color)
+            }
         }
 
         tiles = newTiles
@@ -280,12 +319,34 @@ private struct RootFilesKey: Equatable {
     let version: UInt64
 }
 
+/// Identifies the inputs that determine tile colours. A tile's colour is a pure
+/// function of its hue (dominant/own extension) and brightness (relative size) —
+/// neither depends on the treemap's size — plus the theme. `(isDark, version)`
+/// captures every way the extensions or theme can change, so while it holds the
+/// colour memo below stays valid across resizes.
+private struct ColorCacheKey: Equatable {
+    let isDark: Bool
+    let version: UInt64
+}
+
 /// Per-view render memo, persisted across relayouts (see `TreemapView.cache`).
 /// A reference type so mutating it is invisible to SwiftUI — it caches results
 /// whose inputs don't change on resize, keeping the resize path allocation-free.
 private final class RenderCache {
     var rootFiles: [FileTileInfo]?
     var rootFilesKey: RootFilesKey?
+
+    /// Directory tiles colour by their dominant extension, read under a lock and
+    /// decoded to a `String`. That's stable per node, so memoise the resolved
+    /// palette index to spare the lock + allocation on every resize frame.
+    var hueIndex: [ObjectIdentifier: Int] = [:]
+
+    /// Colours reused across tiles and frames, keyed by `hueIndex * brightnessBuckets
+    /// + bucket`. Bounded to `paletteCount * brightnessBuckets` entries, so once warm
+    /// the colour loop constructs no `Color` at all. Brightness is quantised to
+    /// `brightnessBuckets` levels — a step below one 8-bit channel, imperceptible.
+    var colorLUT: [Color?] = []
+    var colorKey: ColorCacheKey?
 }
 
 /// The drawn treemap. Equatable on the layout `generation` / `isDark` /
