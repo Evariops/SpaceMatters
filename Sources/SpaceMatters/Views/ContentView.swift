@@ -462,6 +462,10 @@ private struct Stat: View {
                 .foregroundStyle(theme.textSecondary)
                 .textCase(.uppercase)
         }
+        // Each stat is the only compressible element in an otherwise fixed-width
+        // toolbar, so without this it absorbs all the shrink and wraps its text
+        // one glyph per line when the window narrows (#12).
+        .fixedSize(horizontal: true, vertical: false)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(label)
         .accessibilityValue(value)
