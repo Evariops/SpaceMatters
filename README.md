@@ -4,7 +4,7 @@ A space usage visualizer for Disks, VMs, Kubernetes and even ssh. It scans fast,
 
 ![swift](https://img.shields.io/badge/Swift-6-orange) ![macOS](https://img.shields.io/badge/macOS-15%2B-blue)
 
-![Scanning a 327 GiB system volume: sortable directory outline, file-type breakdown and squarified treemap, filled in live — 4 million files in 23 seconds](docs/screenshots/scan-local-disk.avif)
+![Scanning a 327 GiB system volume: sortable directory outline, file-type breakdown and squarified treemap, filled in live — 4 million files in 23 seconds](docs/screenshots/scan-local-disk.webp)
 
 ## What it does
 
@@ -14,13 +14,13 @@ Pick a disk, a cluster, a VM, and SpaceMatters maps everything inside it as a sq
 
 The home screen lists everything worth analyzing, not just volumes.
 
-![Home screen: internal disk, Low-Hanging Fruits safe cleanup, Podman virtual machines and Kubernetes contexts](docs/screenshots/home.avif)
+![Home screen: internal disk, Low-Hanging Fruits safe cleanup, Podman virtual machines and Kubernetes contexts](docs/screenshots/home.webp)
 
 - **Low-Hanging Fruits** — a safe one-click cleanup pass over the usual suspects: Trash, `DerivedData`, npm and NuGet caches, and friends. It only ever touches locations that are safe to regenerate.
 - **Virtual machines** — Podman machines, scanned from inside the VM.
 - **Kubernetes** — pick a kube context and see every PVC by namespace, provisioned capacity against actual usage, as the same treemap.
 
-![Kubernetes view: 26 PVCs across 8 namespaces, capacity vs. used, with a per-PVC treemap](docs/screenshots/kubernetes-pvcs.avif)
+![Kubernetes view: 26 PVCs across 8 namespaces, capacity vs. used, with a per-PVC treemap](docs/screenshots/kubernetes-pvcs.webp)
 
 ## How it stays fast and lean
 
