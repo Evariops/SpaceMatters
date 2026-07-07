@@ -313,7 +313,11 @@ private struct ToolbarBar: View {
             Spacer()
 
             if controller.root != nil {
+                // Lowest layout priority so a narrowing window shrinks the search
+                // field first, before the stats or the segmented pickers give up
+                // space (#12).
                 searchField
+                    .layoutPriority(-1)
                 Button("") { searchFocused = true }
                     .keyboardShortcut("f", modifiers: .command)
                     .opacity(0).frame(width: 0)
@@ -374,6 +378,10 @@ private struct ToolbarBar: View {
             .help("Toggle theme")
             .accessibilityLabel(isDark ? "Switch to light theme" : "Switch to dark theme")
         }
+        // Keep the whole bar on a single row: without this, any text squeezed by
+        // a narrow window (button labels, stats) wraps and the bar grows taller
+        // instead of the content shrinking (#12).
+        .lineLimit(1)
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
         .background(theme.panelBackground)
@@ -385,7 +393,7 @@ private struct ToolbarBar: View {
             TextField("Search folders…", text: $searchText)
                 .textFieldStyle(.plain)
                 .font(.system(size: 12))
-                .frame(width: 150)
+                .frame(minWidth: 60, maxWidth: 150)
                 .focused($searchFocused)
                 .onSubmit { controller.setSearch(searchText) }
                 .onChange(of: searchText) { _, query in debounceSearch(query) }
@@ -462,6 +470,10 @@ private struct Stat: View {
                 .foregroundStyle(theme.textSecondary)
                 .textCase(.uppercase)
         }
+        // Each stat is the only compressible element in an otherwise fixed-width
+        // toolbar, so without this it absorbs all the shrink and wraps its text
+        // one glyph per line when the window narrows (#12).
+        .fixedSize(horizontal: true, vertical: false)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(label)
         .accessibilityValue(value)
