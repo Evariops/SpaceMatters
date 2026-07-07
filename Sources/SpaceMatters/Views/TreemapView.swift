@@ -14,6 +14,10 @@ struct TreemapView: View {
     @State private var lastSize: CGSize = .zero
     @State private var hovered: TreemapTile?
 
+    // Memoisation for `recompute`, persisted across relayouts. Held by reference so
+    // mutating it never invalidates the view — it's pure side storage, not an input.
+    @State private var cache = RenderCache()
+
     var body: some View {
         GeometryReader { geo in
             ZStack(alignment: .topLeading) {
@@ -133,18 +137,7 @@ struct TreemapView: View {
         // SPEC-05 (B2): refine the zoom root's own files into individual tiles.
         // The overview (root of the scan, or any level "from afar") stays folder-
         // granular; only the folder you've entered shows its files.
-        var rootFiles: [FileTileInfo]? = nil
-        // Only post-scan: during a scan the count churns and would re-enumerate the
-        // folder's files every refresh. Files refine once the scan settles.
-        if controller.isHostScan && !controller.isScanning {
-            let items = controller.filesIn(zoom)
-            if !items.isEmpty {
-                rootFiles = items.map {
-                    FileTileInfo(name: $0.name, size: $0.size(controller.metric),
-                                 extName: OutlineRowView.extDisplay($0.name))
-                }
-            }
-        }
+        let rootFiles = rootFileTiles(for: zoom)
 
         let result = TreemapLayout.compute(root: zoom, rect: rect, metric: controller.metric, rootFiles: rootFiles)
         let newTiles = result.tiles
@@ -175,6 +168,27 @@ struct TreemapView: View {
     private func tileSize(_ tile: TreemapTile) -> Int64 {
         if let file = tile.file { return file.size }
         return tile.isFileBlock ? tile.node.directFilesSize(controller.metric) : tile.node.size(controller.metric)
+    }
+
+    /// The zoom root's own files as tiles (SPEC-05), memoised. The mapping depends
+    /// only on `(zoom, metric, tree version)` — never on the treemap's *size* — so a
+    /// resize, which reruns the layout every frame, reuses the cached array instead
+    /// of re-mapping up to `maxFilesPerFolder` files (each deriving an extension
+    /// label — a `String` allocation) every frame.
+    private func rootFileTiles(for zoom: FSNode) -> [FileTileInfo]? {
+        // Only post-scan: during a scan the count churns and would re-enumerate the
+        // folder's files every refresh. Files refine once the scan settles.
+        guard controller.isHostScan, !controller.isScanning else { return nil }
+        let key = RootFilesKey(zoom: ObjectIdentifier(zoom), metric: controller.metric, version: controller.version)
+        if cache.rootFilesKey == key { return cache.rootFiles }
+        let items = controller.filesIn(zoom)
+        let tiles: [FileTileInfo]? = items.isEmpty ? nil : items.map {
+            FileTileInfo(name: $0.name, size: $0.size(controller.metric),
+                         extName: OutlineRowView.extDisplay($0.name))
+        }
+        cache.rootFiles = tiles
+        cache.rootFilesKey = key
+        return tiles
     }
 
     /// A spoken summary of the (Canvas-opaque) treemap: the zoomed folder plus its
@@ -256,6 +270,22 @@ struct TreemapView: View {
         }
         return nil
     }
+}
+
+/// Identifies the inputs that determine the zoom root's file tiles. When it's
+/// unchanged (e.g. across a resize), the mapped `FileTileInfo` array is reused.
+private struct RootFilesKey: Equatable {
+    let zoom: ObjectIdentifier
+    let metric: SizeMetric
+    let version: UInt64
+}
+
+/// Per-view render memo, persisted across relayouts (see `TreemapView.cache`).
+/// A reference type so mutating it is invisible to SwiftUI — it caches results
+/// whose inputs don't change on resize, keeping the resize path allocation-free.
+private final class RenderCache {
+    var rootFiles: [FileTileInfo]?
+    var rootFilesKey: RootFilesKey?
 }
 
 /// The drawn treemap. Equatable on the layout `generation` / `isDark` /
