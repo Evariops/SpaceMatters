@@ -66,6 +66,7 @@ jobs:
       - name: Single-category label (priority)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }} # this job has no checkout; tell gh the repo
           PR: ${{ github.event.pull_request.number }}
         run: |
           # Highest → lowest. Mirror this order in release-drafter.yml categories.
