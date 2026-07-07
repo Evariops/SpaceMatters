@@ -32,7 +32,13 @@ Sizes are atomic counters propagated up the ancestor chain as each directory com
 
 ## Download
 
-Grab the latest signed and notarized `.dmg` from the [Releases page](../../releases/latest), open it, and drag SpaceMatters into Applications. It launches without a Gatekeeper warning.
+Grab the latest `.dmg` from the [Releases page](../../releases/latest), open it, and drag SpaceMatters into Applications.
+
+The app isn't notarized (that needs a paid Apple Developer account), so Gatekeeper blocks it on first launch. Clear the quarantine flag once and it opens normally from then on:
+
+```sh
+xattr -d com.apple.quarantine /Applications/SpaceMatters.app
+```
 
 ## Good to know
 
