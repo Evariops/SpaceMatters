@@ -58,3 +58,33 @@ jobs:
           disable-releaser: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # release-drafter lists a PR under *every* category its labels match, with
+      # no notion of priority — so a PR labelled both `bug` and `documentation`
+      # shows up twice. Collapse to the single highest-priority category label so
+      # each PR lands in exactly one changelog section.
+      - name: Single-category label (priority)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          # Highest → lowest. Mirror this order in release-drafter.yml categories.
+          priority="breaking enhancement feature bug performance documentation ci dependencies"
+          have="$(gh pr view "$PR" --json labels --jq '.labels[].name')"
+          winner=""
+          for p in $priority; do
+            if printf '%s\n' "$have" | grep -qx "$p"; then winner="$p"; break; fi
+          done
+          if [ -z "$winner" ]; then echo "No category label — leaving as-is."; exit 0; fi
+          drop=""
+          for p in $priority; do
+            [ "$p" = "$winner" ] && continue
+            if printf '%s\n' "$have" | grep -qx "$p"; then drop="$drop --remove-label $p"; fi
+          done
+          if [ -n "$drop" ]; then
+            # shellcheck disable=SC2086
+            gh pr edit "$PR" $drop
+            echo "Kept '$winner'; removed:$drop"
+          else
+            echo "Already single-category: '$winner'."
+          fi

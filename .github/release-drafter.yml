@@ -11,6 +11,9 @@
 name-template: 'v$RESOLVED_VERSION'
 tag-template: 'v$RESOLVED_VERSION'
 
+# Each PR is collapsed to a single category label by priority in the autolabel
+# job (.github/workflows/release-drafter.yml), so a PR never appears in two
+# sections. Keep this list in the same order as that priority list.
 categories:
   - title: '🚀 Features'
     labels: ['enhancement', 'feature']
