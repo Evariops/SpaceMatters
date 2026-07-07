@@ -121,12 +121,21 @@ private struct DiskChangedBanner: View {
     @Environment(\.theme) private var theme
     @State private var refreshing = false
 
+    /// Spell out how much moved, and in which direction, so the banner is a
+    /// signal worth acting on rather than a permanent fixture (issue #14).
+    private static func message(for delta: Int64) -> String {
+        let amount = Format.bytes(abs(delta))
+        return delta >= 0
+            ? "The disk grew by ~\(amount) since this scan."
+            : "The disk freed ~\(amount) since this scan."
+    }
+
     var body: some View {
         HStack(spacing: 10) {
             Image(systemName: "arrow.triangle.2.circlepath")
                 .font(.system(size: 13))
                 .foregroundStyle(theme.accent)
-            Text("The disk changed since this scan.")
+            Text(Self.message(for: controller.changedBytes))
                 .font(.system(size: 11))
                 .foregroundStyle(theme.textPrimary)
             Spacer(minLength: 8)
