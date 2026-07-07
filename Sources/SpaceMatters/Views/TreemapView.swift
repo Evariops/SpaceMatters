@@ -433,10 +433,11 @@ private struct TreemapCanvas: View, Equatable {
                 }
             }
         }
-        // No `.drawingGroup()`: a Canvas already rasterises to a single layer via
-        // Core Graphics/Metal, so wrapping it added a redundant offscreen pass whose
-        // buffer had to be re-allocated at every intermediate size during a live
-        // resize — extra compositing for no flattening benefit.
+        // Rasterise on the GPU (Metal). The map redraws every resize frame (its
+        // rects change), and profiling showed the draw itself is cheap next to the
+        // layout — but a synchronous CPU raster is still needless main-thread work,
+        // so keep the offscreen GPU pass even without `rendersAsynchronously`.
+        .drawingGroup()
     }
 }
 
