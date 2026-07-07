@@ -11,7 +11,10 @@ on:
   push:
     branches: [main]
   pull_request:
-    types: [opened, reopened, synchronize, edited]
+    # `labeled` matters: a manually-added category label must also trigger the
+    # single-category collapse below, or a hand-labelled PR (e.g. enhancement +
+    # performance) shows up in two changelog sections.
+    types: [opened, reopened, synchronize, edited, labeled]
   workflow_dispatch:
     inputs:
       version:
