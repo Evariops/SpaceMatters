@@ -1,236 +1,49 @@
 import SwiftUI
+import AppKit
 
+/// Treemap view. The map itself is drawn by a plain AppKit `NSView`
+/// (`TreemapNSView`) rather than a SwiftUI `Canvas`, so a window resize is driven
+/// straight by AppKit — `setFrameSize` → recompute rects → redraw — with **no**
+/// SwiftUI recompute / reconcile / display-list trip per frame. Profiling showed
+/// that per-frame SwiftUI machinery, not the drawing, was the resize bottleneck.
+///
+/// This thin SwiftUI wrapper only: (1) reads the controller's observable inputs so
+/// SwiftUI calls `updateNSView` when they change, (2) hosts the hover-label overlay
+/// (interaction chrome, not perf-critical), and (3) carries accessibility.
 struct TreemapView: View {
     @Bindable var controller: ScanController
     @Environment(\.theme) private var theme
-
-    // Cached layout. Recomputed only when an input that affects geometry changes
-    // (size, zoom, metric, or live sizes during a scan) — NOT on hover/selection,
-    // so highlighting stays instant.
-    @State private var tiles: [TreemapTile] = []
-    @State private var colors: [Color] = []
-    @State private var regions: [ObjectIdentifier: CGRect] = [:]
-    @State private var generation: Int = 0
-    @State private var lastSize: CGSize = .zero
-    @State private var hovered: TreemapTile?
-
-    // Memoisation for `recompute`, persisted across relayouts. Held by reference so
-    // mutating it never invalidates the view — it's pure side storage, not an input.
-    @State private var cache = RenderCache()
-
-    /// Brightness quantisation for the colour LUT: one step is below a single
-    /// 8-bit channel, so bucketing is imperceptible while bounding the LUT size.
-    private static let brightnessBuckets = 256
+    @State private var hover: HoverInfo?
 
     var body: some View {
-        GeometryReader { geo in
-            ZStack(alignment: .topLeading) {
-                theme.treemapBackground
-
-                TreemapCanvas(
-                    tiles: tiles,
-                    colors: colors,
-                    border: theme.treemapBorder,
-                    generation: generation,
-                    isDark: theme.isDark,
-                    highlightExt: controller.selectedExt,
-                    searchMatchIDs: controller.searchMatchIDs,
-                    highlightVersion: controller.highlightVersion
-                )
-                .equatable()
-
-                if let hovered {
-                    let r = hovered.rect
-                    Rectangle()
-                        .strokeBorder(Color.white.opacity(0.95), lineWidth: 1.5)
-                        .frame(width: r.width, height: r.height)
-                        .offset(x: r.minX, y: r.minY)
-                        .allowsHitTesting(false)
-                }
-
-                if let selection = controller.selection, let r = selectionRect(for: selection) {
-                    // Spotlight: dim everything outside the selected region.
-                    Canvas { ctx, size in
-                        var p = Path(CGRect(origin: .zero, size: size))
-                        p.addRect(r)
-                        ctx.fill(p, with: .color(.black.opacity(0.5)), style: FillStyle(eoFill: true))
-                    }
-                    .allowsHitTesting(false)
-
-                    // Dark inner liseré + bright white edge → reads on any tile color.
-                    Rectangle()
-                        .strokeBorder(Color.black.opacity(0.85), lineWidth: 4)
-                        .frame(width: r.width, height: r.height)
-                        .offset(x: r.minX, y: r.minY)
-                        .allowsHitTesting(false)
-                    Rectangle()
-                        .strokeBorder(Color.white, lineWidth: 2)
-                        .frame(width: r.width, height: r.height)
-                        .offset(x: r.minX, y: r.minY)
-                        .allowsHitTesting(false)
-                        .shadow(color: theme.accent.opacity(0.9), radius: 6)
-                }
+        // Reading these establishes SwiftUI observation: when any changes, `body`
+        // re-evaluates → the representable is recreated → `updateNSView` runs. A
+        // resize is NOT observed here (no GeometryReader) — AppKit drives it.
+        TreemapRepresentable(
+            controller: controller,
+            theme: theme,
+            version: controller.version,
+            zoomRoot: controller.zoomRoot,
+            metric: controller.metric,
+            selection: controller.selection,
+            selectedExt: controller.selectedExt,
+            searchMatchIDs: controller.searchMatchIDs,
+            highlightVersion: controller.highlightVersion,
+            isDark: theme.isDark,
+            onHover: { hover = $0 }
+        )
+        .overlay(alignment: .bottomLeading) {
+            if let hover {
+                HoverLabel(title: hover.title, isDirectory: hover.isDirectory, sizeText: hover.sizeText)
+                    .padding(8).allowsHitTesting(false)
             }
-            .contentShape(Rectangle())
-            .onContinuousHover { phase in
-                switch phase {
-                case .active(let point): hovered = hitTest(point)
-                case .ended: hovered = nil
-                }
-            }
-            .onTapGesture { point in
-                if let tile = hitTest(point) { controller.reveal(tile.node) }
-            }
-            // simultaneousGesture (not .gesture) so the single tap above fires
-            // immediately instead of waiting out the double-click interval.
-            .simultaneousGesture(
-                TapGesture(count: 2).onEnded {
-                    // Double-click: open a file tile, dive into a folder tile, or
-                    // pop back out on a leaf/gap — a mouse-only way to zoom.
-                    if let hovered {
-                        if let file = hovered.file {
-                            if let base = controller.path(for: hovered.node) {
-                                controller.openItem((base == "/" ? "/" : base + "/") + file.name)
-                            }
-                        } else if hovered.node.isDirectory {
-                            controller.zoom(into: hovered.node)
-                        } else {
-                            controller.zoomOut()
-                        }
-                    } else {
-                        controller.zoomOut()
-                    }
-                }
-            )
-            .contextMenu {
-                if let hovered { treemapMenu(for: hovered) }
-            }
-            .overlay(alignment: .bottomLeading) {
-                if let hovered {
-                    if let file = hovered.file {
-                        HoverLabel(title: file.name, isDirectory: false, sizeText: Format.bytes(file.size))
-                            .padding(8).allowsHitTesting(false)
-                    } else {
-                        HoverLabel(title: hoverPath(hovered.node), isDirectory: hovered.node.isDirectory,
-                                   sizeText: Format.bytes(hovered.node.size(controller.metric)))
-                            .padding(8).allowsHitTesting(false)
-                    }
-                }
-            }
-            .accessibilityElement(children: .ignore)
-            .accessibilityLabel("Treemap")
-            .accessibilityValue(treemapSummary)
-            .onAppear { recompute(size: geo.size) }
-            .onChange(of: geo.size) { _, size in recompute(size: size) }
-            .onChange(of: controller.version) { _, _ in recompute(size: lastSize) }
-            .onChange(of: controller.zoomRoot) { _, _ in recompute(size: lastSize) }
-            .onChange(of: controller.metric) { _, _ in recompute(size: lastSize) }
-            .onChange(of: theme.isDark) { _, _ in recompute(size: lastSize) }
         }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Treemap")
+        .accessibilityValue(treemapSummary)
     }
 
-    private func recompute(size: CGSize) {
-        hovered = nil // old tile no longer exists after a relayout — avoid a ghost outline
-        guard let zoom = controller.zoomRoot, size.width > 1, size.height > 1 else {
-            tiles = []; colors = []; regions = [:]; generation &+= 1
-            return
-        }
-        lastSize = size
-        let rect = CGRect(origin: .zero, size: size).insetBy(dx: 1, dy: 1)
-
-        // SPEC-05 (B2): refine the zoom root's own files into individual tiles.
-        // The overview (root of the scan, or any level "from afar") stays folder-
-        // granular; only the folder you've entered shows its files.
-        let rootFiles = rootFileTiles(for: zoom)
-
-        let result = controller.treemapLayout(root: zoom, rect: rect, rootFiles: rootFiles)
-        let newTiles = result.tiles
-
-        var maxSize: Int64 = 1
-        for tile in newTiles {
-            let s = tileSize(tile)
-            if s > maxSize { maxSize = s }
-        }
-        let denom = Double(maxSize)
-
-        // Colour by file type (matches the legend); size → brightness. Both inputs
-        // are size-independent, so a resize never changes a tile's colour — only the
-        // tile set/order. Memoise so the loop takes no lock and, once warm, allocates
-        // no String/Color: hue indices are cached per node, and finished colours are
-        // reused from a bounded LUT. Invalidate only when the theme or tree changes.
-        let paletteCount = Theme.paletteHues.count
-        let colorKey = ColorCacheKey(isDark: theme.isDark, version: controller.version)
-        if cache.colorKey != colorKey {
-            cache.hueIndex.removeAll(keepingCapacity: true)
-            cache.colorLUT = Array(repeating: nil, count: paletteCount * Self.brightnessBuckets)
-            cache.colorKey = colorKey
-        }
-
-        var newColors = [Color]()
-        newColors.reserveCapacity(newTiles.count)
-        for tile in newTiles {
-            let weight = min(1.0, max(0.0, pow(Double(tileSize(tile)) / denom, 0.40)))
-            // File tiles carry their own extension (a plain field); directory tiles
-            // read the dominant one under a lock + string-decode, so cache that index.
-            let hueIdx: Int
-            if let ext = tile.file?.extName {
-                hueIdx = Theme.stableIndex(ext, paletteCount)
-            } else {
-                let oid = ObjectIdentifier(tile.node)
-                if let cached = cache.hueIndex[oid] {
-                    hueIdx = cached
-                } else {
-                    hueIdx = Theme.stableIndex(tile.node.dominantExt.displayName, paletteCount)
-                    cache.hueIndex[oid] = hueIdx
-                }
-            }
-            let bucket = min(Self.brightnessBuckets - 1, Int(weight * Double(Self.brightnessBuckets)))
-            let lutKey = hueIdx * Self.brightnessBuckets + bucket
-            if let cached = cache.colorLUT[lutKey] {
-                newColors.append(cached)
-            } else {
-                // Colour from the bucket centre so the LUT is a pure function of its
-                // key, independent of which tile happened to fill the slot first.
-                let color = theme.treemapTypeColor(
-                    hueIndex: hueIdx, weight: (Double(bucket) + 0.5) / Double(Self.brightnessBuckets))
-                cache.colorLUT[lutKey] = color
-                newColors.append(color)
-            }
-        }
-
-        tiles = newTiles
-        colors = newColors
-        regions = result.regions
-        generation &+= 1
-    }
-
-    private func tileSize(_ tile: TreemapTile) -> Int64 {
-        if let file = tile.file { return file.size }
-        return tile.isFileBlock ? tile.node.directFilesSize(controller.metric) : tile.node.size(controller.metric)
-    }
-
-    /// The zoom root's own files as tiles (SPEC-05), memoised. The mapping depends
-    /// only on `(zoom, metric, tree version)` — never on the treemap's *size* — so a
-    /// resize, which reruns the layout every frame, reuses the cached array instead
-    /// of re-mapping up to `maxFilesPerFolder` files (each deriving an extension
-    /// label — a `String` allocation) every frame.
-    private func rootFileTiles(for zoom: FSNode) -> [FileTileInfo]? {
-        // Only post-scan: during a scan the count churns and would re-enumerate the
-        // folder's files every refresh. Files refine once the scan settles.
-        guard controller.isHostScan, !controller.isScanning else { return nil }
-        let key = RootFilesKey(zoom: ObjectIdentifier(zoom), metric: controller.metric, version: controller.version)
-        if cache.rootFilesKey == key { return cache.rootFiles }
-        let items = controller.filesIn(zoom)
-        let tiles: [FileTileInfo]? = items.isEmpty ? nil : items.map {
-            FileTileInfo(name: $0.name, size: $0.size(controller.metric),
-                         extName: OutlineRowView.extDisplay($0.name))
-        }
-        cache.rootFiles = tiles
-        cache.rootFilesKey = key
-        return tiles
-    }
-
-    /// A spoken summary of the (Canvas-opaque) treemap: the zoomed folder plus its
+    /// A spoken summary of the (drawing-opaque) treemap: the zoomed folder plus its
     /// largest children by share — so VoiceOver conveys the shape of the map.
     private var treemapSummary: String {
         guard let zoom = controller.zoomRoot else { return "" }
@@ -242,132 +55,408 @@ struct TreemapView: View {
         }
         return kids.isEmpty ? head : head + " Largest: " + kids.joined(separator: ", ")
     }
+}
 
-    private func hitTest(_ point: CGPoint) -> TreemapTile? {
-        for tile in tiles.reversed() where tile.rect.contains(point) { return tile }
-        return nil
+/// The hover pill's payload — computed in the NSView, rendered by SwiftUI.
+struct HoverInfo: Equatable {
+    let title: String
+    let isDirectory: Bool
+    let sizeText: String
+}
+
+/// Bridges the AppKit `TreemapNSView` into SwiftUI. `updateNSView` pushes the
+/// current observable inputs; the NSView decides what that implies (relayout vs a
+/// cheap overlay/dimming redraw).
+private struct TreemapRepresentable: NSViewRepresentable {
+    let controller: ScanController
+    let theme: Theme
+    let version: UInt64
+    let zoomRoot: FSNode?
+    let metric: SizeMetric
+    let selection: FSNode?
+    let selectedExt: ExtKey?
+    let searchMatchIDs: Set<ObjectIdentifier>
+    let highlightVersion: Int
+    let isDark: Bool
+    let onHover: (HoverInfo?) -> Void
+
+    func makeNSView(context: Context) -> TreemapNSView {
+        let view = TreemapNSView()
+        view.onHover = onHover
+        view.apply(controller: controller, theme: theme, version: version, zoomRoot: zoomRoot,
+                   metric: metric, selection: selection, selectedExt: selectedExt,
+                   searchMatchIDs: searchMatchIDs, highlightVersion: highlightVersion)
+        return view
     }
 
-    /// Path of a tile relative to the current zoom root — so identical folder
-    /// names (`Caches`, `node_modules`) are distinguishable on hover.
-    private func hoverPath(_ node: FSNode) -> String {
-        guard let zoom = controller.zoomRoot, node !== zoom else { return node.name }
-        var parts: [String] = []
-        var cur: FSNode? = node
-        while let n = cur, n !== zoom { parts.append(n.name); cur = n.parent }
-        return parts.reversed().joined(separator: "/")
+    func updateNSView(_ view: TreemapNSView, context: Context) {
+        view.onHover = onHover
+        view.apply(controller: controller, theme: theme, version: version, zoomRoot: zoomRoot,
+                   metric: metric, selection: selection, selectedExt: selectedExt,
+                   searchMatchIDs: searchMatchIDs, highlightVersion: highlightVersion)
+    }
+}
+
+/// The drawn treemap: an AppKit view AppKit resizes directly. Tiles live in one
+/// cached layer (redrawn only on relayout — resize or model change); the hover
+/// outline + selection spotlight live in a second layer (redrawn on hover/selection
+/// alone), so hovering never re-renders the ~thousands of tiles.
+///
+/// Allocation discipline (the resize hot path is `setFrameSize` → `relayout` →
+/// `draw`): the cushion gradient, tile CGColors (a bounded LUT), theme CGColors and
+/// label attributed-strings are all cached and reused across frames; the per-frame
+/// `colors`/`sizeScratch` buffers keep their capacity. Only the tiles array (whose
+/// rects genuinely change every frame) is rebuilt.
+final class TreemapNSView: NSView, CALayerDelegate {
+    var onHover: ((HoverInfo?) -> Void)?
+
+    // Inputs (mirrored from SwiftUI via `apply`).
+    private var controller: ScanController?
+    private var theme = Theme(isDark: true)
+    private var version: UInt64 = .max
+    private var zoomRoot: FSNode?
+    private var metric: SizeMetric = .physical
+    private var selection: FSNode?
+    private var selectedExt: ExtKey?
+    private var searchMatchIDs: Set<ObjectIdentifier> = []
+    private var highlightVersion: Int = .min
+    private var isDark = true
+
+    // Layout state.
+    private var tiles: [TreemapTile] = []
+    private var colors: [CGColor] = []
+    private var regions: [ObjectIdentifier: CGRect] = [:]
+    private var regionsBuilt = false
+    private var hovered: TreemapTile?
+
+    // Layers: tiles (cached) and overlay (hover/selection).
+    private let tileLayer = CALayer()
+    private let overlayLayer = CALayer()
+
+    // MARK: Caches (persist across relayouts)
+
+    private static let brightnessBuckets = 256
+    private let paletteCount = Theme.paletteHues.count
+    private var hueIndexCache: [ObjectIdentifier: Int] = [:]
+    private var colorLUT: [CGColor?] = []
+    private var colorKey: ColorKey?
+    private var sizeScratch: [Int64] = []
+
+    private var rootFilesCache: [FileTileInfo]?
+    private var rootFilesKey: RootFilesKey?
+
+    // Theme-derived CGColors (rebuilt on theme change).
+    private var backgroundCG = CGColor(gray: 0, alpha: 1)
+    private var borderCG = CGColor(gray: 0, alpha: 0.45)
+    private var accentShadowCG = CGColor(gray: 0.3, alpha: 0.9)
+    private static let dimCG = CGColor(gray: 0, alpha: 0.72)
+    private static let spotlightDimCG = CGColor(gray: 0, alpha: 0.5)
+    private static let blackBorderCG = CGColor(gray: 0, alpha: 0.85)
+    private static let whiteCG = CGColor(gray: 1, alpha: 1)
+    private static let hoverCG = CGColor(gray: 1, alpha: 0.95)
+
+    private lazy var cushionGradient: CGGradient = {
+        let space = CGColorSpaceCreateDeviceRGB()
+        let stops: [CGColor] = [
+            CGColor(red: 1, green: 1, blue: 1, alpha: 0.16),
+            CGColor(red: 1, green: 1, blue: 1, alpha: 0),
+            CGColor(red: 0, green: 0, blue: 0, alpha: 0.20),
+        ]
+        return CGGradient(colorsSpace: space, colors: stops as CFArray, locations: [0, 0.45, 1])!
+    }()
+
+    private struct ColorKey: Equatable { let isDark: Bool; let version: UInt64 }
+
+    // MARK: Setup
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layerContentsRedrawPolicy = .duringViewResize
+        layer?.masksToBounds = true
+        for sub in [tileLayer, overlayLayer] {
+            sub.delegate = self
+            sub.needsDisplayOnBoundsChange = true
+            sub.contentsScale = 2
+            sub.frame = bounds
+            layer?.addSublayer(sub)
+        }
     }
 
-    @ViewBuilder
-    private func treemapMenu(for tile: TreemapTile) -> some View {
-        if let file = tile.file, let base = controller.path(for: tile.node) {
-            // A single file of the zoom root (SPEC-05).
-            let path = (base == "/" ? "/" : base + "/") + file.name
-            Button { controller.openItem(path) } label: { Label("Open", systemImage: "arrow.up.forward.app") }
-            Button { controller.revealInFinder(path) } label: { Label("Reveal in Finder", systemImage: "folder") }
-            Button { controller.copyPath(path) } label: { Label("Copy Path", systemImage: "doc.on.doc") }
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) unavailable") }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        guard !inLiveResize else { return }   // don't fight the live-resize scale-down
+        setScale(window?.backingScaleFactor ?? 2)
+    }
+
+    private func setScale(_ scale: CGFloat) {
+        tileLayer.contentsScale = scale
+        overlayLayer.contentsScale = scale
+        tileLayer.setNeedsDisplay()
+        overlayLayer.setNeedsDisplay()
+    }
+
+    // The map is CPU-rasterised into the layer, and filling the big solid tiles at 2×
+    // retina is the resize bottleneck (memory bandwidth). During a live drag, fill ¼
+    // the pixels (1× backing) — slightly soft while dragging, re-rendered crisp the
+    // instant the drag ends. Motion hides the softness; the still frame stays sharp.
+    override func viewWillStartLiveResize() {
+        super.viewWillStartLiveResize()
+        tileLayer.contentsScale = 1
+        overlayLayer.contentsScale = 1
+    }
+
+    override func viewDidEndLiveResize() {
+        super.viewDidEndLiveResize()
+        setScale(window?.backingScaleFactor ?? 2)
+    }
+
+    // MARK: SwiftUI → view
+
+    func apply(controller: ScanController, theme: Theme, version: UInt64, zoomRoot: FSNode?,
+               metric: SizeMetric, selection: FSNode?, selectedExt: ExtKey?,
+               searchMatchIDs: Set<ObjectIdentifier>, highlightVersion: Int) {
+        self.controller = controller
+
+        let themeChanged = isDark != theme.isDark
+        self.theme = theme
+        self.isDark = theme.isDark
+        if themeChanged { rebuildThemeColors() }
+
+        let structural = version != self.version || zoomRoot !== self.zoomRoot
+            || metric != self.metric || themeChanged
+        let highlightChanged = selectedExt != self.selectedExt
+            || highlightVersion != self.highlightVersion || searchMatchIDs != self.searchMatchIDs
+        let selectionChanged = selection !== self.selection
+
+        self.version = version
+        self.zoomRoot = zoomRoot
+        self.metric = metric
+        self.selectedExt = selectedExt
+        self.searchMatchIDs = searchMatchIDs
+        self.highlightVersion = highlightVersion
+        self.selection = selection
+
+        if structural {
+            relayout()
+            tileLayer.setNeedsDisplay()
+            overlayLayer.setNeedsDisplay()
         } else {
-            treemapDirMenu(for: tile.node)
+            if selectionChanged && selection != nil && !regionsBuilt {
+                relayout()               // need the region map to outline the new selection
+                tileLayer.setNeedsDisplay()
+            } else if highlightChanged {
+                tileLayer.setNeedsDisplay()   // dimming changed; rects unchanged
+            }
+            if selectionChanged { overlayLayer.setNeedsDisplay() }
         }
     }
 
-    @ViewBuilder
-    private func treemapDirMenu(for node: FSNode) -> some View {
-        if node.isDirectory {
-            Button { controller.zoom(into: node) } label: { Label("Zoom In", systemImage: "plus.magnifyingglass") }
+    private func rebuildThemeColors() {
+        backgroundCG = NSColor(theme.treemapBackground).cgColor
+        borderCG = NSColor(theme.treemapBorder).cgColor
+        accentShadowCG = NSColor(theme.accent).withAlphaComponent(0.9).cgColor
+        layer?.backgroundColor = backgroundCG
+    }
+
+    // MARK: Resize (AppKit-driven — the hot path)
+
+    override func setFrameSize(_ newSize: NSSize) {
+        let changed = newSize != frame.size
+        super.setFrameSize(newSize)
+        guard changed else { return }
+        tileLayer.frame = bounds
+        overlayLayer.frame = bounds
+        relayout()
+        tileLayer.setNeedsDisplay()
+        overlayLayer.setNeedsDisplay()
+    }
+
+    // MARK: Layout (size-dependent placement + colours)
+
+    private func relayout() {
+        hovered = nil
+        guard let controller, let zoomRoot, bounds.width > 1, bounds.height > 1 else {
+            tiles = []; colors.removeAll(keepingCapacity: true); regions = [:]; regionsBuilt = false
+            return
         }
-        if controller.canZoomOut {
-            Button { controller.zoomOut() } label: { Label("Zoom Out", systemImage: "minus.magnifyingglass") }
+        let rect = bounds.insetBy(dx: 1, dy: 1)
+        let rootFiles = rootFileTiles(for: zoomRoot, controller: controller)
+        let needRegions = selection != nil
+        let result = controller.treemapLayout(root: zoomRoot, rect: rect, rootFiles: rootFiles,
+                                              needsRegions: needRegions)
+        tiles = result.tiles
+        regions = result.regions
+        regionsBuilt = needRegions
+        computeColors()
+    }
+
+    /// Fill `colors` (parallel to `tiles`) from the LUT. Size is read once per tile
+    /// (into `sizeScratch`) and reused for both the max pass and the weight, halving
+    /// the atomic loads; `colors` keeps its buffer capacity across frames.
+    private func computeColors() {
+        let n = tiles.count
+        let key = ColorKey(isDark: isDark, version: version)
+        if colorKey != key {
+            hueIndexCache.removeAll(keepingCapacity: true)
+            colorLUT = Array(repeating: nil, count: paletteCount * Self.brightnessBuckets)
+            colorKey = key
         }
-        if let path = controller.path(for: node) {
-            Divider()
-            if controller.isHostScan {
-                Button { controller.revealInFinder(path) } label: { Label("Reveal in Finder", systemImage: "folder") }
-                Button { controller.copyPath(path) } label: { Label("Copy Path", systemImage: "doc.on.doc") }
-                Divider()
-                Button { Task { _ = await controller.remove(directory: node, permanently: false) } } label: {
-                    Label("Move to Trash", systemImage: "trash")
-                }
-                .disabled(controller.isScanning)
+        if sizeScratch.count < n { sizeScratch = [Int64](repeating: 0, count: n) }
+        var maxSize: Int64 = 1
+        for i in 0..<n {
+            let s = tileSize(tiles[i])
+            sizeScratch[i] = s
+            if s > maxSize { maxSize = s }
+        }
+        let denom = Double(maxSize)
+        colors.removeAll(keepingCapacity: true)
+        colors.reserveCapacity(n)
+        for i in 0..<n {
+            let weight = min(1.0, max(0.0, pow(Double(sizeScratch[i]) / denom, 0.40)))
+            colors.append(cgColor(for: tiles[i], weight: weight))
+        }
+    }
+
+    private func cgColor(for tile: TreemapTile, weight: Double) -> CGColor {
+        let hueIdx: Int
+        if let ext = tile.file?.extName {
+            hueIdx = Theme.stableIndex(ext, paletteCount)
+        } else {
+            let oid = ObjectIdentifier(tile.node)
+            if let cached = hueIndexCache[oid] {
+                hueIdx = cached
             } else {
-                Button { controller.copyPath(path) } label: { Label("Copy Path (in VM)", systemImage: "doc.on.doc") }
+                hueIdx = Theme.stableIndex(tile.node.dominantExt.displayName, paletteCount)
+                hueIndexCache[oid] = hueIdx
+            }
+        }
+        let bucket = min(Self.brightnessBuckets - 1, Int(weight * Double(Self.brightnessBuckets)))
+        let lutKey = hueIdx * Self.brightnessBuckets + bucket
+        if let cached = colorLUT[lutKey] { return cached }
+        let color = NSColor(theme.treemapTypeColor(
+            hueIndex: hueIdx, weight: (Double(bucket) + 0.5) / Double(Self.brightnessBuckets))).cgColor
+        colorLUT[lutKey] = color
+        return color
+    }
+
+    private func tileSize(_ tile: TreemapTile) -> Int64 {
+        if let file = tile.file { return file.size }
+        return tile.isFileBlock ? tile.node.directFilesSize(metric) : tile.node.size(metric)
+    }
+
+    /// The zoom root's own files as tiles (SPEC-05), memoised by (zoom, metric,
+    /// version) so a resize reuses the mapping instead of re-deriving extension
+    /// labels for up to `maxFilesPerFolder` files every frame.
+    private func rootFileTiles(for zoom: FSNode, controller: ScanController) -> [FileTileInfo]? {
+        guard controller.isHostScan, !controller.isScanning else { return nil }
+        let key = RootFilesKey(zoom: ObjectIdentifier(zoom), metric: metric, version: version)
+        if rootFilesKey == key { return rootFilesCache }
+        let items = controller.filesIn(zoom)
+        let mapped: [FileTileInfo]? = items.isEmpty ? nil : items.map {
+            FileTileInfo(name: $0.name, size: $0.size(metric), extName: OutlineRowView.extDisplay($0.name))
+        }
+        rootFilesCache = mapped
+        rootFilesKey = key
+        return mapped
+    }
+
+    // MARK: Drawing
+
+    func draw(_ layer: CALayer, in ctx: CGContext) {
+        // The layer context is native Core Graphics: bottom-left, y-up, text upright.
+        // The tile rects are top-left, so each is flipped into this space at draw time
+        // (`flip`). No context or text-matrix flips — so glyphs can never mirror.
+        if layer === tileLayer {
+            drawTiles(in: ctx, height: layer.bounds.height)
+        } else if layer === overlayLayer {
+            drawOverlay(in: ctx, size: layer.bounds.size)
+        }
+    }
+
+    /// Flip a top-left tile rect into the context's native bottom-left space.
+    private func flip(_ r: CGRect, _ height: CGFloat) -> CGRect {
+        CGRect(x: r.minX, y: height - r.maxY, width: r.width, height: r.height)
+    }
+
+    private func drawTiles(in ctx: CGContext, height: CGFloat) {
+        let n = tiles.count
+        guard n > 0, colors.count == n else { return }
+        let highlightName = selectedExt?.displayName
+        let hasSearch = highlightName == nil && !searchMatchIDs.isEmpty
+
+        for i in 0..<n {
+            let tile = tiles[i]
+            if tile.rect.width <= 0.5 || tile.rect.height <= 0.5 { continue }
+            let r = flip(tile.rect, height)
+
+            ctx.setFillColor(colors[i])
+            ctx.fill(r)
+
+            // Cushion sheen (light top → dark bottom); skip the tiniest tiles.
+            if r.width > 6 && r.height > 6 {
+                ctx.saveGState()
+                ctx.clip(to: r)
+                ctx.drawLinearGradient(cushionGradient,
+                                       start: CGPoint(x: r.midX, y: r.maxY),
+                                       end: CGPoint(x: r.midX, y: r.minY),
+                                       options: [.drawsBeforeStartLocation, .drawsAfterEndLocation])
+                ctx.restoreGState()
+            }
+
+            var dimmed = false
+            if let highlightName {
+                let tileExt = tile.file?.extName ?? tile.node.dominantExt.displayName
+                dimmed = tileExt != highlightName
+            } else if hasSearch {
+                dimmed = !isUnderMatch(tile.node)
+            }
+            if dimmed {
+                ctx.setFillColor(Self.dimCG)
+                ctx.fill(r)
+            }
+
+            if r.width > 3 && r.height > 3 {
+                ctx.setStrokeColor(borderCG)
+                ctx.setLineWidth(0.6)
+                ctx.stroke(r)
             }
         }
     }
 
-    /// Bounding region of a directory in the current layout — so selecting it in
-    /// the list outlines the matching area. If the node itself wasn't given its
-    /// own tile (it lives inside an undivided parent tile), fall back to the
-    /// nearest ancestor that has a region: that tile is exactly where it lives.
-    private func selectionRect(for node: FSNode) -> CGRect? {
-        if node === controller.zoomRoot { return nil } // whole map; no outline needed
-        var cur: FSNode? = node
-        while let n = cur {
-            if let r = regions[ObjectIdentifier(n)] { return r }
-            if n === controller.zoomRoot { break }
-            cur = n.parent
+    private func drawOverlay(in ctx: CGContext, size: CGSize) {
+        if let selection, let sel = selectionRect(for: selection) {
+            let r = flip(sel, size.height)
+            // Spotlight: dim everything outside the selected region.
+            ctx.setFillColor(Self.spotlightDimCG)
+            ctx.addRect(CGRect(origin: .zero, size: size))
+            ctx.addRect(r)
+            ctx.fillPath(using: .evenOdd)
+
+            // Dark inner liseré + bright white edge (strokeBorder draws inside the
+            // frame, so inset by half the line width to match).
+            ctx.setStrokeColor(Self.blackBorderCG)
+            ctx.setLineWidth(4)
+            ctx.stroke(r.insetBy(dx: 2, dy: 2))
+
+            ctx.saveGState()
+            ctx.setShadow(offset: .zero, blur: 6, color: accentShadowCG)
+            ctx.setStrokeColor(Self.whiteCG)
+            ctx.setLineWidth(2)
+            ctx.stroke(r.insetBy(dx: 1, dy: 1))
+            ctx.restoreGState()
         }
-        return nil
-    }
-}
-
-/// Identifies the inputs that determine the zoom root's file tiles. When it's
-/// unchanged (e.g. across a resize), the mapped `FileTileInfo` array is reused.
-private struct RootFilesKey: Equatable {
-    let zoom: ObjectIdentifier
-    let metric: SizeMetric
-    let version: UInt64
-}
-
-/// Identifies the inputs that determine tile colours. A tile's colour is a pure
-/// function of its hue (dominant/own extension) and brightness (relative size) —
-/// neither depends on the treemap's size — plus the theme. `(isDark, version)`
-/// captures every way the extensions or theme can change, so while it holds the
-/// colour memo below stays valid across resizes.
-private struct ColorCacheKey: Equatable {
-    let isDark: Bool
-    let version: UInt64
-}
-
-/// Per-view render memo, persisted across relayouts (see `TreemapView.cache`).
-/// A reference type so mutating it is invisible to SwiftUI — it caches results
-/// whose inputs don't change on resize, keeping the resize path allocation-free.
-private final class RenderCache {
-    var rootFiles: [FileTileInfo]?
-    var rootFilesKey: RootFilesKey?
-
-    /// Directory tiles colour by their dominant extension, read under a lock and
-    /// decoded to a `String`. That's stable per node, so memoise the resolved
-    /// palette index to spare the lock + allocation on every resize frame.
-    var hueIndex: [ObjectIdentifier: Int] = [:]
-
-    /// Colours reused across tiles and frames, keyed by `hueIndex * brightnessBuckets
-    /// + bucket`. Bounded to `paletteCount * brightnessBuckets` entries, so once warm
-    /// the colour loop constructs no `Color` at all. Brightness is quantised to
-    /// `brightnessBuckets` levels — a step below one 8-bit channel, imperceptible.
-    var colorLUT: [Color?] = []
-    var colorKey: ColorCacheKey?
-}
-
-/// The drawn treemap. Equatable on the layout `generation` / `isDark` /
-/// `highlightVersion` so it only re-renders when something that affects the
-/// pixels changed — hover and selection overlays live in the parent.
-///
-/// Each tile gets a soft "cushion" sheen (a light-top / dark-bottom gradient) for
-/// a pseudo-3D look, a name label when it's big enough, and dims when a file-type
-/// filter is active and it doesn't match.
-private struct TreemapCanvas: View, Equatable {
-    let tiles: [TreemapTile]
-    let colors: [Color]
-    let border: Color
-    let generation: Int
-    let isDark: Bool
-    let highlightExt: ExtKey?
-    let searchMatchIDs: Set<ObjectIdentifier>
-    let highlightVersion: Int
-
-    static func == (lhs: TreemapCanvas, rhs: TreemapCanvas) -> Bool {
-        lhs.generation == rhs.generation && lhs.isDark == rhs.isDark && lhs.highlightVersion == rhs.highlightVersion
+        if let hovered {
+            let r = flip(hovered.rect, size.height)
+            ctx.setStrokeColor(Self.hoverCG)
+            ctx.setLineWidth(1.5)
+            ctx.stroke(r.insetBy(dx: 0.75, dy: 0.75))
+        }
     }
 
     private func isUnderMatch(_ node: FSNode) -> Bool {
@@ -379,66 +468,162 @@ private struct TreemapCanvas: View, Equatable {
         return false
     }
 
-    private static let cushion = Gradient(stops: [
-        .init(color: .white.opacity(0.16), location: 0),
-        .init(color: .clear, location: 0.45),
-        .init(color: .black.opacity(0.20), location: 1),
-    ])
-
-    var body: some View {
-        Canvas { ctx, _ in
-            let labelColor = GraphicsContext.Shading.color(.white.opacity(0.92))
-            for i in tiles.indices {
-                let tile = tiles[i]
-                let r = tile.rect
-                if r.width <= 0.5 || r.height <= 0.5 { continue }
-                let path = Path(r)
-
-                ctx.fill(path, with: .color(colors[i]))
-
-                // Cushion sheen (skip the tiniest tiles for perf/clarity).
-                if r.width > 6 && r.height > 6 {
-                    ctx.fill(path, with: .linearGradient(Self.cushion,
-                                                         startPoint: CGPoint(x: r.midX, y: r.minY),
-                                                         endPoint: CGPoint(x: r.midX, y: r.maxY)))
-                }
-
-                let dimmed: Bool
-                if let ext = highlightExt {
-                    // File tiles match on their own extension; folder tiles on their dominant one.
-                    let tileExt = tile.file?.extName ?? tile.node.dominantExt.displayName
-                    dimmed = tileExt != ext.displayName
-                } else if !searchMatchIDs.isEmpty {
-                    dimmed = !isUnderMatch(tile.node)
-                } else {
-                    dimmed = false
-                }
-                if dimmed {
-                    ctx.fill(path, with: .color(.black.opacity(0.72)))
-                }
-
-                if r.width > 3 && r.height > 3 {
-                    ctx.stroke(path, with: .color(border), lineWidth: 0.6)
-                }
-
-                // Label big directory + file tiles (not the aggregate block).
-                let label = tile.file?.name ?? (tile.isFileBlock ? nil : tile.node.name)
-                if !dimmed, let label, r.width > 64, r.height > 22 {
-                    let labelRect = r.insetBy(dx: 5, dy: 3)
-                    var text = ctx.resolve(Text(label)
-                        .font(.system(size: 10.5, weight: .medium)))
-                    text.shading = labelColor
-                    ctx.draw(text, in: CGRect(x: labelRect.minX, y: labelRect.minY,
-                                              width: labelRect.width, height: 14))
-                }
-            }
+    /// Bounding region of a directory in the current layout, falling back to the
+    /// nearest ancestor that has one (the tile it visually lives inside).
+    private func selectionRect(for node: FSNode) -> CGRect? {
+        if node === zoomRoot { return nil }
+        var cur: FSNode? = node
+        while let n = cur {
+            if let r = regions[ObjectIdentifier(n)] { return r }
+            if n === zoomRoot { break }
+            cur = n.parent
         }
-        // Rasterise on the GPU (Metal). The map redraws every resize frame (its
-        // rects change), and profiling showed the draw itself is cheap next to the
-        // layout — but a synchronous CPU raster is still needless main-thread work,
-        // so keep the offscreen GPU pass even without `rendersAsynchronously`.
-        .drawingGroup()
+        return nil
     }
+
+    // MARK: Hit testing & interaction
+
+    /// The topmost tile at `point` (a mouse location in view coordinates). Mouse
+    /// coordinates arrive bottom-left; the tiles are stored top-left (matching the
+    /// layout), so flip Y before hit-testing. Named to avoid clashing with
+    /// `NSView.hitTest(_:)`.
+    private func tileAt(_ point: CGPoint) -> TreemapTile? {
+        let p = CGPoint(x: point.x, y: bounds.height - point.y)
+        for tile in tiles.reversed() where tile.rect.contains(p) { return tile }
+        return nil
+    }
+
+    private var trackingArea: NSTrackingArea?
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea { removeTrackingArea(trackingArea) }
+        let area = NSTrackingArea(rect: bounds,
+                                  options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+                                  owner: self, userInfo: nil)
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        let p = convert(event.locationInWindow, from: nil)
+        let hit = tileAt(p)
+        if hit?.rect != hovered?.rect {
+            hovered = hit
+            overlayLayer.setNeedsDisplay()
+            onHover?(hit.map(hoverInfo(for:)))
+        }
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        guard hovered != nil else { return }
+        hovered = nil
+        overlayLayer.setNeedsDisplay()
+        onHover?(nil)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        let tile = tileAt(convert(event.locationInWindow, from: nil))
+        if event.clickCount >= 2 {
+            // Double-click: open a file tile, dive into a folder tile, or pop back
+            // out on a leaf/gap — a mouse-only way to zoom.
+            guard let controller else { return }
+            if let tile {
+                if let file = tile.file {
+                    if let base = controller.path(for: tile.node) {
+                        controller.openItem((base == "/" ? "/" : base + "/") + file.name)
+                    }
+                } else if tile.node.isDirectory {
+                    controller.zoom(into: tile.node)
+                } else {
+                    controller.zoomOut()
+                }
+            } else {
+                controller.zoomOut()
+            }
+        } else if let tile {
+            controller?.reveal(tile.node)
+        }
+    }
+
+    private func hoverInfo(for tile: TreemapTile) -> HoverInfo {
+        if let file = tile.file {
+            return HoverInfo(title: file.name, isDirectory: false, sizeText: Format.bytes(file.size))
+        }
+        return HoverInfo(title: hoverPath(tile.node), isDirectory: tile.node.isDirectory,
+                         sizeText: Format.bytes(tile.node.size(metric)))
+    }
+
+    /// Path of a node relative to the current zoom root — so identical folder names
+    /// (`Caches`, `node_modules`) are distinguishable on hover.
+    private func hoverPath(_ node: FSNode) -> String {
+        guard let zoom = zoomRoot, node !== zoom else { return node.name }
+        var parts: [String] = []
+        var cur: FSNode? = node
+        while let n = cur, n !== zoom { parts.append(n.name); cur = n.parent }
+        return parts.reversed().joined(separator: "/")
+    }
+
+    // MARK: Context menu
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let p = convert(event.locationInWindow, from: nil)
+        guard let tile = tileAt(p), let controller else { return nil }
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        if let file = tile.file, let base = controller.path(for: tile.node) {
+            let path = (base == "/" ? "/" : base + "/") + file.name
+            menu.addItem(ClosureMenuItem(title: "Open", symbol: "arrow.up.forward.app") { controller.openItem(path) })
+            menu.addItem(ClosureMenuItem(title: "Reveal in Finder", symbol: "folder") { controller.revealInFinder(path) })
+            menu.addItem(ClosureMenuItem(title: "Copy Path", symbol: "doc.on.doc") { controller.copyPath(path) })
+        } else {
+            buildDirMenu(menu, node: tile.node, controller: controller)
+        }
+        return menu.numberOfItems > 0 ? menu : nil
+    }
+
+    private func buildDirMenu(_ menu: NSMenu, node: FSNode, controller: ScanController) {
+        if node.isDirectory {
+            menu.addItem(ClosureMenuItem(title: "Zoom In", symbol: "plus.magnifyingglass") { controller.zoom(into: node) })
+        }
+        if controller.canZoomOut {
+            menu.addItem(ClosureMenuItem(title: "Zoom Out", symbol: "minus.magnifyingglass") { controller.zoomOut() })
+        }
+        guard let path = controller.path(for: node) else { return }
+        menu.addItem(.separator())
+        if controller.isHostScan {
+            menu.addItem(ClosureMenuItem(title: "Reveal in Finder", symbol: "folder") { controller.revealInFinder(path) })
+            menu.addItem(ClosureMenuItem(title: "Copy Path", symbol: "doc.on.doc") { controller.copyPath(path) })
+            menu.addItem(.separator())
+            let trash = ClosureMenuItem(title: "Move to Trash", symbol: "trash") {
+                Task { _ = await controller.remove(directory: node, permanently: false) }
+            }
+            trash.isEnabled = !controller.isScanning
+            menu.addItem(trash)
+        } else {
+            menu.addItem(ClosureMenuItem(title: "Copy Path (in VM)", symbol: "doc.on.doc") { controller.copyPath(path) })
+        }
+    }
+}
+
+/// Identifies the inputs that determine the zoom root's file tiles.
+private struct RootFilesKey: Equatable {
+    let zoom: ObjectIdentifier
+    let metric: SizeMetric
+    let version: UInt64
+}
+
+/// An `NSMenuItem` that runs a closure when chosen.
+private final class ClosureMenuItem: NSMenuItem {
+    private let handler: () -> Void
+    init(title: String, symbol: String? = nil, handler: @escaping () -> Void) {
+        self.handler = handler
+        super.init(title: title, action: #selector(fire), keyEquivalent: "")
+        target = self
+        if let symbol { image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) }
+    }
+    @available(*, unavailable)
+    required init(coder: NSCoder) { fatalError("init(coder:) unavailable") }
+    @objc private func fire() { handler() }
 }
 
 private struct HoverLabel: View {
