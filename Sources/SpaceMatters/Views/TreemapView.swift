@@ -386,7 +386,7 @@ private struct TreemapCanvas: View, Equatable {
     ])
 
     var body: some View {
-        Canvas(rendersAsynchronously: true) { ctx, _ in
+        Canvas { ctx, _ in
             let labelColor = GraphicsContext.Shading.color(.white.opacity(0.92))
             for i in tiles.indices {
                 let tile = tiles[i]
