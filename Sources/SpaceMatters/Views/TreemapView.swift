@@ -241,6 +241,11 @@ final class TreemapNSView: NSView, CALayerDelegate {
         setScale(window?.backingScaleFactor ?? 2)
     }
 
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil { cancelZoom() }     // break the CADisplayLink → self cycle on teardown
+    }
+
     private func setScale(_ scale: CGFloat) {
         if let metalLayer {
             metalLayer.contentsScale = scale
@@ -276,6 +281,7 @@ final class TreemapNSView: NSView, CALayerDelegate {
                metric: SizeMetric, selection: FSNode?, selectedExt: ExtKey?,
                searchMatchIDs: Set<ObjectIdentifier>, highlightVersion: Int) {
         self.controller = controller
+        let oldZoomRoot = self.zoomRoot   // capture before the assignment below (for zoom animation)
 
         let themeChanged = isDark != theme.isDark
         self.theme = theme
@@ -297,9 +303,18 @@ final class TreemapNSView: NSView, CALayerDelegate {
         self.selection = selection
 
         if structural {
-            relayout()
-            presentTiles()
-            overlayLayer.setNeedsDisplay()
+            // A pure zoom navigation (from the treemap or the outline) animates the camera;
+            // anything else (scan update, metric, theme) relays out instantly.
+            if zoomRoot !== oldZoomRoot, let oldRoot = oldZoomRoot, let newRoot = zoomRoot,
+               renderer != nil, zoomLink == nil, !inLiveResize, !instances.isEmpty,
+               startZoomAnimation(from: oldRoot, to: newRoot) {
+                overlayLayer.setNeedsDisplay()
+            } else {
+                if zoomLink != nil { cancelZoom() }
+                relayout()
+                presentTiles()
+                overlayLayer.setNeedsDisplay()
+            }
         } else {
             if selectionChanged && selection != nil && !regionsBuilt {
                 relayout()               // need the region map to outline the new selection
@@ -478,10 +493,13 @@ final class TreemapNSView: NSView, CALayerDelegate {
     }
 
     /// Push the current tiles to screen: a GPU render (Metal) or a layer redraw (CG).
+    /// During a zoom animation `zoomViewport` overrides the full-bounds camera so the map
+    /// pushes toward / pulls back from a folder (same tiles, a moving orthographic camera).
     private func presentTiles() {
         if let renderer, let metalLayer {
+            let viewport = zoomViewport ?? CGRect(origin: .zero, size: bounds.size)
             renderer.render(into: metalLayer, instances: instances,
-                            camera: Camera.orthoTopDown(width: Float(bounds.width), height: Float(bounds.height)),
+                            camera: Camera.ortho(viewport: viewport),
                             clearColor: backgroundComps, borderColor: borderComps)
         } else {
             tileLayer.setNeedsDisplay()
@@ -573,6 +591,7 @@ final class TreemapNSView: NSView, CALayerDelegate {
     }
 
     private func drawOverlay(in ctx: CGContext, size: CGSize) {
+        guard zoomLink == nil else { return }   // hidden during a zoom (CG can't follow the Metal camera)
         if let selection, let sel = selectionRect(for: selection) {
             let r = flip(sel, size.height)
             // Spotlight: dim everything outside the selected region.
@@ -648,6 +667,7 @@ final class TreemapNSView: NSView, CALayerDelegate {
     }
 
     override func mouseMoved(with event: NSEvent) {
+        guard zoomLink == nil else { return }   // ignore hover while a zoom animates
         let p = convert(event.locationInWindow, from: nil)
         let hit = tileAt(p)
         if hit?.rect != hovered?.rect {
@@ -665,10 +685,11 @@ final class TreemapNSView: NSView, CALayerDelegate {
     }
 
     override func mouseUp(with event: NSEvent) {
+        guard zoomLink == nil else { return }   // let a running zoom animation finish
         let tile = tileAt(convert(event.locationInWindow, from: nil))
         if event.clickCount >= 2 {
-            // Double-click: open a file tile, dive into a folder tile, or pop back
-            // out on a leaf/gap — a mouse-only way to zoom.
+            // Double-click: open a file tile, dive into a folder tile (animated), or pop
+            // back out on a leaf/gap — a mouse-only way to zoom.
             guard let controller else { return }
             if let tile {
                 if let file = tile.file {
@@ -676,7 +697,7 @@ final class TreemapNSView: NSView, CALayerDelegate {
                         controller.openItem((base == "/" ? "/" : base + "/") + file.name)
                     }
                 } else if tile.node.isDirectory {
-                    controller.zoom(into: tile.node)
+                    controller.zoom(into: tile.node)   // apply() animates the transition
                 } else {
                     controller.zoomOut()
                 }
@@ -686,6 +707,123 @@ final class TreemapNSView: NSView, CALayerDelegate {
         } else if let tile {
             controller?.reveal(tile.node)
         }
+    }
+
+    // MARK: Animated zoom (a moving orthographic camera)
+
+    private var zoomLink: CADisplayLink?
+    private var zoomFrom = CGRect.zero
+    private var zoomTo = CGRect.zero
+    private var zoomStart: CFTimeInterval = -1
+    private var zoomViewport: CGRect?              // nil = full-bounds camera (no animation)
+    private var zoomOnDone: (() -> Void)?
+    private static let zoomDuration: CFTimeInterval = 0.5
+
+    /// Route a zoom navigation (from *any* entry point — treemap double-click, the left
+    /// outline, ⌘↑, breadcrumb) into an animated camera move. `apply()` calls this when the
+    /// zoom root changed. Returns false when it can't animate (e.g. a sideways jump between
+    /// unrelated branches), so the caller falls back to an instant relayout.
+    private func startZoomAnimation(from oldRoot: FSNode, to newRoot: FSNode) -> Bool {
+        let full = CGRect(origin: .zero, size: bounds.size)
+        if isUnder(newRoot, orIs: oldRoot) {
+            // Zoom IN: newRoot sits inside the *current* (old) layout, still in `tiles`. Push
+            // the camera onto its region, keeping the old tiles; settle to the new layout at end.
+            guard let r = regionRect(for: newRoot, in: tiles), r.width > 1, r.height > 1 else { return false }
+            animateZoom(from: full, to: r) { [weak self] in self?.settleAfterZoom() }
+            return true
+        } else if isUnder(oldRoot, orIs: newRoot) {
+            // Zoom OUT: lay out the new (parent) view now, then pull the camera back from where
+            // the old root sits in it to the full view.
+            relayout()
+            guard let r = regionRect(for: oldRoot, in: tiles), r.width > 1, r.height > 1 else {
+                presentTiles(); overlayLayer.setNeedsDisplay(); return true
+            }
+            animateZoom(from: r, to: full) { [weak self] in
+                self?.presentTiles(); self?.overlayLayer.setNeedsDisplay()
+            }
+            return true
+        }
+        return false   // unrelated branches → instant relayout
+    }
+
+    private func settleAfterZoom() {
+        relayout()
+        presentTiles()
+        overlayLayer.setNeedsDisplay()
+    }
+
+    /// Bounding rect of `ancestor`'s subtree within `tileList` (union of its tiles) — where a
+    /// folder sits in a layout, without depending on the (optional) region map being built.
+    private func regionRect(for ancestor: FSNode, in tileList: [TreemapTile]) -> CGRect? {
+        var union: CGRect?
+        for tile in tileList where isUnder(tile.node, orIs: ancestor) {
+            union = union.map { $0.union(tile.rect) } ?? tile.rect
+        }
+        return union
+    }
+
+    private func isUnder(_ node: FSNode, orIs ancestor: FSNode) -> Bool {
+        var cur: FSNode? = node
+        while let n = cur {
+            if n === ancestor { return true }
+            cur = n.parent
+        }
+        return false
+    }
+
+    private func animateZoom(from: CGRect, to: CGRect, onDone: @escaping () -> Void) {
+        zoomFrom = from
+        zoomTo = to
+        zoomStart = -1
+        zoomViewport = from
+        zoomOnDone = onDone
+        let link = displayLink(target: self, selector: #selector(zoomStep(_:)))
+        link.add(to: .main, forMode: .common)
+        zoomLink = link
+        presentTiles()                      // first frame at `from`
+        overlayLayer.setNeedsDisplay()       // clear the CG overlay (it can't follow the camera)
+    }
+
+    @objc private func zoomStep(_ link: CADisplayLink) {
+        if zoomStart < 0 { zoomStart = link.timestamp }
+        let t = min(1, (link.timestamp - zoomStart) / Self.zoomDuration)
+        zoomViewport = interpolatedViewport(easeInOut(t))
+        presentTiles()
+        if t >= 1 { finishZoom() }
+    }
+
+    private func finishZoom() {
+        zoomLink?.invalidate()
+        zoomLink = nil
+        zoomViewport = nil
+        let done = zoomOnDone
+        zoomOnDone = nil
+        done?()                             // commit the zoom → apply → relayout → full-view present
+    }
+
+    /// Cancel a zoom without committing it (e.g. the view leaves its window mid-animation),
+    /// so the `CADisplayLink → self` retain cycle can't outlive the view.
+    private func cancelZoom() {
+        zoomLink?.invalidate()
+        zoomLink = nil
+        zoomViewport = nil
+        zoomOnDone = nil
+    }
+
+    /// Geometric interpolation of the viewport (constant-velocity zoom) between the two
+    /// framings, `e` already eased.
+    private func interpolatedViewport(_ e: Double) -> CGRect {
+        let a = zoomFrom, b = zoomTo
+        let aw = max(Double(a.width), 0.5), ah = max(Double(a.height), 0.5)
+        let w = aw * pow(Double(b.width) / aw, e)
+        let h = ah * pow(Double(b.height) / ah, e)
+        let cx = Double(a.midX) + (Double(b.midX) - Double(a.midX)) * e
+        let cy = Double(a.midY) + (Double(b.midY) - Double(a.midY)) * e
+        return CGRect(x: cx - w / 2, y: cy - h / 2, width: w, height: h)
+    }
+
+    private func easeInOut(_ t: Double) -> Double {
+        t < 0.5 ? 4 * t * t * t : 1 - pow(-2 * t + 2, 3) / 2
     }
 
     private func hoverInfo(for tile: TreemapTile) -> HoverInfo {
@@ -709,6 +847,7 @@ final class TreemapNSView: NSView, CALayerDelegate {
     // MARK: Context menu
 
     override func menu(for event: NSEvent) -> NSMenu? {
+        guard zoomLink == nil else { return nil }   // no context menu mid-zoom
         let p = convert(event.locationInWindow, from: nil)
         guard let tile = tileAt(p), let controller else { return nil }
         let menu = NSMenu()
