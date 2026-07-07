@@ -128,8 +128,6 @@ final class TreemapNSView: NSView, CALayerDelegate {
     private var tiles: [TreemapTile] = []
     private var colors: [CGColor] = []            // CG fallback path
     private var instances: [TileInstance] = []    // Metal path (culled to visible tiles)
-    private var layoutRect: CGRect = .zero        // inset rect `tiles` were squarified in
-    private var colorDenom: Double = 1            // max tile size at last full layout
     private var regions: [ObjectIdentifier: CGRect] = [:]
     private var regionsBuilt = false
     private var hovered: TreemapTile?
@@ -268,14 +266,8 @@ final class TreemapNSView: NSView, CALayerDelegate {
 
     override func viewDidEndLiveResize() {
         super.viewDidEndLiveResize()
-        guard renderer != nil else {
-            setScale(window?.backingScaleFactor ?? 2)   // fallback: restore crisp backing scale
-            return
-        }
-        // Re-settle the frozen, stretched layout into a proper squarified one at the final size.
-        relayout()
-        presentTiles()
-        overlayLayer.setNeedsDisplay()
+        guard renderer == nil else { return }
+        setScale(window?.backingScaleFactor ?? 2)
     }
 
     // MARK: SwiftUI → view
@@ -349,16 +341,10 @@ final class TreemapNSView: NSView, CALayerDelegate {
         } else {
             tileLayer.frame = bounds
         }
-        // Squarify is not monotone under resize: recomputing it every frame reorganises the
-        // tiles wholesale (the flicker). During a live drag, keep the layout FROZEN and just
-        // affine-scale the existing tiles into the new bounds — spatially stable, tiles only
-        // stretch (a pure ortho-camera rescale). A full squarified relayout re-settles when
-        // the drag ends (viewDidEndLiveResize).
-        if renderer != nil, inLiveResize, !tiles.isEmpty, layoutRect.width > 0, layoutRect.height > 0 {
-            packInstances(denom: colorDenom, from: layoutRect, to: bounds.insetBy(dx: 1, dy: 1))
-        } else {
-            relayout()
-        }
+        // The squarified layout is now monotone under resize (TreemapLayout freezes the
+        // discrete row/orientation/recurse decisions and reruns only continuous geometry),
+        // so a full relayout every frame flows smoothly — no freeze/settle needed.
+        relayout()
         presentTiles()
         overlayLayer.setNeedsDisplay()
     }
@@ -369,11 +355,10 @@ final class TreemapNSView: NSView, CALayerDelegate {
         hovered = nil
         guard let controller, let zoomRoot, bounds.width > 1, bounds.height > 1 else {
             tiles = []; colors.removeAll(keepingCapacity: true); instances.removeAll(keepingCapacity: true)
-            regions = [:]; regionsBuilt = false; layoutRect = .zero
+            regions = [:]; regionsBuilt = false
             return
         }
         let rect = bounds.insetBy(dx: 1, dy: 1)
-        layoutRect = rect
         let rootFiles = rootFileTiles(for: zoomRoot, controller: controller)
         let needRegions = selection != nil
         let result = controller.treemapLayout(root: zoomRoot, rect: rect, rootFiles: rootFiles,
@@ -404,9 +389,8 @@ final class TreemapNSView: NSView, CALayerDelegate {
             if s > maxSize { maxSize = s }
         }
         let denom = Double(maxSize)
-        colorDenom = denom
         if renderer != nil {
-            packInstances(denom: denom, from: layoutRect, to: layoutRect)
+            packInstances(denom: denom)
         } else {
             colors.removeAll(keepingCapacity: true)
             colors.reserveCapacity(n)
@@ -420,33 +404,16 @@ final class TreemapNSView: NSView, CALayerDelegate {
     /// Pack `tiles` into GPU `instances` (Metal path): world rect on the ground plane
     /// (top-left, height 0), packed sRGB colour, dim folded in. Sub-pixel tiles are
     /// culled here — `instances` may be shorter than `tiles`; hit-testing uses `tiles`.
-    ///
-    /// The tile rects were squarified in `src`; they are affine-mapped into `dst`. For a
-    /// full layout `src == dst` (identity). During a live resize the squarified layout is
-    /// frozen (`src` = the layout rect) and stretched into the new bounds (`dst`) instead
-    /// of re-running the non-monotone squarify every frame — a pure ortho-camera rescale.
-    private func packInstances(denom: Double, from src: CGRect, to dst: CGRect) {
+    private func packInstances(denom: Double) {
         let n = tiles.count
         instances.removeAll(keepingCapacity: true)
         instances.reserveCapacity(n)
-        let sx = src.width > 0 ? Double(dst.width) / Double(src.width) : 1
-        let sy = src.height > 0 ? Double(dst.height) / Double(src.height) : 1
-        let identity = sx == 1 && sy == 1 && src.origin == dst.origin
         let highlightName = selectedExt?.displayName
         let hasSearch = highlightName == nil && !searchMatchIDs.isEmpty
         for i in 0..<n {
             let tile = tiles[i]
-            let r0 = tile.rect
-            let x: Double, y: Double, w: Double, h: Double
-            if identity {
-                x = Double(r0.minX); y = Double(r0.minY); w = Double(r0.width); h = Double(r0.height)
-            } else {
-                x = Double(dst.minX) + (Double(r0.minX) - Double(src.minX)) * sx
-                y = Double(dst.minY) + (Double(r0.minY) - Double(src.minY)) * sy
-                w = Double(r0.width) * sx
-                h = Double(r0.height) * sy
-            }
-            if w <= 0.5 || h <= 0.5 { continue }
+            let r = tile.rect
+            if r.width <= 0.5 || r.height <= 0.5 { continue }
             let weight = min(1.0, max(0.0, pow(Double(sizeScratch[i]) / denom, 0.40)))
             var dim: Float = 0
             if let highlightName {
@@ -456,8 +423,8 @@ final class TreemapNSView: NSView, CALayerDelegate {
                 dim = 1
             }
             instances.append(TileInstance(
-                origin: SIMD4<Float>(Float(x), 0, Float(y), 0),
-                size: SIMD4<Float>(Float(w), 0, Float(h), dim),
+                origin: SIMD4<Float>(Float(r.minX), 0, Float(r.minY), 0),
+                size: SIMD4<Float>(Float(r.width), 0, Float(r.height), dim),
                 color: floatColor(for: tile, weight: weight)))
         }
     }
