@@ -35,6 +35,16 @@ struct ContainerResultView: View {
         .background(theme.windowBackground)
         .alert(item: $confirmPrune) { kind in pruneAlert(kind) }
         .alert(item: $confirmRemove) { image in removeAlert(image) }
+        .alert("Action failed", isPresented: actionErrorShown) {
+            Button("OK", role: .cancel) { controller.clearActionError() }
+        } message: {
+            Text(controller.actionError ?? "")
+        }
+    }
+
+    private var actionErrorShown: Binding<Bool> {
+        Binding(get: { controller.actionError != nil },
+                set: { if !$0 { controller.clearActionError() } })
     }
 
     // MARK: Toolbar
@@ -55,6 +65,12 @@ struct ContainerResultView: View {
             Text("\(controller.engineName) containers")
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(theme.textPrimary)
+
+            if let action = controller.runningAction {
+                ProgressView().controlSize(.small)
+                Text("\(action)…")
+                    .font(.system(size: 11)).foregroundStyle(theme.textSecondary)
+            }
 
             Spacer()
 
@@ -104,6 +120,8 @@ struct ContainerResultView: View {
                         .background(Capsule().fill(Color(hex: 0xE0915A)))
                 }
                 .buttonStyle(.plain)
+                .disabled(controller.runningAction != nil)
+                .opacity(controller.runningAction != nil ? 0.5 : 1)
             } else {
                 Text("nothing to reclaim")
                     .font(.system(size: 10)).foregroundStyle(theme.textSecondary.opacity(0.7))
@@ -192,9 +210,14 @@ struct ContainerResultView: View {
     }
 
     private func removeAlert(_ image: CImage) -> Alert {
-        Alert(
+        // `rmi` is deliberately not forced: on an in-use image the engine
+        // refuses instead of tearing down the containers that use it.
+        let message = image.inUse
+            ? "“\(image.name)” is used by at least one container, so \(controller.engineName) will refuse to delete it. Remove those containers first."
+            : "“\(image.name)” (\(Format.bytes(image.size))) will be deleted."
+        return Alert(
             title: Text("Remove image?"),
-            message: Text("“\(image.name)” (\(Format.bytes(image.size))) will be deleted."),
+            message: Text(message),
             primaryButton: .destructive(Text("Remove")) { controller.removeImage(image) },
             secondaryButton: .cancel()
         )

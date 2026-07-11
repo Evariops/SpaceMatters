@@ -16,10 +16,20 @@ final class ContainerController {
     private(set) var containers: [CContainer] = []
     private(set) var volumes: [CVolume] = []
 
+    /// Failure of the last cleanup action (timeout, engine refusal…), surfaced
+    /// as an alert — a prune that dies silently looks like a button that does
+    /// nothing.
+    private(set) var actionError: String?
+    /// Label of the cleanup action currently running; disables the others.
+    private(set) var runningAction: String?
+
     var expandedImages: Set<String> = []
     private(set) var layerCache: [String: [CLayer]] = [:]
 
     private var engine: ContainerEngine?
+    /// Superseded-load guard (same pattern as the Kubernetes and Cleanup modes):
+    /// a slow stale snapshot must never overwrite a newer engine's data.
+    @ObservationIgnored private var loadID = 0
 
     var imagesRow: CDFRow? { df.first { $0.type.lowercased().contains("image") } }
     var containersRow: CDFRow? { df.first { $0.type.lowercased().contains("container") } }
@@ -31,7 +41,11 @@ final class ContainerController {
         state = .loading
         df = []; images = []; containers = []; volumes = []
         expandedImages = []; layerCache = [:]
-        Task { await reload() }
+        actionError = nil
+        runningAction = nil
+        loadID += 1
+        let id = loadID
+        Task { await reload(id) }
     }
 
     func refresh() {
@@ -39,11 +53,17 @@ final class ContainerController {
         load(engine: engine)
     }
 
-    func stop() { /* no long-running work to cancel */ }
+    /// Leaving the mode: orphan any in-flight reload or action result so a slow
+    /// stale snapshot can't overwrite whatever the user looks at next.
+    func stop() {
+        loadID += 1
+        runningAction = nil
+    }
 
-    private func reload() async {
+    private func reload(_ id: Int) async {
         guard let engine else { return }
         let snapshot = await Task.detached(priority: .userInitiated) { ContainerQueries.fetchAll(engine) }.value
+        guard id == loadID else { return } // superseded (engine switched / mode left)
         df = snapshot.df
         images = snapshot.images.sorted { $0.size > $1.size }
         containers = snapshot.containers.sorted { $0.size > $1.size }
@@ -66,27 +86,43 @@ final class ContainerController {
 
     private func loadLayersIfNeeded(_ image: CImage) {
         guard layerCache[image.id] == nil, let engine else { return }
+        let id = loadID
         Task {
             let layers = await Task.detached(priority: .userInitiated) {
                 ContainerQueries.history(engine, imageID: image.id)
             }.value
+            guard id == loadID else { return }
             layerCache[image.id] = layers
         }
     }
 
     // MARK: Cleanup actions
+    //
+    // All destructive, so none is fire-and-forget: they run with a long deadline
+    // (a prune can walk tens of GB — the default 20 s would SIGKILL it mid-way)
+    // and any failure or timeout surfaces in `actionError`.
 
-    func removeImage(_ image: CImage) { run(["rmi", "-f", image.id]) }
-    func pruneImages() { run(["image", "prune", "-a", "-f"]) }
-    func pruneContainers() { run(["container", "prune", "-f"]) }
-    func pruneVolumes() { run(["volume", "prune", "-f"]) }
-    func removeContainer(_ container: CContainer) { run(["rm", "-f", container.id]) }
+    /// No `-f`: a forced `rmi` also stops and deletes the containers using the
+    /// image. If it's in use the engine refuses and the refusal is shown as-is.
+    func removeImage(_ image: CImage) { run("Remove image", ["rmi", image.id]) }
+    func pruneImages() { run("Prune images", ["image", "prune", "-a", "-f"]) }
+    func pruneContainers() { run("Prune containers", ["container", "prune", "-f"]) }
+    func pruneVolumes() { run("Prune volumes", ["volume", "prune", "-f"]) }
+    func removeContainer(_ container: CContainer) { run("Remove container", ["rm", "-f", container.id]) }
 
-    private func run(_ args: [String]) {
-        guard let engine else { return }
+    func clearActionError() { actionError = nil }
+
+    private func run(_ label: String, _ args: [String]) {
+        guard let engine, runningAction == nil else { return }
+        runningAction = label
+        actionError = nil
+        let id = loadID
         Task {
-            _ = await Task.detached(priority: .userInitiated) { VMProbe.capture(engine.executable, args) }.value
-            await reload()
+            let result = await ProcessRunner.run(engine.executable, args, timeout: 600)
+            guard id == loadID else { return } // mode was left meanwhile
+            runningAction = nil
+            if !result.ok { actionError = "\(label) failed: \(result.diagnostic)" }
+            await reload(id)
         }
     }
 }

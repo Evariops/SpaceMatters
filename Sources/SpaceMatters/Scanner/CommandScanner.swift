@@ -62,7 +62,6 @@ final class CommandScanner: ScanBackend {
         let errPipe = Pipe()
         process.standardOutput = outPipe
         process.standardError = errPipe
-        self.process = process
 
         let thread = Thread { [weak self] in
             self?.readLoop(outPipe.fileHandleForReading, errHandle: errPipe.fileHandleForReading, process: process)
@@ -79,12 +78,22 @@ final class CommandScanner: ScanBackend {
             markFinished()
             return
         }
+        // Published only once launched: `terminate()` on a never-launched
+        // Process raises NSInvalidArgumentException, and `cancel()` can arrive
+        // at any time (Home after a failed start).
+        self.process = process
+        if cancelledFlag.load(ordering: .relaxed) { cancel(); return }
         thread.start()
     }
 
     func cancel() {
         cancelledFlag.store(true, ordering: .relaxed)
-        process?.terminate() // closes stdout → the reader loop sees EOF and stops
+        // Kill the whole tree: the executable is often a wrapper (podman,
+        // colima) whose `ssh` child would otherwise survive, hold the pipes'
+        // write ends open, and leave the reader threads blocked for good.
+        if let p = process, p.isRunning {
+            ProcessTree.signal(p.processIdentifier, SIGTERM)
+        }
         markFinished()
     }
 
