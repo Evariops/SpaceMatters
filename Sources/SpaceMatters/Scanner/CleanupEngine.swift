@@ -163,15 +163,18 @@ enum CleanupEngine {
 
     /// Delete the *children* of each of the item's paths. The paths themselves
     /// survive (tools expect their cache directory to exist). Every path must
-    /// live strictly inside `allowedRoot` and be a real directory — a symlinked
-    /// root is refused, so a cache relocated elsewhere is never chased.
+    /// live strictly inside `allowedRoot` **once fully resolved** and be a real
+    /// directory — a symlinked root, a symlinked *intermediate* component
+    /// (`~/.gradle` → an external volume) or a `..` escape are all refused, so
+    /// a cache relocated elsewhere is never chased.
     static func clean(_ item: Cleanable, allowedRoot: String = NSHomeDirectory()) -> CleanResult {
         var result = CleanResult()
         let fm = FileManager.default
         let fence = allowedRoot.hasSuffix("/") ? allowedRoot : allowedRoot + "/"
 
         for root in item.paths {
-            guard root.hasPrefix(fence), root != fence, isRealDirectory(root) else {
+            guard root.hasPrefix(fence), root != fence, isRealDirectory(root),
+                  staysInsideFence(root, allowedRoot: allowedRoot) else {
                 result.refused += 1
                 continue
             }
@@ -198,6 +201,22 @@ enum CleanupEngine {
         var st = stat()
         guard lstat(path, &st) == 0 else { return false }
         return (st.st_mode & S_IFMT) == S_IFDIR
+    }
+
+    /// The textual prefix check can be defeated by a symlinked *intermediate*
+    /// component or a `..`: the path still starts with the fence but its real
+    /// location is elsewhere. The fully-resolved form must stay strictly inside
+    /// the fully-resolved fence for the clean to proceed.
+    private static func staysInsideFence(_ root: String, allowedRoot: String) -> Bool {
+        let fenceReal = resolvedPath(allowedRoot)
+        let fencePrefix = fenceReal.hasSuffix("/") ? fenceReal : fenceReal + "/"
+        let real = resolvedPath(root)
+        return real != fenceReal && real.hasPrefix(fencePrefix)
+    }
+
+    /// Fully-resolved (symlinks + `..`) form of a path.
+    private static func resolvedPath(_ path: String) -> String {
+        URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath().path
     }
 
     private static let bufferSize = 256 * 1024

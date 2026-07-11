@@ -62,9 +62,16 @@ final class DirectoryScanner: ScanBackend {
     /// (matches `du`/df). Attribution mode (default) counts every link.
     private let exact: Bool
     private let linkLock = NSLock()
-    /// Inodes of multi-link files already counted (only `linkCount > 1` entries,
-    /// so this stays negligible even on huge trees).
-    private var seenInodes: Set<UInt64> = []
+    /// Identity of a multi-link file. Inode numbers are only unique per
+    /// filesystem — a multi-disk scan, or `/` spanning the System and Data
+    /// volumes, would collide on bare inodes and silently count files as zero.
+    private struct InodeKey: Hashable {
+        let dev: UInt32
+        let ino: UInt64
+    }
+    /// Multi-link files already counted (only `linkCount > 1` entries, so this
+    /// stays negligible even on huge trees).
+    private var seenInodes: Set<InodeKey> = []
 
     private static let bufferSize = 256 * 1024
 
@@ -317,7 +324,8 @@ final class DirectoryScanner: ScanBackend {
                 // sighting; later hardlinks contribute 0 bytes (still 1 file entry).
                 if exact && entry.linkCount > 1 {
                     linkLock.lock()
-                    let firstSighting = seenInodes.insert(entry.fileID).inserted
+                    let firstSighting = seenInodes
+                        .insert(InodeKey(dev: entry.deviceID, ino: entry.fileID)).inserted
                     linkLock.unlock()
                     if !firstSighting { effL = 0; effP = 0 }
                 }
