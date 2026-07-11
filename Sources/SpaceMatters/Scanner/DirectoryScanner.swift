@@ -49,6 +49,10 @@ final class DirectoryScanner: ScanBackend {
     private var outstanding = 0
     private var finished = false
     private var cancelled = false
+    /// Workers that haven't exited yet. A cancel is cooperative — each worker
+    /// finishes its current directory first — so "cancelled" alone doesn't mean
+    /// the tree is quiescent; this reaching zero does.
+    private var activeWorkers = 0
 
     // Per-extension table (merged from each directory under its own lock).
     private let extLock = NSLock()
@@ -104,6 +108,7 @@ final class DirectoryScanner: ScanBackend {
         }
         outstanding = seeds.count
         if seeds.isEmpty { finished = true }
+        activeWorkers = workerCount
         cond.unlock()
 
         for i in 0..<workerCount {
@@ -127,12 +132,21 @@ final class DirectoryScanner: ScanBackend {
         return finished || cancelled
     }
 
-    /// Block the calling (background) thread until the scan finishes or is
-    /// cancelled. Used by `ScanController.invalidate` to await a subtree re-scan.
+    /// Block the calling (background) thread until the scan has finished or been
+    /// cancelled **and every worker has exited** — after this returns, no code
+    /// path of this scanner mutates the tree again. Used by
+    /// `ScanController.invalidate` to await a subtree re-scan, and to drain a
+    /// cancelled scan before its tree is mutated or torn down.
     func waitUntilFinished() {
         cond.lock()
-        while !finished && !cancelled { cond.wait() }
+        while (!finished && !cancelled) || activeWorkers > 0 { cond.wait() }
         cond.unlock()
+    }
+
+    /// True once the scan is over and every worker thread has exited.
+    var isDrained: Bool {
+        cond.lock(); defer { cond.unlock() }
+        return (finished || cancelled) && activeWorkers == 0
     }
 
     /// Raw per-extension table (copy under lock) — for reconciling the global
@@ -218,6 +232,14 @@ final class DirectoryScanner: ScanBackend {
     private func workerLoop() {
         let buffer = UnsafeMutableRawPointer.allocate(byteCount: Self.bufferSize, alignment: 16)
         defer { buffer.deallocate() }
+        // Signal exit on every return path so `waitUntilFinished`/`isDrained`
+        // only report quiescence once no worker can still touch the tree.
+        defer {
+            cond.lock()
+            activeWorkers -= 1
+            cond.broadcast()
+            cond.unlock()
+        }
 
         while true {
             cond.lock()
