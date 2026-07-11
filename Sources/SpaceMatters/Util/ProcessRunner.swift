@@ -118,11 +118,11 @@ enum ProcessRunner {
         let group = DispatchGroup()
         group.enter()
         DispatchQueue.global(qos: .userInitiated).async {
-            buffers.setOut(outPipe.fileHandleForReading.readDataToEndOfFile()); group.leave()
+            Self.drain(outPipe.fileHandleForReading) { buffers.appendOut($0) }; group.leave()
         }
         group.enter()
         DispatchQueue.global(qos: .userInitiated).async {
-            buffers.setErr(errPipe.fileHandleForReading.readDataToEndOfFile()); group.leave()
+            Self.drain(errPipe.fileHandleForReading) { buffers.appendErr($0) }; group.leave()
         }
 
         // Watchdog: SIGTERM the whole tree at the deadline (grandchildren like a
@@ -153,13 +153,24 @@ enum ProcessRunner {
         )
     }
 
+    /// Incremental read so a timeout snapshot still holds everything received so
+    /// far — `readDataToEndOfFile` would only publish at EOF, i.e. never when a
+    /// straggler keeps the pipe open, losing the whole output.
+    private static func drain(_ handle: FileHandle, _ sink: (Data) -> Void) {
+        while true {
+            let chunk = handle.availableData // blocks until data; empty == EOF
+            if chunk.isEmpty { return }
+            sink(chunk)
+        }
+    }
+
     /// stdout/stderr accumulators shared with the drain threads.
     private final class PipeBuffers: @unchecked Sendable {
         private let lock = NSLock()
         private var out = Data()
         private var err = Data()
-        func setOut(_ d: Data) { lock.lock(); out = d; lock.unlock() }
-        func setErr(_ d: Data) { lock.lock(); err = d; lock.unlock() }
+        func appendOut(_ d: Data) { lock.lock(); out.append(d); lock.unlock() }
+        func appendErr(_ d: Data) { lock.lock(); err.append(d); lock.unlock() }
         func snapshot() -> (Data, Data) { lock.lock(); defer { lock.unlock() }; return (out, err) }
     }
 }

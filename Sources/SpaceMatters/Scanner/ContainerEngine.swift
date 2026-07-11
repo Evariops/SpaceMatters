@@ -156,7 +156,8 @@ enum ContainerQueries {
         }
     }
 
-    private static func cleanCommand(_ raw: String) -> String {
+    /// Internal (not private) so tests can pin the layer-command cleanup.
+    static func cleanCommand(_ raw: String) -> String {
         var s = raw
         // Strip the buildkit/buildah arg prefix like "|3 KEY=v ... /bin/sh -c ".
         if let range = s.range(of: "/bin/sh -c ") { s = String(s[range.upperBound...]) }
@@ -167,10 +168,15 @@ enum ContainerQueries {
     // MARK: helpers
 
     private static func jsonArray(_ engine: ContainerEngine, _ args: [String]) -> [[String: Any]]? {
-        guard let json = VMProbe.capture(engine.executable, args),
-              let data = json.data(using: .utf8) else { return nil }
+        guard let json = VMProbe.capture(engine.executable, args) else { return nil }
+        return parseJSONArray(json)
+    }
+
+    /// Parse `--format json` output: a JSON array, or JSONL (one object per
+    /// line — some podman/docker commands emit that). Internal for tests.
+    static func parseJSONArray(_ json: String) -> [[String: Any]]? {
+        guard let data = json.data(using: .utf8) else { return nil }
         if let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] { return arr }
-        // Some commands emit JSONL.
         var out: [[String: Any]] = []
         for line in json.split(whereSeparator: \.isNewline) {
             if let d = line.data(using: .utf8), let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
@@ -200,7 +206,8 @@ enum ContainerQueries {
 
     /// Parse a docker-style human size ("1.2GB", "512MB", "0B") to bytes. Decimal
     /// units, matching docker's own output. Returns 0 for anything unrecognised.
-    private static func parseHumanSize(_ raw: String) -> Int64 {
+    /// Internal (not private) so tests can pin it — it drives the Reclaim button.
+    static func parseHumanSize(_ raw: String) -> Int64 {
         let s = raw.trimmingCharacters(in: .whitespaces)
         let units: [(String, Double)] = [
             ("TB", 1e12), ("GB", 1e9), ("MB", 1e6), ("kB", 1e3), ("KB", 1e3), ("B", 1),

@@ -155,7 +155,8 @@ enum K8sQueries {
 
     private static func rawPath(_ node: String) -> String { "/api/v1/nodes/\(node)/proxy/stats/summary" }
 
-    private static func parseNodeUsage(_ raw: String) -> [String: Int64] {
+    /// Internal (not private) so tests can pin the kubelet stats shape.
+    static func parseNodeUsage(_ raw: String) -> [String: Int64] {
         guard let data = raw.data(using: .utf8),
               let summary = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let pods = summary["pods"] as? [[String: Any]] else { return [:] }
