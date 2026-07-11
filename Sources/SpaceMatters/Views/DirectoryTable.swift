@@ -83,6 +83,7 @@ struct DirectoryTable: NSViewRepresentable {
         weak var table: MacDirTableView?
         private(set) var rows: [ScanController.OutlineRow] = []
         private var rowIDs: [ScanController.RowID] = []
+        private var rowIndexByID: [ScanController.RowID: Int] = [:]
         /// Suppress delegate → controller pushes while *we* mutate the selection.
         private var applyingSelection = false
         private var hoveredRow = -1
@@ -106,6 +107,13 @@ struct DirectoryTable: NSViewRepresentable {
             let structureChanged = newIDs != rowIDs
             rows = newRows
             rowIDs = newIDs
+            if structureChanged {
+                // O(1) id→row projection for selection sync and reveal-scroll: a
+                // linear firstIndex per selected id turns ⌘A on a big list into
+                // O(N²) per update.
+                rowIndexByID = Dictionary(newIDs.enumerated().map { ($1, $0) },
+                                          uniquingKeysWith: { first, _ in first })
+            }
 
             applyingSelection = true
             if structureChanged {
@@ -132,7 +140,7 @@ struct DirectoryTable: NSViewRepresentable {
 
         private func applySelectionFromController() {
             guard let table else { return }
-            let want = IndexSet(controller.selectedRowIDs.compactMap { rowIDs.firstIndex(of: $0) })
+            let want = IndexSet(controller.selectedRowIDs.compactMap { rowIndexByID[$0] })
             if table.selectedRowIndexes != want {
                 table.selectRowIndexes(want, byExtendingSelection: false)
             }
@@ -140,7 +148,7 @@ struct DirectoryTable: NSViewRepresentable {
 
         private func scrollToRevealTargetIfNeeded() {
             guard let target = controller.revealTarget, let table else { return }
-            if let idx = rowIDs.firstIndex(of: .dir(ObjectIdentifier(target))) {
+            if let idx = rowIndexByID[.dir(ObjectIdentifier(target))] {
                 table.scrollRowToVisible(idx)
             }
             // Clear async to avoid mutating observable state during a view update.

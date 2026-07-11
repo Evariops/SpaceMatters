@@ -149,6 +149,10 @@ final class TreemapMetalRenderer {
         rpd.depthAttachment.loadAction = .clear
         rpd.depthAttachment.storeAction = .dontCare
         rpd.depthAttachment.clearDepth = 1
+        // The transient attachments may be larger than the drawable (grow-only
+        // allocation on non-memoryless GPUs): clamp the pass to the drawable.
+        rpd.renderTargetWidth = drawable.texture.width
+        rpd.renderTargetHeight = drawable.texture.height
 
         guard let cmd = queue.makeCommandBuffer(),
               let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else {
@@ -192,7 +196,20 @@ final class TreemapMetalRenderer {
 
     private func ensureAttachments(_ size: CGSize) {
         guard depthTexture == nil || attachmentSize != size else { return }
-        let w = max(1, Int(size.width)), h = max(1, Int(size.height))
+        var w = max(1, Int(size.width)), h = max(1, Int(size.height))
+        // Memoryless attachments (Apple Silicon TBDR) cost nothing to recreate.
+        // On `.private` (Intel/eGPU) they are real VRAM allocations, recreated
+        // twice per frame of a resize drag: round up to 256 px steps and never
+        // shrink, so a drag reallocates a handful of times instead; the render
+        // pass is clamped to the drawable via renderTargetWidth/Height.
+        if transientStorage == .private {
+            w = (w + 255) & ~255
+            h = (h + 255) & ~255
+            if let t = depthTexture, t.width >= w, t.height >= h {
+                attachmentSize = size
+                return
+            }
+        }
 
         let dd = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .depth32Float, width: w, height: h, mipmapped: false)

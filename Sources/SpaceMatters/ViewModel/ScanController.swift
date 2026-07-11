@@ -470,8 +470,10 @@ final class ScanController {
     @ObservationIgnored private var sortCacheMetric: SizeMetric = .physical
     /// Cached file listing per directory, tagged with the directory's direct-file
     /// count so it stays valid during a live scan and only re-enumerates the disk
-    /// when that directory's contents actually changed.
-    private struct FileListing { let count: Int64; let items: [FileItem] }
+    /// when that directory's contents actually changed. Items are kept sorted by
+    /// `metric` (tagged too): `visibleRows()` runs at 10 Hz during a scan and
+    /// must not re-sort every expanded folder's files on each evaluation.
+    private struct FileListing { let count: Int64; let metric: SizeMetric; let items: [FileItem] }
     @ObservationIgnored private var fileCache: [ObjectIdentifier: FileListing] = [:]
     /// Resolved paths for seed (root/volume) nodes, so any node's full path can be
     /// rebuilt on demand without storing a path on every node.
@@ -555,7 +557,13 @@ final class ScanController {
         // Valid as long as the folder's file count is unchanged — true across the
         // 10 Hz refresh during a scan (a folder's files are set once, atomically)
         // and forever after it.
-        if let cached = fileCache[key], cached.count == count { return cached.items }
+        if let cached = fileCache[key], cached.count == count {
+            if cached.metric == metric { return cached.items }
+            // Metric flipped: re-sort the cached listing, no disk I/O.
+            let resorted = cached.items.sorted { $0.size(metric) > $1.size(metric) }
+            fileCache[key] = FileListing(count: count, metric: metric, items: resorted)
+            return resorted
+        }
 
         var items: [FileItem] = []
         if count > 0, let dirPath = path(for: node) {
@@ -576,7 +584,8 @@ final class ScanController {
             items.sort { $0.physical > $1.physical }
             items.removeLast(items.count - Self.maxFilesPerFolder)
         }
-        fileCache[key] = FileListing(count: count, items: items)
+        items.sort { $0.size(metric) > $1.size(metric) }
+        fileCache[key] = FileListing(count: count, metric: metric, items: items)
         return items
     }
 
@@ -687,7 +696,7 @@ final class ScanController {
             guard isOpen else { return }
 
             let kids = sortedChildren(node)
-            let files = filesIn(node).sorted { $0.size(metric) > $1.size(metric) }
+            let files = filesIn(node) // pre-sorted by the current metric (cached)
             let childMax = max(kids.first?.size(metric) ?? 0, files.first?.size(metric) ?? 0, 1)
 
             // Merge folders + files by size, biggest first.
