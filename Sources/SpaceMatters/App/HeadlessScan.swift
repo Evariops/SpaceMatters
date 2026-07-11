@@ -80,16 +80,21 @@ enum HeadlessScan {
 
     /// Headless VM scan that prints rising counts as the stream arrives — proves
     /// the find-over-SSH backend updates progressively, not in one blocking call.
-    static func runVM(runtime: String, scope: String) {
+    /// Returns an exit code (0 ok, 1 failure) so scripts can rely on it.
+    @discardableResult
+    static func runVM(runtime: String, scope: String) -> Int32 {
         let machines = VMProbe.detect()
         print("detected VMs:")
         for m in machines {
             print("  \(m.runtime.rawValue) \(m.name) — \(m.running ? "running" : "stopped"), disk \(Format.bytes(m.diskBytes))")
         }
         guard let machine = machines.first(where: { $0.runtime.rawValue.lowercased() == runtime.lowercased() }) else {
-            print("no \(runtime) machine found"); return
+            FileHandle.standardError.write(Data("error: no \(runtime) machine found\n".utf8)); return 1
         }
-        guard machine.running else { print("\(machine.runtime.rawValue) is not running — cannot scan"); return }
+        guard machine.running else {
+            FileHandle.standardError.write(Data("error: \(machine.runtime.rawValue) is not running — cannot scan\n".utf8))
+            return 1
+        }
 
         let vmScope: VMScope = (scope.lowercased() == "containers") ? .containers : .full
         let cmd = VMProbe.scanCommand(machine: machine, scope: vmScope)
@@ -122,10 +127,18 @@ enum HeadlessScan {
         for row in scanner.snapshotExtensions(metric: .physical, limit: 6) {
             print("  \(row.name): \(Format.bytes(row.physical)) (\(Format.count(row.count)) files)")
         }
+        if let failure = scanner.failure {
+            FileHandle.standardError.write(Data("error: \(failure)\n".utf8))
+            return 1
+        }
+        return 0
     }
 
-    static func runContainers() {
-        guard let engine = ContainerProbe.detect().first else { print("no reachable container engine"); return }
+    @discardableResult
+    static func runContainers() -> Int32 {
+        guard let engine = ContainerProbe.detect().first else {
+            FileHandle.standardError.write(Data("error: no reachable container engine\n".utf8)); return 1
+        }
         print("engine: \(engine.displayName) (\(engine.executable))")
         let snap = ContainerQueries.fetchAll(engine)
         print("df:")
@@ -143,13 +156,15 @@ enum HeadlessScan {
             }
         }
         print("containers: \(snap.containers.count), volumes: \(snap.volumes.count)")
+        return 0
     }
 
-    static func runK8s(context: String?) {
+    @discardableResult
+    static func runK8s(context: String?) -> Int32 {
         let contexts = K8sProbe.contexts()
         print("contexts: \(contexts.map { $0.isCurrent ? "\($0.name)*" : $0.name }.joined(separator: ", "))")
         guard let ctx = context ?? contexts.first(where: \.isCurrent)?.name ?? contexts.first?.name else {
-            print("no kube context"); return
+            FileHandle.standardError.write(Data("error: no kube context\n".utf8)); return 1
         }
         print("analyzing context: \(ctx)")
         var pvcs = K8sQueries.pvcs(context: ctx)
@@ -170,6 +185,7 @@ enum HeadlessScan {
         }
         let reclaimable = pvs.filter(\.reclaimable)
         print("PVs: \(pvs.count)  reclaimable=\(reclaimable.count) (\(Format.bytes(reclaimable.reduce(0) { $0 + $1.capacity })))")
+        return 0
     }
 
     static func listVolumes() {

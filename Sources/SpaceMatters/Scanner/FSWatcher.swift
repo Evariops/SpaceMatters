@@ -21,10 +21,24 @@ final class FSWatcher {
 
     func start() {
         guard stream == nil, !paths.isEmpty else { return }
+        // retain/release make the *stream* keep the watcher alive: without them
+        // a callback in flight on the private queue races `stop()` + the last
+        // release on the main thread, and `takeUnretainedValue` dereferences a
+        // freed object. With them, FSEvents holds its own +1 until the stream
+        // is destroyed, after any pending callback.
         var ctx = FSEventStreamContext(
             version: 0,
             info: Unmanaged.passUnretained(self).toOpaque(),
-            retain: nil, release: nil, copyDescription: nil
+            retain: { info in
+                guard let info else { return nil }
+                _ = Unmanaged<FSWatcher>.fromOpaque(info).retain()
+                return info
+            },
+            release: { info in
+                guard let info else { return }
+                Unmanaged<FSWatcher>.fromOpaque(info).release()
+            },
+            copyDescription: nil
         )
         let flags = UInt32(kFSEventStreamCreateFlagUseCFTypes | kFSEventStreamCreateFlagNoDefer)
         guard let stream = FSEventStreamCreate(

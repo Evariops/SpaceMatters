@@ -44,6 +44,9 @@ final class CleanupController {
     }
 
     func load() {
+        // The model guards itself (same philosophy as DeletionGuardTests): a
+        // reload during a clean would reset rows/state under the operation.
+        guard state != .cleaning else { return }
         loadID += 1
         let id = loadID
         lastFreed = 0
@@ -117,6 +120,7 @@ final class CleanupController {
     func cleanSelected() async {
         guard state == .ready, !selectedRows.isEmpty else { return }
         state = .cleaning
+        let id = loadID
         let before = totalSelected
         let targets = selectedRows.map(\.item)
         let root = allowedRoot
@@ -130,9 +134,11 @@ final class CleanupController {
             let measure = await Task.detached(priority: .userInitiated) {
                 CleanupEngine.size(of: item)
             }.value
+            guard id == loadID else { return } // mode left/re-entered mid-clean
             apply(measure, to: item.id)
         }
 
+        guard id == loadID else { return } // don't stamp a newer session's state
         lastFailures = failures
         lastFreed = max(0, before - totalSelected)
         for idx in rows.indices { rows[idx].selected = false }

@@ -6,28 +6,32 @@ import AppKit
 @main
 enum Entry {
     static func main() {
+        // Headless subcommands exit with a real status code (0 ok, 1 failure,
+        // 2 usage) so scripts can tell a broken run from a clean one — and a
+        // subcommand missing its argument prints usage instead of silently
+        // falling through to the GUI.
         let args = CommandLine.arguments
         if args.contains("--volumes") {
             HeadlessScan.listVolumes()
-            return
+            exit(0)
         }
         if args.contains("--containers") {
-            HeadlessScan.runContainers()
-            return
+            exit(HeadlessScan.runContainers())
         }
         if let idx = args.firstIndex(of: "--k8s") {
             let ctx = idx + 1 < args.count ? args[idx + 1] : nil
-            HeadlessScan.runK8s(context: ctx)
-            return
+            exit(HeadlessScan.runK8s(context: ctx))
         }
-        if let idx = args.firstIndex(of: "--vm-scan"), idx + 1 < args.count {
-            let runtime = args[idx + 1]
+        if let idx = args.firstIndex(of: "--vm-scan") {
+            guard idx + 1 < args.count else {
+                print("usage: SpaceMatters --vm-scan <podman|colima> [full|containers]")
+                exit(2)
+            }
             let scope = idx + 2 < args.count ? args[idx + 2] : "full"
-            HeadlessScan.runVM(runtime: runtime, scope: scope)
-            return
+            exit(HeadlessScan.runVM(runtime: args[idx + 1], scope: scope))
         }
-        if let idx = args.firstIndex(of: "--scan"), idx + 1 < args.count {
-            exit(HeadlessScan.run(paths: Array(args[(idx + 1)...])))
+        if let idx = args.firstIndex(of: "--scan") {
+            exit(HeadlessScan.run(paths: Array(args[(idx + 1)...]))) // empty → usage, exit 2
         }
         SpaceMattersApp.main()
     }

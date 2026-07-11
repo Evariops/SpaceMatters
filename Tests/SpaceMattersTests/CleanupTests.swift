@@ -72,6 +72,48 @@ import Foundation
         #expect(try FileManager.default.contentsOfDirectory(atPath: cache.path).isEmpty)
     }
 
+    /// A symlinked *intermediate* component (`~/.gradle` → an external volume)
+    /// passes the textual prefix check but resolves outside the fence — the
+    /// clean must refuse it, leaving the relocated cache untouched.
+    @Test func cleanRefusesSymlinkedIntermediateComponent() throws {
+        let fm = FileManager.default
+        let base = fm.temporaryDirectory.appendingPathComponent("sm-fence-\(UUID().uuidString)")
+        let home = base.appendingPathComponent("home")
+        let external = base.appendingPathComponent("external/gradle")
+        try fm.createDirectory(at: home, withIntermediateDirectories: true)
+        try fm.createDirectory(at: external.appendingPathComponent("caches"), withIntermediateDirectories: true)
+        try Data(count: 4096).write(to: external.appendingPathComponent("caches/keep.bin"))
+        // home/.gradle → external/gradle : the catalog path home/.gradle/caches
+        // starts with the fence but really lives outside it.
+        try fm.createSymbolicLink(at: home.appendingPathComponent(".gradle"), withDestinationURL: external)
+        defer { try? fm.removeItem(at: base) }
+
+        let target = home.appendingPathComponent(".gradle/caches").path
+        let result = CleanupEngine.clean(Self.cleanable([target]), allowedRoot: home.path)
+
+        #expect(result.refused == 1 && result.removed == 0)
+        #expect(fm.fileExists(atPath: external.appendingPathComponent("caches/keep.bin").path))
+    }
+
+    /// A `..` in the path also defeats the prefix check textually; the resolved
+    /// form escapes the fence and must be refused.
+    @Test func cleanRefusesDotDotEscape() throws {
+        let fm = FileManager.default
+        let base = fm.temporaryDirectory.appendingPathComponent("sm-dotdot-\(UUID().uuidString)")
+        let home = base.appendingPathComponent("home")
+        let outside = base.appendingPathComponent("outside")
+        try fm.createDirectory(at: home, withIntermediateDirectories: true)
+        try fm.createDirectory(at: outside, withIntermediateDirectories: true)
+        try Data(count: 4096).write(to: outside.appendingPathComponent("keep.bin"))
+        defer { try? fm.removeItem(at: base) }
+
+        let sneaky = home.path + "/../outside"
+        let result = CleanupEngine.clean(Self.cleanable([sneaky]), allowedRoot: home.path)
+
+        #expect(result.refused == 1 && result.removed == 0)
+        #expect(fm.fileExists(atPath: outside.appendingPathComponent("keep.bin").path))
+    }
+
     /// A symlink placed inside a cache must be removed as a link — its target,
     /// outside the cache, survives.
     @Test func cleanNeverFollowsSymlinks() throws {

@@ -97,12 +97,15 @@ struct ExtStat {
         count += other.count
     }
 
-    /// Remove a subtree's contribution after it's been deleted (A6).
+    /// Remove a subtree's contribution after it's been deleted (A6). Clamped at
+    /// zero: in exact counting mode the deletion walk counts every hardlink at
+    /// full size while the scan booked later sightings as 0 bytes, so the delta
+    /// can exceed what was ever added — the panel must never show negatives.
     @inline(__always)
     mutating func subtract(_ other: ExtStat) {
-        logical -= other.logical
-        physical -= other.physical
-        count -= other.count
+        logical = max(0, logical - other.logical)
+        physical = max(0, physical - other.physical)
+        count = max(0, count - other.count)
     }
 
     var isEmpty: Bool { logical <= 0 && physical <= 0 && count <= 0 }

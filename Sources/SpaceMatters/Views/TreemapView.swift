@@ -15,7 +15,10 @@ import QuartzCore
 struct TreemapView: View {
     @Bindable var controller: ScanController
     @Environment(\.theme) private var theme
-    @State private var hover: HoverInfo?
+    /// Hover lives in its own observable box so a mouse move only re-evaluates
+    /// the pill overlay — not this whole body (which would re-diff the
+    /// representable's inputs and recompute the a11y summary per event).
+    @State private var hoverModel = HoverModel()
 
     var body: some View {
         // Reading these establishes SwiftUI observation: when any changes, `body`
@@ -32,13 +35,10 @@ struct TreemapView: View {
             searchMatchIDs: controller.searchMatchIDs,
             highlightVersion: controller.highlightVersion,
             isDark: theme.isDark,
-            onHover: { hover = $0 }
+            onHover: { [hoverModel] in hoverModel.info = $0 }
         )
         .overlay(alignment: .bottomLeading) {
-            if let hover {
-                HoverLabel(title: hover.title, isDirectory: hover.isDirectory, sizeText: hover.sizeText)
-                    .padding(8).allowsHitTesting(false)
-            }
+            HoverPill(model: hoverModel)
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Treemap")
@@ -64,6 +64,23 @@ struct HoverInfo: Equatable {
     let title: String
     let isDirectory: Bool
     let sizeText: String
+}
+
+/// Isolates the hover state (see `TreemapView.hoverModel`).
+@MainActor @Observable
+final class HoverModel {
+    var info: HoverInfo?
+}
+
+/// The only view that observes `HoverModel.info` — mouse moves invalidate it alone.
+private struct HoverPill: View {
+    let model: HoverModel
+    var body: some View {
+        if let hover = model.info {
+            HoverLabel(title: hover.title, isDirectory: hover.isDirectory, sizeText: hover.sizeText)
+                .padding(8).allowsHitTesting(false)
+        }
+    }
 }
 
 /// Bridges the AppKit `TreemapNSView` into SwiftUI. `updateNSView` pushes the
@@ -187,7 +204,10 @@ final class TreemapNSView: NSView, CALayerDelegate {
             ml.pixelFormat = .bgra8Unorm            // non-sRGB: store sRGB values as-is → matches CG
             ml.framebufferOnly = true
             ml.isOpaque = true
-            ml.presentsWithTransaction = true       // atomic present with bounds during live-resize
+            // `presentsWithTransaction` is turned on only while resizing (see
+            // viewWillStartLiveResize / setFrameSize): the synchronous commit +
+            // waitUntilScheduled it implies must not tax every ordinary frame.
+            ml.presentsWithTransaction = false
             ml.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
             self.renderer = renderer
             self.metalLayer = ml
@@ -259,20 +279,30 @@ final class TreemapNSView: NSView, CALayerDelegate {
         overlayLayer.setNeedsDisplay()
     }
 
-    // Fallback (no-GPU) path only: CPU rasterisation of the big solid tiles at 2× retina
-    // is the resize bottleneck, so during a live drag we fill ¼ the pixels (1× backing)
-    // and re-render crisp when it ends. Metal renders full-res cheaply — it skips this.
+    // Metal path: synchronous presents (`presentsWithTransaction`) only while the
+    // window is actually being resized — they keep the drawable atomic with the
+    // bounds, but block the main thread until the GPU schedules, which is too
+    // expensive to pay on every ordinary frame (zoom animation at 120 Hz, scan
+    // ticks). Fallback (no-GPU) path: CPU rasterisation of the big solid tiles at
+    // 2× retina is the resize bottleneck, so during a live drag we fill ¼ the
+    // pixels (1× backing) and re-render crisp when it ends.
     override func viewWillStartLiveResize() {
         super.viewWillStartLiveResize()
-        guard renderer == nil else { return }
-        tileLayer.contentsScale = 1
-        overlayLayer.contentsScale = 1
+        if let metalLayer {
+            metalLayer.presentsWithTransaction = true
+        } else {
+            tileLayer.contentsScale = 1
+            overlayLayer.contentsScale = 1
+        }
     }
 
     override func viewDidEndLiveResize() {
         super.viewDidEndLiveResize()
-        guard renderer == nil else { return }
-        setScale(window?.backingScaleFactor ?? 2)
+        if let metalLayer {
+            metalLayer.presentsWithTransaction = false
+        } else {
+            setScale(window?.backingScaleFactor ?? 2)
+        }
     }
 
     // MARK: SwiftUI → view
@@ -282,6 +312,7 @@ final class TreemapNSView: NSView, CALayerDelegate {
                searchMatchIDs: Set<ObjectIdentifier>, highlightVersion: Int) {
         self.controller = controller
         let oldZoomRoot = self.zoomRoot   // capture before the assignment below (for zoom animation)
+        let oldMetric = self.metric
 
         let themeChanged = isDark != theme.isDark
         self.theme = theme
@@ -309,6 +340,12 @@ final class TreemapNSView: NSView, CALayerDelegate {
                renderer != nil, zoomLink == nil, !inLiveResize, !instances.isEmpty,
                startZoomAnimation(from: oldRoot, to: newRoot) {
                 overlayLayer.setNeedsDisplay()
+            } else if zoomLink != nil, zoomRoot === oldZoomRoot, metric == oldMetric, !themeChanged {
+                // Version-only bump (the 10 Hz scan tick, an FSEvents dirty-dot
+                // repaint) while the camera animates: defer the relayout to the
+                // end of the animation instead of cancelling it — otherwise the
+                // push-in can never complete during a live scan.
+                pendingRelayout = true
             } else {
                 if zoomLink != nil { cancelZoom() }
                 relayout()
@@ -348,11 +385,19 @@ final class TreemapNSView: NSView, CALayerDelegate {
         let changed = newSize != frame.size
         super.setFrameSize(newSize)
         guard changed else { return }
+        // A resize mid-zoom (split-divider drag — not a window live-resize) would
+        // render the old layout's camera over the new layout: fast-forward to the
+        // end state first, then lay out at the new size below.
+        if zoomLink != nil { finishZoom() }
         overlayLayer.frame = bounds
         if let metalLayer {
             // Backing-layer frame is managed by AppKit; we only resize the drawable + redraw.
             let scale = window?.backingScaleFactor ?? 2
             metalLayer.drawableSize = CGSize(width: bounds.width * scale, height: bounds.height * scale)
+            // This frame's present must stay atomic with the bounds change (no
+            // band behind a split-divider drag); reverted below unless a window
+            // live-resize keeps the synchronous path on.
+            metalLayer.presentsWithTransaction = true
         } else {
             tileLayer.frame = bounds
         }
@@ -362,11 +407,13 @@ final class TreemapNSView: NSView, CALayerDelegate {
         relayout()
         presentTiles()
         overlayLayer.setNeedsDisplay()
+        if let metalLayer, !inLiveResize { metalLayer.presentsWithTransaction = false }
     }
 
     // MARK: Layout (size-dependent placement + colours)
 
     private func relayout() {
+        pendingRelayout = false   // any relayout consumes a deferred one
         hovered = nil
         guard let controller, let zoomRoot, bounds.width > 1, bounds.height > 1 else {
             tiles = []; colors.removeAll(keepingCapacity: true); instances.removeAll(keepingCapacity: true)
@@ -647,11 +694,15 @@ final class TreemapNSView: NSView, CALayerDelegate {
 
     /// The topmost tile at `point` (a mouse location in view coordinates). Mouse
     /// coordinates arrive bottom-left; the tiles are stored top-left (matching the
-    /// layout), so flip Y before hit-testing. Named to avoid clashing with
-    /// `NSView.hitTest(_:)`.
+    /// layout), so flip Y before hit-testing. Sub-pixel tiles are skipped with the
+    /// same 0.5 pt threshold as the renderers — hover/click/menu must never land
+    /// on a tile the user can't see. Named to avoid clashing with `NSView.hitTest(_:)`.
     private func tileAt(_ point: CGPoint) -> TreemapTile? {
         let p = CGPoint(x: point.x, y: bounds.height - point.y)
-        for tile in tiles.reversed() where tile.rect.contains(p) { return tile }
+        for tile in tiles.reversed()
+        where tile.rect.width > 0.5 && tile.rect.height > 0.5 && tile.rect.contains(p) {
+            return tile
+        }
         return nil
     }
 
@@ -717,6 +768,9 @@ final class TreemapNSView: NSView, CALayerDelegate {
     private var zoomStart: CFTimeInterval = -1
     private var zoomViewport: CGRect?              // nil = full-bounds camera (no animation)
     private var zoomOnDone: (() -> Void)?
+    /// A version bump arrived mid-animation; the relayout it asked for runs when
+    /// the camera lands (consumed by `relayout()`).
+    private var pendingRelayout = false
     private static let zoomDuration: CFTimeInterval = 0.5
 
     /// Route a zoom navigation (from *any* entry point — treemap double-click, the left
@@ -799,6 +853,11 @@ final class TreemapNSView: NSView, CALayerDelegate {
         let done = zoomOnDone
         zoomOnDone = nil
         done?()                             // commit the zoom → apply → relayout → full-view present
+        if pendingRelayout {                // deferred scan-tick relayout (zoom-out path doesn't relayout)
+            relayout()
+            presentTiles()
+            overlayLayer.setNeedsDisplay()
+        }
     }
 
     /// Cancel a zoom without committing it (e.g. the view leaves its window mid-animation),

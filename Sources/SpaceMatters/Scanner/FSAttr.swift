@@ -10,6 +10,7 @@ enum FSAttr {
     // Common attribute bits (sys/attr.h)
     static let cmnReturnedAttrs: UInt32 = 0x8000_0000
     static let cmnName: UInt32          = 0x0000_0001
+    static let cmnDevID: UInt32         = 0x0000_0002 // dev_t, exact mode (inode dedup key)
     static let cmnObjType: UInt32       = 0x0000_0008
     static let cmnFileID: UInt32        = 0x0200_0000 // inode number (u_int64), exact mode
     static let cmnError: UInt32         = 0x2000_0000
@@ -44,6 +45,11 @@ struct BulkEntry {
     /// Inode number — only populated when the enumerator is `hardlinkAware`
     /// (exact counting mode); `0` otherwise.
     let fileID: UInt64
+    /// Device id of the filesystem holding the entry — `0` unless
+    /// `hardlinkAware`. Inode numbers are only unique per filesystem, so the
+    /// dedup key must be `(deviceID, fileID)`: a multi-volume scan (or `/`,
+    /// which spans the System and Data volumes) would otherwise collide.
+    let deviceID: UInt32
     /// Hardlink count — `0` unless `hardlinkAware`. `> 1` marks a file whose
     /// blocks are shared by several directory entries (dedup candidate).
     let linkCount: UInt32
@@ -69,7 +75,7 @@ func enumerateDirectory(
     // Requested only then, so the default (attribution) path packs an identical
     // buffer to before — the reads below are gated on the returned-attr masks.
     if hardlinkAware {
-        attrList.commonattr |= FSAttr.cmnFileID
+        attrList.commonattr |= FSAttr.cmnDevID | FSAttr.cmnFileID
         attrList.fileattr |= FSAttr.fileLinkCount
     }
 
@@ -118,6 +124,13 @@ func enumerateDirectory(
                     nameLen = Int(rawLen) - 1 // strip trailing NUL
                 }
                 off += 8
+            }
+
+            // ATTR_CMN_DEVID (0x02) packs between NAME (0x01) and OBJTYPE (0x08).
+            var deviceID: UInt32 = 0
+            if commonReturned & FSAttr.cmnDevID != 0 {
+                deviceID = entry.loadUnaligned(fromByteOffset: off, as: UInt32.self)
+                off += 4
             }
 
             var objType: UInt32 = 0
@@ -174,6 +187,7 @@ func enumerateDirectory(
                     logicalSize: logical,
                     physicalSize: physical,
                     fileID: fileID,
+                    deviceID: deviceID,
                     linkCount: linkCount
                 ))
             }

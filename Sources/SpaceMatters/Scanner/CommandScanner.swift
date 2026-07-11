@@ -62,7 +62,6 @@ final class CommandScanner: ScanBackend {
         let errPipe = Pipe()
         process.standardOutput = outPipe
         process.standardError = errPipe
-        self.process = process
 
         let thread = Thread { [weak self] in
             self?.readLoop(outPipe.fileHandleForReading, errHandle: errPipe.fileHandleForReading, process: process)
@@ -79,12 +78,22 @@ final class CommandScanner: ScanBackend {
             markFinished()
             return
         }
+        // Published only once launched: `terminate()` on a never-launched
+        // Process raises NSInvalidArgumentException, and `cancel()` can arrive
+        // at any time (Home after a failed start).
+        self.process = process
+        if cancelledFlag.load(ordering: .relaxed) { cancel(); return }
         thread.start()
     }
 
     func cancel() {
         cancelledFlag.store(true, ordering: .relaxed)
-        process?.terminate() // closes stdout → the reader loop sees EOF and stops
+        // Kill the whole tree: the executable is often a wrapper (podman,
+        // colima) whose `ssh` child would otherwise survive, hold the pipes'
+        // write ends open, and leave the reader threads blocked for good.
+        if let p = process, p.isRunning {
+            ProcessTree.signal(p.processIdentifier, SIGTERM)
+        }
         markFinished()
     }
 
@@ -179,9 +188,19 @@ final class CommandScanner: ScanBackend {
         guard t1 >= 1, t2 > t1, t3 > t2, t3 + 1 < bytes.count else { return }
 
         let type = bytes[0]
-        let blocks = asciiInt(bytes, t1 + 1, t2)
-        let logical = asciiInt(bytes, t2 + 1, t3)
-        let physical = blocks * 512
+        // Reject records whose numbers overflow instead of injecting garbage
+        // sizes into the tree (under -Ounchecked the trap would become a
+        // silent wraparound). The remote stream is not trusted input.
+        guard let blocks = asciiInt(bytes, t1 + 1, t2),
+              let logical = asciiInt(bytes, t2 + 1, t3) else {
+            errAtomic.wrappingAdd(1, ordering: .relaxed)
+            return
+        }
+        let (physical, overflow) = blocks.multipliedReportingOverflow(by: 512)
+        guard !overflow else {
+            errAtomic.wrappingAdd(1, ordering: .relaxed)
+            return
+        }
         let path = String(decoding: bytes[(t3 + 1)...], as: UTF8.self)
 
         if type == 0x64 { // 'd' directory
@@ -237,12 +256,19 @@ final class CommandScanner: ScanBackend {
         accParent = nil; accLogical = 0; accPhysical = 0; accCount = 0
     }
 
-    private func asciiInt(_ b: [UInt8], _ lo: Int, _ hi: Int) -> Int64 {
+    /// `nil` on Int64 overflow (≥ 20 digits) — the caller drops the record.
+    private func asciiInt(_ b: [UInt8], _ lo: Int, _ hi: Int) -> Int64? {
         var value: Int64 = 0
         var i = lo
         while i < hi {
             let c = b[i]
-            if c >= 0x30 && c <= 0x39 { value = value * 10 + Int64(c - 0x30) }
+            if c >= 0x30 && c <= 0x39 {
+                let (m, mo) = value.multipliedReportingOverflow(by: 10)
+                if mo { return nil }
+                let (a, ao) = m.addingReportingOverflow(Int64(c - 0x30))
+                if ao { return nil }
+                value = a
+            }
             i += 1
         }
         return value

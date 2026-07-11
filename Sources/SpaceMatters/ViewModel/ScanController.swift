@@ -119,6 +119,53 @@ final class ScanController {
 
     private var scanner: (any ScanBackend)?
 
+    // MARK: Structural integrity
+
+    /// Monotonic tree generation, bumped whenever the tree is replaced or torn
+    /// down (`startBackend`, `goHome`). Structural operations (`remove`,
+    /// `invalidate`) capture it before suspending and re-check it after every
+    /// `await`: if it moved, the tree they were operating on is gone — abort
+    /// without touching the one that replaced it.
+    @ObservationIgnored private var treeEpoch: UInt64 = 0
+    /// True while a `remove`/`invalidate` is suspended mid-flight. Structural
+    /// operations are mutually exclusive — concurrent tree surgery would
+    /// subtract aggregates out from under each other. Mass-delete (⌘⌫) awaits
+    /// each removal sequentially, so this never turns it away.
+    @ObservationIgnored private var structuralOpActive = false
+    /// True from Stop until the cancelled scanner's workers have actually
+    /// exited. The cancel is cooperative — workers finish their current
+    /// directory first — so until then they still mutate the tree and
+    /// structural operations must stay refused.
+    @ObservationIgnored private var drainingCancelledScan = false
+    /// The sub-scanner of an in-flight `invalidate`, so a Rescan/Home can
+    /// cancel it instead of letting it keep re-scanning a subtree nobody
+    /// displays anymore.
+    @ObservationIgnored private var activeSubScan: DirectoryScanner?
+
+    /// Keep an outgoing tree and its scanner alive until the workers have
+    /// exited, then let both go on a background thread. Workers propagate sizes
+    /// up `unowned` parent chains, so freeing the old tree from under them
+    /// would trap; releasing off-main also spares the UI the deallocation of a
+    /// multi-million-node tree.
+    private func releaseAfterDrain(scanner: (any ScanBackend)?, root: FSNode?) {
+        guard scanner != nil || root != nil else { return }
+        Task.detached(priority: .utility) {
+            if let ds = scanner as? DirectoryScanner { ds.waitUntilFinished() }
+            withExtendedLifetime(root) {}
+            withExtendedLifetime(scanner) {}
+        }
+    }
+
+    /// Strong references to a node's ancestor chain. `parent` links are
+    /// `unowned`; a structural operation holds this across its suspensions so a
+    /// concurrent Rescan/Home can never free the ancestors it walks on resume.
+    private static func retainedAncestors(of node: FSNode) -> [FSNode] {
+        var chain: [FSNode] = []
+        var p = node.parent
+        while let n = p { chain.append(n); p = n.parent }
+        return chain
+    }
+
     // MARK: Live disk watching (SPEC-04)
 
     /// True once the disk has changed *enough* under the scanned tree to be worth
@@ -230,7 +277,14 @@ final class ScanController {
 
     /// Scan inside a Podman/Colima VM (streamed `find` over SSH).
     func scanVM(machine: VMMachine, scope: VMScope) {
-        guard machine.running else { return }
+        guard machine.running else {
+            // The route already switched to the result view: a silent return
+            // would show an unexplained empty screen if the VM stopped between
+            // detection and the click.
+            failureMessage = "\(machine.runtime.rawValue) “\(machine.name)” is not running — start it and scan again."
+            phase = .failed
+            return
+        }
         lastVolumes = []
         lastVM = (machine, scope)
         let cmd = VMProbe.scanCommand(machine: machine, scope: scope)
@@ -275,7 +329,17 @@ final class ScanController {
         isHost: Bool,
         nodePaths: [ObjectIdentifier: String]
     ) {
+        // The old tree is being replaced: abort in-flight structural operations
+        // (they re-check the epoch after each await), stop a sub-scan that would
+        // otherwise keep re-scanning an orphaned subtree, and keep the outgoing
+        // tree alive until its workers have exited.
+        treeEpoch &+= 1
+        activeSubScan?.cancel()
+        let oldScanner = self.scanner
+        let oldRoot = self.root
         cancel()
+        drainingCancelledScan = false // the new tree isn't the one draining
+        releaseAfterDrain(scanner: oldScanner, root: oldRoot)
 
         self.root = root
         self.zoomRoot = root
@@ -293,6 +357,7 @@ final class ScanController {
 
         sortCache.removeAll()
         fileCache.removeAll()
+        layoutCache = TreemapLayout.Cache() // its entries retain old-tree nodes
         self.nodePaths = nodePaths
         stopWatching()
         self.watchPaths = isHost ? Array(nodePaths.values) : []
@@ -315,6 +380,16 @@ final class ScanController {
         phase = .cancelled
         refresh(final: true)
         stopTimer()
+        // The cancel is cooperative: workers finish their current directory
+        // before exiting. Keep structural ops refused until they all have.
+        if let ds = scanner as? DirectoryScanner, !ds.isDrained {
+            drainingCancelledScan = true
+            let epoch = treeEpoch
+            Task { @MainActor [weak self] in
+                await Task.detached(priority: .userInitiated) { ds.waitUntilFinished() }.value
+                if let self, self.treeEpoch == epoch { self.drainingCancelledScan = false }
+            }
+        }
     }
 
     func rescan() {
@@ -326,7 +401,11 @@ final class ScanController {
 
     /// Discard the current scan and return to the disk-selection splash.
     func goHome() {
-        scanner?.cancel()
+        treeEpoch &+= 1
+        activeSubScan?.cancel()
+        let oldScanner = scanner
+        let oldRoot = root
+        oldScanner?.cancel()
         stopTimer()
         stopWatching()
         scanDate = nil
@@ -349,6 +428,9 @@ final class ScanController {
         totalLogical = 0; totalPhysical = 0; fileCount = 0; dirCount = 0; errorCount = 0
         filesPerSecond = 0; elapsed = 0; extRows = []
         sortCache.removeAll(); fileCache.removeAll(); nodePaths.removeAll()
+        layoutCache = TreemapLayout.Cache() // don't retain the whole old tree on the splash
+        drainingCancelledScan = false
+        releaseAfterDrain(scanner: oldScanner, root: oldRoot)
         bump()
     }
 
@@ -395,9 +477,14 @@ final class ScanController {
     @ObservationIgnored private var sortCacheMetric: SizeMetric = .physical
     /// Cached file listing per directory, tagged with the directory's direct-file
     /// count so it stays valid during a live scan and only re-enumerates the disk
-    /// when that directory's contents actually changed.
-    private struct FileListing { let count: Int64; let items: [FileItem] }
+    /// when that directory's contents actually changed. Items are kept sorted by
+    /// `metric` (tagged too): `visibleRows()` runs at 10 Hz during a scan and
+    /// must not re-sort every expanded folder's files on each evaluation.
+    private struct FileListing { let count: Int64; let metric: SizeMetric; let items: [FileItem] }
     @ObservationIgnored private var fileCache: [ObjectIdentifier: FileListing] = [:]
+    /// Directories whose file listing is being enumerated off-main right now
+    /// (prevents duplicate walks while `visibleRows()` polls at 10 Hz).
+    @ObservationIgnored private var fileListingsInFlight: Set<ObjectIdentifier> = []
     /// Resolved paths for seed (root/volume) nodes, so any node's full path can be
     /// rebuilt on demand without storing a path on every node.
     @ObservationIgnored private var nodePaths: [ObjectIdentifier: String] = [:]
@@ -480,28 +567,56 @@ final class ScanController {
         // Valid as long as the folder's file count is unchanged — true across the
         // 10 Hz refresh during a scan (a folder's files are set once, atomically)
         // and forever after it.
-        if let cached = fileCache[key], cached.count == count { return cached.items }
+        if let cached = fileCache[key], cached.count == count {
+            if cached.metric == metric { return cached.items }
+            // Metric flipped: re-sort the cached listing, no disk I/O.
+            let resorted = cached.items.sorted { $0.size(metric) > $1.size(metric) }
+            fileCache[key] = FileListing(count: count, metric: metric, items: resorted)
+            return resorted
+        }
 
-        var items: [FileItem] = []
-        if count > 0, let dirPath = path(for: node) {
-            let fd = open(dirPath, O_RDONLY | O_DIRECTORY)
-            if fd >= 0 {
-                let bufSize = 64 * 1024
-                let buf = UnsafeMutableRawPointer.allocate(byteCount: bufSize, alignment: 16)
-                enumerateDirectory(fd: fd, buffer: buf, bufferSize: bufSize) { entry in
-                    guard !entry.isDirectory else { return }
-                    let name = String(decoding: UnsafeRawBufferPointer(start: entry.name, count: entry.nameLength), as: UTF8.self)
-                    items.append(FileItem(name: name, logical: entry.logicalSize, physical: entry.physicalSize))
-                }
-                buf.deallocate()
-                close(fd)
+        // Cache miss: enumerate off the main actor — a 100k-file folder or a slow
+        // network volume must not beach-ball the UI — and repaint when it lands.
+        // Callers get an empty placeholder for the frame or two it takes.
+        guard count > 0, let dirPath = path(for: node) else {
+            fileCache[key] = FileListing(count: count, metric: metric, items: [])
+            return []
+        }
+        guard !fileListingsInFlight.contains(key) else { return [] }
+        fileListingsInFlight.insert(key)
+        let epoch = treeEpoch
+        let m = metric
+        Task { @MainActor in
+            var items = await Task.detached(priority: .userInitiated) {
+                Self.enumerateFiles(dirPath: dirPath)
+            }.value
+            self.fileListingsInFlight.remove(key)
+            guard epoch == self.treeEpoch else { return }
+            if items.count > Self.maxFilesPerFolder {
+                items.sort { $0.physical > $1.physical }
+                items.removeLast(items.count - Self.maxFilesPerFolder)
             }
+            items.sort { $0.size(m) > $1.size(m) }
+            self.fileCache[key] = FileListing(count: node.directFileCount, metric: m, items: items)
+            self.bump()
         }
-        if items.count > Self.maxFilesPerFolder {
-            items.sort { $0.physical > $1.physical }
-            items.removeLast(items.count - Self.maxFilesPerFolder)
+        return []
+    }
+
+    /// Blocking directory read behind `filesIn` — runs on a detached task.
+    nonisolated private static func enumerateFiles(dirPath: String) -> [FileItem] {
+        var items: [FileItem] = []
+        let fd = open(dirPath, O_RDONLY | O_DIRECTORY)
+        guard fd >= 0 else { return items }
+        let bufSize = 64 * 1024
+        let buf = UnsafeMutableRawPointer.allocate(byteCount: bufSize, alignment: 16)
+        enumerateDirectory(fd: fd, buffer: buf, bufferSize: bufSize) { entry in
+            guard !entry.isDirectory else { return }
+            let name = String(decoding: UnsafeRawBufferPointer(start: entry.name, count: entry.nameLength), as: UTF8.self)
+            items.append(FileItem(name: name, logical: entry.logicalSize, physical: entry.physicalSize))
         }
-        fileCache[key] = FileListing(count: count, items: items)
+        buf.deallocate()
+        close(fd)
         return items
     }
 
@@ -612,7 +727,7 @@ final class ScanController {
             guard isOpen else { return }
 
             let kids = sortedChildren(node)
-            let files = filesIn(node).sorted { $0.size(metric) > $1.size(metric) }
+            let files = filesIn(node) // pre-sorted by the current metric (cached)
             let childMax = max(kids.first?.size(metric) ?? 0, files.first?.size(metric) ?? 0, 1)
 
             // Merge folders + files by size, biggest first.
@@ -689,8 +804,18 @@ final class ScanController {
     /// must not rely on every entry point remembering to.
     @discardableResult
     func remove(directory node: FSNode, permanently: Bool) async -> Bool {
-        guard isHostScan, phase != .scanning,
-              node.parent != nil, let path = path(for: node) else { return false }
+        // `root != nil` must come before any dereference of `node` — a task
+        // scheduled just before Home could otherwise walk a freed parent chain.
+        guard isHostScan, phase != .scanning, !drainingCancelledScan, !structuralOpActive,
+              root != nil, node.parent != nil, let path = path(for: node) else { return false }
+        structuralOpActive = true
+        defer { structuralOpActive = false }
+        // Hold the ancestors strongly and re-check the epoch after every
+        // suspension: a Rescan/Home while we're off-actor must neither free the
+        // chain we walk on resume nor let us mutate the tree that replaced ours.
+        let epoch = treeEpoch
+        let ancestors = Self.retainedAncestors(of: node)
+        defer { withExtendedLifetime(ancestors) {} }
         let rowID = RowID.dir(ObjectIdentifier(node))
         deletingRows.insert(rowID)
         defer { deletingRows.remove(rowID) }
@@ -698,13 +823,15 @@ final class ScanController {
         // A6: capture the subtree's per-extension breakdown *before* deleting it
         // (off the main thread) so the File-types panel can be corrected after.
         // Not stored per node, so it must be re-enumerated from disk while it exists.
-        let extDelta: [ExtKey: ExtStat] = isHostScan
-            ? await Task.detached(priority: .userInitiated) {
-                DirectoryScanner.subtreeExtensions(path: path)
-              }.value
-            : [:]
+        let extDelta: [ExtKey: ExtStat] = await Task.detached(priority: .userInitiated) {
+            DirectoryScanner.subtreeExtensions(path: path)
+        }.value
+        guard epoch == treeEpoch else { return false }
 
         guard await Self.diskRemove(path: path, permanently: permanently) else { return false }
+        // Disk removal happened, but the tree it belonged to is gone — the
+        // replacement scan observes the deletion by itself.
+        guard epoch == treeEpoch else { return true }
         applyDirectoryRemoval(node)
         if !extDelta.isEmpty {
             scanner?.subtractExtensions(extDelta)
@@ -769,12 +896,18 @@ final class ScanController {
     /// Same safety guards as `remove(directory:)`.
     @discardableResult
     func remove(file: FileItem, parent: FSNode, permanently: Bool) async -> Bool {
-        guard isHostScan, phase != .scanning,
-              let path = path(forFile: file, parent: parent) else { return false }
+        guard isHostScan, phase != .scanning, !drainingCancelledScan, !structuralOpActive,
+              root != nil, let path = path(forFile: file, parent: parent) else { return false }
+        structuralOpActive = true
+        defer { structuralOpActive = false }
+        let epoch = treeEpoch
+        let ancestors = Self.retainedAncestors(of: parent)
+        defer { withExtendedLifetime(ancestors) {} }
         let rowID = RowID.file(ObjectIdentifier(parent), file.name)
         deletingRows.insert(rowID)
         defer { deletingRows.remove(rowID) }
         guard await Self.diskRemove(path: path, permanently: permanently) else { return false }
+        guard epoch == treeEpoch else { return true } // deleted on disk; tree is gone
 
         parent.adjustDirectFiles(logical: -file.logical, physical: -file.physical, count: -1)
         var p: FSNode? = parent
@@ -817,7 +950,16 @@ final class ScanController {
     /// while no full scan is running (its atomics would collide).
     @discardableResult
     func invalidate(subtree node: FSNode) async -> Bool {
-        guard isHostScan, phase != .scanning, node.isDirectory, let path = path(for: node) else { return false }
+        guard isHostScan, phase != .scanning, !drainingCancelledScan, !structuralOpActive,
+              root != nil, node.isDirectory, let path = path(for: node) else { return false }
+        structuralOpActive = true
+        defer { structuralOpActive = false }
+        // Same epoch/ancestor discipline as `remove(directory:)`. The strong
+        // ancestors additionally keep the sub-scan's upward propagation safe on
+        // its worker threads if a Rescan replaces the tree mid-flight.
+        let epoch = treeEpoch
+        let ancestors = Self.retainedAncestors(of: node)
+        defer { withExtendedLifetime(ancestors) {} }
 
         // OLD subtree snapshot (aggregates, folder count, and per-extension bytes
         // from disk — the same source as the fresh tally, so they reconcile exactly).
@@ -828,6 +970,7 @@ final class ScanController {
         let oldExt = await Task.detached(priority: .userInitiated) {
             DirectoryScanner.subtreeExtensions(path: path)
         }.value
+        guard epoch == treeEpoch else { return false }
 
         // Capture navigation state that points *into* the subtree — its descendant
         // nodes are about to be replaced by fresh objects — then drop the strong
@@ -856,8 +999,13 @@ final class ScanController {
         // the parent chain stays intact all the way to the real root.
         let skip = DirectoryScanner.recommendedSkipPaths(seedPaths: [path])
         let sub = DirectoryScanner(root: node, seeds: [.init(path: path, node: node)], skipPaths: skip, exact: countingMode == .exact)
+        activeSubScan = sub
         sub.start()
         await Task.detached(priority: .userInitiated) { sub.waitUntilFinished() }.value
+        activeSubScan = nil
+        // Torn down mid-re-scan (Rescan/Home): the half-reconciled subtree is
+        // detached from anything visible; let it be freed with the old tree.
+        guard epoch == treeEpoch else { return false }
 
         // Reconcile the global File-types table: subtract the subtree's old
         // per-extension bytes, add the fresh ones. EXACT for the deletion path
@@ -886,6 +1034,9 @@ final class ScanController {
         refreshTotals()
         extRows = scanner?.snapshotExtensions(metric: metric, limit: 250) ?? extRows
         bump()
+        // The rebuilt nodes have fresh identities: an active search would keep
+        // matching the freed objects and silently drop this subtree's hits.
+        if isSearching { setSearch(searchQuery) }
         return true
     }
 
@@ -963,8 +1114,14 @@ final class ScanController {
         }
         dirtyPaths.removeAll()
         diskChanged = false
+        let epoch = treeEpoch
         for p in roots {
-            if let node = nearestNode(toPath: p) { await invalidate(subtree: node) }
+            guard epoch == treeEpoch else { return } // Rescan/Home mid-refresh
+            if let node = nearestNode(toPath: p), !(await invalidate(subtree: node)) {
+                // Refused (e.g. a delete is in flight) — keep the path dirty so
+                // the next Refresh retries instead of silently forgetting it.
+                dirtyPaths.insert(p)
+            }
         }
         scanDate = Date()
         // Re-baseline the budget so the banner measures drift from *this* refresh.
