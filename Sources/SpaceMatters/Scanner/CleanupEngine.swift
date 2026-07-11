@@ -167,6 +167,11 @@ enum CleanupEngine {
     /// directory — a symlinked root, a symlinked *intermediate* component
     /// (`~/.gradle` → an external volume) or a `..` escape are all refused, so
     /// a cache relocated elsewhere is never chased.
+    ///
+    /// Concurrency note: the checks and the removals are separate syscalls
+    /// (TOCTOU). The fence defends against catalog bugs and relocated caches —
+    /// not against code already running as the same user, which could delete
+    /// anything directly and gains nothing from racing this loop.
     static func clean(_ item: Cleanable, allowedRoot: String = NSHomeDirectory()) -> CleanResult {
         var result = CleanResult()
         let fm = FileManager.default

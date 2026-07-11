@@ -188,9 +188,19 @@ final class CommandScanner: ScanBackend {
         guard t1 >= 1, t2 > t1, t3 > t2, t3 + 1 < bytes.count else { return }
 
         let type = bytes[0]
-        let blocks = asciiInt(bytes, t1 + 1, t2)
-        let logical = asciiInt(bytes, t2 + 1, t3)
-        let physical = blocks * 512
+        // Reject records whose numbers overflow instead of injecting garbage
+        // sizes into the tree (under -Ounchecked the trap would become a
+        // silent wraparound). The remote stream is not trusted input.
+        guard let blocks = asciiInt(bytes, t1 + 1, t2),
+              let logical = asciiInt(bytes, t2 + 1, t3) else {
+            errAtomic.wrappingAdd(1, ordering: .relaxed)
+            return
+        }
+        let (physical, overflow) = blocks.multipliedReportingOverflow(by: 512)
+        guard !overflow else {
+            errAtomic.wrappingAdd(1, ordering: .relaxed)
+            return
+        }
         let path = String(decoding: bytes[(t3 + 1)...], as: UTF8.self)
 
         if type == 0x64 { // 'd' directory
@@ -246,12 +256,19 @@ final class CommandScanner: ScanBackend {
         accParent = nil; accLogical = 0; accPhysical = 0; accCount = 0
     }
 
-    private func asciiInt(_ b: [UInt8], _ lo: Int, _ hi: Int) -> Int64 {
+    /// `nil` on Int64 overflow (≥ 20 digits) — the caller drops the record.
+    private func asciiInt(_ b: [UInt8], _ lo: Int, _ hi: Int) -> Int64? {
         var value: Int64 = 0
         var i = lo
         while i < hi {
             let c = b[i]
-            if c >= 0x30 && c <= 0x39 { value = value * 10 + Int64(c - 0x30) }
+            if c >= 0x30 && c <= 0x39 {
+                let (m, mo) = value.multipliedReportingOverflow(by: 10)
+                if mo { return nil }
+                let (a, ao) = m.addingReportingOverflow(Int64(c - 0x30))
+                if ao { return nil }
+                value = a
+            }
             i += 1
         }
         return value

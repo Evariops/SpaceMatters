@@ -94,6 +94,9 @@ struct SSHTarget: Equatable {
         var args = ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10"]
         if let port { args += ["-p", String(port)] }
         if let identityFile, !identityFile.isEmpty { args += ["-i", identityFile] }
+        // End of options: a host typed as `-oProxyCommand=…` must be treated as
+        // a (bad) host name, never parsed as an ssh option.
+        args.append("--")
         args.append(user.isEmpty ? host : "\(user)@\(host)")
         args.append(RemoteFind.command(rootPath: path, sudo: useSudo))
         return ("/usr/bin/ssh", args, path)

@@ -32,8 +32,16 @@ final class AppModel {
         didHandleLaunch = true
         let args = CommandLine.arguments
         guard let idx = args.firstIndex(of: "--open"), idx + 1 < args.count else { return }
+        let path = args[idx + 1]
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else {
+            // A typo'd path must not "succeed" as an empty scan — say so and
+            // stay on the splash.
+            FileHandle.standardError.write(Data("error: --open path is not a directory: \(path)\n".utf8))
+            return
+        }
         route = .filesystem
-        filesystem.scan(url: URL(fileURLWithPath: args[idx + 1]))
+        filesystem.scan(url: URL(fileURLWithPath: path))
     }
 
     // MARK: Filesystem mode

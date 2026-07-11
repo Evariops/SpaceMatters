@@ -50,10 +50,15 @@ struct Reconciliation: Equatable {
 
     private static func trashSize(volumeURL: URL) -> Int64 {
         var total: Int64 = 0
-        let candidates = [
-            FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".Trash"),
-            volumeURL.appendingPathComponent(".Trashes/\(getuid())"),
-        ]
+        // `~/.Trash` lives on the home volume: attribute it to the reconciled
+        // volume only when that's actually where home is — an external disk
+        // would otherwise inherit the internal disk's trash, inflating
+        // `accountedFor` and zeroing out `unaccounted`.
+        var candidates = [volumeURL.appendingPathComponent(".Trashes/\(getuid())")]
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        if sameVolume(home, volumeURL) {
+            candidates.append(home.appendingPathComponent(".Trash"))
+        }
         for dir in candidates {
             guard let e = FileManager.default.enumerator(
                 at: dir,
@@ -66,6 +71,14 @@ struct Reconciliation: Equatable {
             }
         }
         return total
+    }
+
+    private static func sameVolume(_ a: URL, _ b: URL) -> Bool {
+        guard let va = try? a.resourceValues(forKeys: [.volumeIdentifierKey]).volumeIdentifier,
+              let vb = try? b.resourceValues(forKeys: [.volumeIdentifierKey]).volumeIdentifier else {
+            return false
+        }
+        return va.isEqual(vb)
     }
 
     private static func snapshotCount(volumeURL: URL) -> Int {

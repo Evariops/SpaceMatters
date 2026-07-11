@@ -277,7 +277,14 @@ final class ScanController {
 
     /// Scan inside a Podman/Colima VM (streamed `find` over SSH).
     func scanVM(machine: VMMachine, scope: VMScope) {
-        guard machine.running else { return }
+        guard machine.running else {
+            // The route already switched to the result view: a silent return
+            // would show an unexplained empty screen if the VM stopped between
+            // detection and the click.
+            failureMessage = "\(machine.runtime.rawValue) “\(machine.name)” is not running — start it and scan again."
+            phase = .failed
+            return
+        }
         lastVolumes = []
         lastVM = (machine, scope)
         let cmd = VMProbe.scanCommand(machine: machine, scope: scope)
@@ -475,6 +482,9 @@ final class ScanController {
     /// must not re-sort every expanded folder's files on each evaluation.
     private struct FileListing { let count: Int64; let metric: SizeMetric; let items: [FileItem] }
     @ObservationIgnored private var fileCache: [ObjectIdentifier: FileListing] = [:]
+    /// Directories whose file listing is being enumerated off-main right now
+    /// (prevents duplicate walks while `visibleRows()` polls at 10 Hz).
+    @ObservationIgnored private var fileListingsInFlight: Set<ObjectIdentifier> = []
     /// Resolved paths for seed (root/volume) nodes, so any node's full path can be
     /// rebuilt on demand without storing a path on every node.
     @ObservationIgnored private var nodePaths: [ObjectIdentifier: String] = [:]
@@ -565,27 +575,48 @@ final class ScanController {
             return resorted
         }
 
-        var items: [FileItem] = []
-        if count > 0, let dirPath = path(for: node) {
-            let fd = open(dirPath, O_RDONLY | O_DIRECTORY)
-            if fd >= 0 {
-                let bufSize = 64 * 1024
-                let buf = UnsafeMutableRawPointer.allocate(byteCount: bufSize, alignment: 16)
-                enumerateDirectory(fd: fd, buffer: buf, bufferSize: bufSize) { entry in
-                    guard !entry.isDirectory else { return }
-                    let name = String(decoding: UnsafeRawBufferPointer(start: entry.name, count: entry.nameLength), as: UTF8.self)
-                    items.append(FileItem(name: name, logical: entry.logicalSize, physical: entry.physicalSize))
-                }
-                buf.deallocate()
-                close(fd)
+        // Cache miss: enumerate off the main actor — a 100k-file folder or a slow
+        // network volume must not beach-ball the UI — and repaint when it lands.
+        // Callers get an empty placeholder for the frame or two it takes.
+        guard count > 0, let dirPath = path(for: node) else {
+            fileCache[key] = FileListing(count: count, metric: metric, items: [])
+            return []
+        }
+        guard !fileListingsInFlight.contains(key) else { return [] }
+        fileListingsInFlight.insert(key)
+        let epoch = treeEpoch
+        let m = metric
+        Task { @MainActor in
+            var items = await Task.detached(priority: .userInitiated) {
+                Self.enumerateFiles(dirPath: dirPath)
+            }.value
+            self.fileListingsInFlight.remove(key)
+            guard epoch == self.treeEpoch else { return }
+            if items.count > Self.maxFilesPerFolder {
+                items.sort { $0.physical > $1.physical }
+                items.removeLast(items.count - Self.maxFilesPerFolder)
             }
+            items.sort { $0.size(m) > $1.size(m) }
+            self.fileCache[key] = FileListing(count: node.directFileCount, metric: m, items: items)
+            self.bump()
         }
-        if items.count > Self.maxFilesPerFolder {
-            items.sort { $0.physical > $1.physical }
-            items.removeLast(items.count - Self.maxFilesPerFolder)
+        return []
+    }
+
+    /// Blocking directory read behind `filesIn` — runs on a detached task.
+    nonisolated private static func enumerateFiles(dirPath: String) -> [FileItem] {
+        var items: [FileItem] = []
+        let fd = open(dirPath, O_RDONLY | O_DIRECTORY)
+        guard fd >= 0 else { return items }
+        let bufSize = 64 * 1024
+        let buf = UnsafeMutableRawPointer.allocate(byteCount: bufSize, alignment: 16)
+        enumerateDirectory(fd: fd, buffer: buf, bufferSize: bufSize) { entry in
+            guard !entry.isDirectory else { return }
+            let name = String(decoding: UnsafeRawBufferPointer(start: entry.name, count: entry.nameLength), as: UTF8.self)
+            items.append(FileItem(name: name, logical: entry.logicalSize, physical: entry.physicalSize))
         }
-        items.sort { $0.size(metric) > $1.size(metric) }
-        fileCache[key] = FileListing(count: count, metric: metric, items: items)
+        buf.deallocate()
+        close(fd)
         return items
     }
 
@@ -1003,6 +1034,9 @@ final class ScanController {
         refreshTotals()
         extRows = scanner?.snapshotExtensions(metric: metric, limit: 250) ?? extRows
         bump()
+        // The rebuilt nodes have fresh identities: an active search would keep
+        // matching the freed objects and silently drop this subtree's hits.
+        if isSearching { setSearch(searchQuery) }
         return true
     }
 

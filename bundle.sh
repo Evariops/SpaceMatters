@@ -30,6 +30,11 @@ fi
 VERSION="${VERSION:-$( { git describe --tags --abbrev=0 2>/dev/null || true; } | sed 's/^v//')}"
 [ -z "$VERSION" ] && VERSION="0.1.0"
 BUILD="${BUILD:-$(git rev-list --count HEAD 2>/dev/null || echo 1)}"
+# Interpolated into the Info.plist heredoc below: keep them plist-safe so a
+# hostile tag name can't inject XML.
+VERSION="$(printf '%s' "$VERSION" | tr -cd '0-9A-Za-z.-')"
+BUILD="$(printf '%s' "$BUILD" | tr -cd '0-9')"
+[ -z "$BUILD" ] && BUILD=1
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

@@ -261,7 +261,14 @@ import Foundation
         await Self.waitForScan(c)
 
         let sibling = try #require(Self.child(c.root!, "sibling"))
-        let files = c.filesIn(sibling)
+        // File listings load off the main actor now: poll until it lands.
+        var files = c.filesIn(sibling)
+        let deadline = Date().addingTimeInterval(5)
+        while files.isEmpty && Date() < deadline {
+            await Task.yield()
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+            files = c.filesIn(sibling)
+        }
         let file = try #require(files.first)
         let rootPhysicalBefore = c.root!.aggPhysical.load(ordering: .relaxed)
 
