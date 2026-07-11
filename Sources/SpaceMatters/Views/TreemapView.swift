@@ -20,29 +20,41 @@ struct TreemapView: View {
     /// representable's inputs and recompute the a11y summary per event).
     @State private var hoverModel = HoverModel()
 
+    /// The one GPU renderer, built once per process and shared across view
+    /// recreations (the shader is compiled at launch — see `TreemapMetalRenderer`).
+    /// `nil` means Metal is genuinely unusable here (no device, or the runtime
+    /// shader compile failed): the treemap then shows an explicit failure state
+    /// instead of silently degrading — a failure that shows beats one that hides.
+    private static let sharedRenderer = TreemapMetalRenderer()
+
     var body: some View {
-        // Reading these establishes SwiftUI observation: when any changes, `body`
-        // re-evaluates → the representable is recreated → `updateNSView` runs. A
-        // resize is NOT observed here (no GeometryReader) — AppKit drives it.
-        TreemapRepresentable(
-            controller: controller,
-            theme: theme,
-            version: controller.version,
-            zoomRoot: controller.zoomRoot,
-            metric: controller.metric,
-            selection: controller.selection,
-            selectedExt: controller.selectedExt,
-            searchMatchIDs: controller.searchMatchIDs,
-            highlightVersion: controller.highlightVersion,
-            isDark: theme.isDark,
-            onHover: { [hoverModel] in hoverModel.info = $0 }
-        )
-        .overlay(alignment: .bottomLeading) {
-            HoverPill(model: hoverModel)
+        if let renderer = Self.sharedRenderer {
+            // Reading these establishes SwiftUI observation: when any changes, `body`
+            // re-evaluates → the representable is recreated → `updateNSView` runs. A
+            // resize is NOT observed here (no GeometryReader) — AppKit drives it.
+            TreemapRepresentable(
+                renderer: renderer,
+                controller: controller,
+                theme: theme,
+                version: controller.version,
+                zoomRoot: controller.zoomRoot,
+                metric: controller.metric,
+                selection: controller.selection,
+                selectedExt: controller.selectedExt,
+                searchMatchIDs: controller.searchMatchIDs,
+                highlightVersion: controller.highlightVersion,
+                isDark: theme.isDark,
+                onHover: { [hoverModel] in hoverModel.info = $0 }
+            )
+            .overlay(alignment: .bottomLeading) {
+                HoverPill(model: hoverModel)
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Treemap")
+            .accessibilityValue(treemapSummary)
+        } else {
+            TreemapUnavailableView()
         }
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Treemap")
-        .accessibilityValue(treemapSummary)
     }
 
     /// A spoken summary of the (drawing-opaque) treemap: the zoomed folder plus its
@@ -56,6 +68,31 @@ struct TreemapView: View {
             "\($0.name) \(Int((Double($0.size(m)) / Double(total) * 100).rounded())) percent"
         }
         return kids.isEmpty ? head : head + " Largest: " + kids.joined(separator: ", ")
+    }
+}
+
+/// Shown when the Metal renderer can't initialise — no GPU device (a VM without
+/// paravirtualisation) or a broken runtime shader compile. Every Mac that runs
+/// macOS 15 has a Metal GPU, so this is an error state, not a supported mode.
+private struct TreemapUnavailableView: View {
+    @Environment(\.theme) private var theme
+
+    var body: some View {
+        VStack(spacing: 8) {
+            Image(systemName: "exclamationmark.triangle")
+                .font(.system(size: 26))
+                .foregroundStyle(theme.textSecondary)
+            Text("GPU rendering unavailable")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(theme.textPrimary)
+            Text("SpaceMatters draws the treemap with Metal, which this machine doesn't provide.")
+                .font(.system(size: 11))
+                .foregroundStyle(theme.textSecondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 320)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -87,6 +124,7 @@ private struct HoverPill: View {
 /// current observable inputs; the NSView decides what that implies (relayout vs a
 /// cheap overlay/dimming redraw).
 private struct TreemapRepresentable: NSViewRepresentable {
+    let renderer: TreemapMetalRenderer
     let controller: ScanController
     let theme: Theme
     let version: UInt64
@@ -100,7 +138,7 @@ private struct TreemapRepresentable: NSViewRepresentable {
     let onHover: (HoverInfo?) -> Void
 
     func makeNSView(context: Context) -> TreemapNSView {
-        let view = TreemapNSView()
+        let view = TreemapNSView(renderer: renderer)
         view.onHover = onHover
         view.apply(controller: controller, theme: theme, version: version, zoomRoot: zoomRoot,
                    metric: metric, selection: selection, selectedExt: selectedExt,
@@ -116,16 +154,16 @@ private struct TreemapRepresentable: NSViewRepresentable {
     }
 }
 
-/// The drawn treemap: an AppKit view AppKit resizes directly. Tiles live in one
-/// cached layer (redrawn only on relayout — resize or model change); the hover
-/// outline + selection spotlight live in a second layer (redrawn on hover/selection
+/// The drawn treemap: an AppKit view AppKit resizes directly. Tiles are rendered by
+/// the GPU into the view's backing `CAMetalLayer` (SPEC-09); the hover outline +
+/// selection spotlight live in a CG overlay layer (redrawn on hover/selection
 /// alone), so hovering never re-renders the ~thousands of tiles.
 ///
 /// Allocation discipline (the resize hot path is `setFrameSize` → `relayout` →
-/// `draw`): the cushion gradient, tile CGColors (a bounded LUT), theme CGColors and
-/// label attributed-strings are all cached and reused across frames; the per-frame
-/// `colors`/`sizeScratch` buffers keep their capacity. Only the tiles array (whose
-/// rects genuinely change every frame) is rebuilt.
+/// `presentTiles`): tile colours (a bounded LUT), the hue-index cache and theme
+/// CGColors are all reused across frames; the per-frame `instances`/`sizeScratch`
+/// buffers keep their capacity. Only the tiles array (whose rects genuinely change
+/// every frame) is rebuilt.
 final class TreemapNSView: NSView, CALayerDelegate {
     var onHover: ((HoverInfo?) -> Void)?
 
@@ -143,18 +181,15 @@ final class TreemapNSView: NSView, CALayerDelegate {
 
     // Layout state.
     private var tiles: [TreemapTile] = []
-    private var colors: [CGColor] = []            // CG fallback path
-    private var instances: [TileInstance] = []    // Metal path (culled to visible tiles)
+    private var instances: [TileInstance] = []    // GPU instances (culled to visible tiles)
     private var regions: [ObjectIdentifier: CGRect] = [:]
     private var regionsBuilt = false
     private var hovered: TreemapTile?
 
-    // Tile layer: a `CAMetalLayer` when a GPU is available (the fast path — SPEC-09),
-    // else a plain `CALayer` rasterised by CoreGraphics (defensive fallback). The
-    // selection/hover overlay stays a CG layer above it (Phase 1).
-    private let tileLayer: CALayer
-    private let metalLayer: CAMetalLayer?
-    private let renderer: TreemapMetalRenderer?
+    // Tile layer: the view's backing `CAMetalLayer` (SPEC-09). The selection/hover
+    // overlay stays a CG layer above it (Phase 1).
+    private let metalLayer: CAMetalLayer
+    private let renderer: TreemapMetalRenderer
     private let overlayLayer = CALayer()
 
     // MARK: Caches (persist across relayouts)
@@ -162,78 +197,49 @@ final class TreemapNSView: NSView, CALayerDelegate {
     private static let brightnessBuckets = 256
     private let paletteCount = Theme.paletteHues.count
     private var hueIndexCache: [ObjectIdentifier: Int] = [:]
-    private var colorLUT: [CGColor?] = []
-    private var colorLUTf: [SIMD4<Float>?] = []
+    private var colorLUT: [SIMD4<Float>?] = []
     private var colorKey: ColorKey?
     private var sizeScratch: [Int64] = []
 
     private var rootFilesCache: [FileTileInfo]?
     private var rootFilesKey: RootFilesKey?
 
-    // Theme-derived CGColors (rebuilt on theme change).
+    // Theme-derived CGColors for the overlay (rebuilt on theme change).
     private var backgroundCG = CGColor(gray: 0, alpha: 1)
-    private var borderCG = CGColor(gray: 0, alpha: 0.45)
     private var accentShadowCG = CGColor(gray: 0.3, alpha: 0.9)
     // Theme-derived sRGB components for the Metal clear + border uniform.
     private var backgroundComps = SIMD4<Float>(0, 0, 0, 1)
     private var borderComps = SIMD4<Float>(0, 0, 0, 0.45)
-    private static let dimCG = CGColor(gray: 0, alpha: 0.72)
     private static let spotlightDimCG = CGColor(gray: 0, alpha: 0.5)
     private static let blackBorderCG = CGColor(gray: 0, alpha: 0.85)
     private static let whiteCG = CGColor(gray: 1, alpha: 1)
     private static let hoverCG = CGColor(gray: 1, alpha: 0.95)
 
-    private lazy var cushionGradient: CGGradient = {
-        let space = CGColorSpaceCreateDeviceRGB()
-        let stops: [CGColor] = [
-            CGColor(red: 1, green: 1, blue: 1, alpha: 0.16),
-            CGColor(red: 1, green: 1, blue: 1, alpha: 0),
-            CGColor(red: 0, green: 0, blue: 0, alpha: 0.20),
-        ]
-        return CGGradient(colorsSpace: space, colors: stops as CFArray, locations: [0, 0.45, 1])!
-    }()
-
     private struct ColorKey: Equatable { let isDark: Bool; let version: UInt64 }
 
     // MARK: Setup
 
-    override init(frame frameRect: NSRect) {
-        if let renderer = TreemapMetalRenderer() {
-            let ml = CAMetalLayer()
-            ml.device = renderer.device
-            ml.pixelFormat = .bgra8Unorm            // non-sRGB: store sRGB values as-is → matches CG
-            ml.framebufferOnly = true
-            ml.isOpaque = true
-            // `presentsWithTransaction` is turned on only while resizing (see
-            // viewWillStartLiveResize / setFrameSize): the synchronous commit +
-            // waitUntilScheduled it implies must not tax every ordinary frame.
-            ml.presentsWithTransaction = false
-            ml.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
-            self.renderer = renderer
-            self.metalLayer = ml
-            self.tileLayer = ml
-        } else {
-            self.renderer = nil
-            self.metalLayer = nil
-            self.tileLayer = CALayer()
-        }
-        super.init(frame: frameRect)
+    init(renderer: TreemapMetalRenderer) {
+        self.renderer = renderer
+        let ml = CAMetalLayer()
+        ml.device = renderer.device
+        ml.pixelFormat = .bgra8Unorm            // non-sRGB: store sRGB values as-is → matches CG
+        ml.framebufferOnly = true
+        ml.isOpaque = true
+        // `presentsWithTransaction` is turned on only while resizing (see
+        // viewWillStartLiveResize / setFrameSize): the synchronous commit +
+        // waitUntilScheduled it implies must not tax every ordinary frame.
+        ml.presentsWithTransaction = false
+        ml.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
+        self.metalLayer = ml
+        super.init(frame: .zero)
         wantsLayer = true
-        // Metal path: the CAMetalLayer is the view's *backing* layer (see makeBackingLayer),
-        // so AppKit resizes it in lockstep with the view — no sublayer-frame lag / black
-        // bands during a live drag. The overlay is a sublayer above it. AppKit must not try
-        // to CG-redraw the metal layer, so its content-redraw policy is `.never`.
-        layerContentsRedrawPolicy = renderer == nil ? .duringViewResize : .never
+        // The CAMetalLayer is the view's *backing* layer (see makeBackingLayer), so
+        // AppKit resizes it in lockstep with the view — no sublayer-frame lag / black
+        // bands during a live drag. The overlay is a sublayer above it. AppKit must not
+        // try to CG-redraw the metal layer, so its content-redraw policy is `.never`.
+        layerContentsRedrawPolicy = .never
         layer?.masksToBounds = true
-
-        if metalLayer == nil {
-            // Fallback: a CG-rendered tile sublayer under the overlay.
-            tileLayer.delegate = self
-            tileLayer.needsDisplayOnBoundsChange = true
-            tileLayer.contentsScale = 2
-            tileLayer.frame = bounds
-            layer?.addSublayer(tileLayer)
-        }
 
         overlayLayer.delegate = self
         overlayLayer.needsDisplayOnBoundsChange = true
@@ -244,10 +250,10 @@ final class TreemapNSView: NSView, CALayerDelegate {
         rebuildThemeColors()   // seed background/border (CG + Metal comps) from the default theme
     }
 
-    /// Metal path: hand AppKit the `CAMetalLayer` as the backing layer, so it's resized in
-    /// lockstep with the view — the fix for resize lag / black bands. Fallback: default layer.
+    /// Hand AppKit the `CAMetalLayer` as the backing layer, so it's resized in
+    /// lockstep with the view — the fix for resize lag / black bands.
     override func makeBackingLayer() -> CALayer {
-        metalLayer ?? super.makeBackingLayer()
+        metalLayer
     }
 
     @available(*, unavailable)
@@ -267,42 +273,25 @@ final class TreemapNSView: NSView, CALayerDelegate {
     }
 
     private func setScale(_ scale: CGFloat) {
-        if let metalLayer {
-            metalLayer.contentsScale = scale
-            metalLayer.drawableSize = CGSize(width: bounds.width * scale, height: bounds.height * scale)
-            presentTiles()
-        } else {
-            tileLayer.contentsScale = scale
-            tileLayer.setNeedsDisplay()
-        }
+        metalLayer.contentsScale = scale
+        metalLayer.drawableSize = CGSize(width: bounds.width * scale, height: bounds.height * scale)
+        presentTiles()
         overlayLayer.contentsScale = scale
         overlayLayer.setNeedsDisplay()
     }
 
-    // Metal path: synchronous presents (`presentsWithTransaction`) only while the
-    // window is actually being resized — they keep the drawable atomic with the
-    // bounds, but block the main thread until the GPU schedules, which is too
-    // expensive to pay on every ordinary frame (zoom animation at 120 Hz, scan
-    // ticks). Fallback (no-GPU) path: CPU rasterisation of the big solid tiles at
-    // 2× retina is the resize bottleneck, so during a live drag we fill ¼ the
-    // pixels (1× backing) and re-render crisp when it ends.
+    // Synchronous presents (`presentsWithTransaction`) only while the window is
+    // actually being resized — they keep the drawable atomic with the bounds, but
+    // block the main thread until the GPU schedules, which is too expensive to pay
+    // on every ordinary frame (zoom animation at 120 Hz, scan ticks).
     override func viewWillStartLiveResize() {
         super.viewWillStartLiveResize()
-        if let metalLayer {
-            metalLayer.presentsWithTransaction = true
-        } else {
-            tileLayer.contentsScale = 1
-            overlayLayer.contentsScale = 1
-        }
+        metalLayer.presentsWithTransaction = true
     }
 
     override func viewDidEndLiveResize() {
         super.viewDidEndLiveResize()
-        if let metalLayer {
-            metalLayer.presentsWithTransaction = false
-        } else {
-            setScale(window?.backingScaleFactor ?? 2)
-        }
+        metalLayer.presentsWithTransaction = false
     }
 
     // MARK: SwiftUI → view
@@ -337,7 +326,7 @@ final class TreemapNSView: NSView, CALayerDelegate {
             // A pure zoom navigation (from the treemap or the outline) animates the camera;
             // anything else (scan update, metric, theme) relays out instantly.
             if zoomRoot !== oldZoomRoot, let oldRoot = oldZoomRoot, let newRoot = zoomRoot,
-               renderer != nil, zoomLink == nil, !inLiveResize, !instances.isEmpty,
+               zoomLink == nil, !inLiveResize, !instances.isEmpty,
                startZoomAnimation(from: oldRoot, to: newRoot) {
                 overlayLayer.setNeedsDisplay()
             } else if zoomLink != nil, zoomRoot === oldZoomRoot, metric == oldMetric, !themeChanged {
@@ -366,7 +355,6 @@ final class TreemapNSView: NSView, CALayerDelegate {
 
     private func rebuildThemeColors() {
         backgroundCG = NSColor(theme.treemapBackground).cgColor
-        borderCG = NSColor(theme.treemapBorder).cgColor
         accentShadowCG = NSColor(theme.accent).withAlphaComponent(0.9).cgColor
         layer?.backgroundColor = backgroundCG
         backgroundComps = srgbComps(theme.treemapBackground)
@@ -390,24 +378,20 @@ final class TreemapNSView: NSView, CALayerDelegate {
         // end state first, then lay out at the new size below.
         if zoomLink != nil { finishZoom() }
         overlayLayer.frame = bounds
-        if let metalLayer {
-            // Backing-layer frame is managed by AppKit; we only resize the drawable + redraw.
-            let scale = window?.backingScaleFactor ?? 2
-            metalLayer.drawableSize = CGSize(width: bounds.width * scale, height: bounds.height * scale)
-            // This frame's present must stay atomic with the bounds change (no
-            // band behind a split-divider drag); reverted below unless a window
-            // live-resize keeps the synchronous path on.
-            metalLayer.presentsWithTransaction = true
-        } else {
-            tileLayer.frame = bounds
-        }
+        // Backing-layer frame is managed by AppKit; we only resize the drawable + redraw.
+        let scale = window?.backingScaleFactor ?? 2
+        metalLayer.drawableSize = CGSize(width: bounds.width * scale, height: bounds.height * scale)
+        // This frame's present must stay atomic with the bounds change (no
+        // band behind a split-divider drag); reverted below unless a window
+        // live-resize keeps the synchronous path on.
+        metalLayer.presentsWithTransaction = true
         // The squarified layout is now monotone under resize (TreemapLayout freezes the
         // discrete row/orientation/recurse decisions and reruns only continuous geometry),
         // so a full relayout every frame flows smoothly — no freeze/settle needed.
         relayout()
         presentTiles()
         overlayLayer.setNeedsDisplay()
-        if let metalLayer, !inLiveResize { metalLayer.presentsWithTransaction = false }
+        if !inLiveResize { metalLayer.presentsWithTransaction = false }
     }
 
     // MARK: Layout (size-dependent placement + colours)
@@ -416,7 +400,7 @@ final class TreemapNSView: NSView, CALayerDelegate {
         pendingRelayout = false   // any relayout consumes a deferred one
         hovered = nil
         guard let controller, let zoomRoot, bounds.width > 1, bounds.height > 1 else {
-            tiles = []; colors.removeAll(keepingCapacity: true); instances.removeAll(keepingCapacity: true)
+            tiles = []; instances.removeAll(keepingCapacity: true)
             regions = [:]; regionsBuilt = false
             return
         }
@@ -431,16 +415,15 @@ final class TreemapNSView: NSView, CALayerDelegate {
         computeColors()
     }
 
-    /// Fill `colors` (parallel to `tiles`) from the LUT. Size is read once per tile
+    /// Rebuild the GPU `instances` from the current tiles. Size is read once per tile
     /// (into `sizeScratch`) and reused for both the max pass and the weight, halving
-    /// the atomic loads; `colors` keeps its buffer capacity across frames.
+    /// the atomic loads; `instances` keeps its buffer capacity across frames.
     private func computeColors() {
         let n = tiles.count
         let key = ColorKey(isDark: isDark, version: version)
         if colorKey != key {
             hueIndexCache.removeAll(keepingCapacity: true)
             colorLUT = Array(repeating: nil, count: paletteCount * Self.brightnessBuckets)
-            colorLUTf = Array(repeating: nil, count: paletteCount * Self.brightnessBuckets)
             colorKey = key
         }
         if sizeScratch.count < n { sizeScratch = [Int64](repeating: 0, count: n) }
@@ -450,20 +433,10 @@ final class TreemapNSView: NSView, CALayerDelegate {
             sizeScratch[i] = s
             if s > maxSize { maxSize = s }
         }
-        let denom = Double(maxSize)
-        if renderer != nil {
-            packInstances(denom: denom)
-        } else {
-            colors.removeAll(keepingCapacity: true)
-            colors.reserveCapacity(n)
-            for i in 0..<n {
-                let weight = min(1.0, max(0.0, pow(Double(sizeScratch[i]) / denom, 0.40)))
-                colors.append(cgColor(for: tiles[i], weight: weight))
-            }
-        }
+        packInstances(denom: Double(maxSize))
     }
 
-    /// Pack `tiles` into GPU `instances` (Metal path): world rect on the ground plane
+    /// Pack `tiles` into GPU `instances`: world rect on the ground plane
     /// (top-left, height 0), packed sRGB colour, dim folded in. Sub-pixel tiles are
     /// culled here — `instances` may be shorter than `tiles`; hit-testing uses `tiles`.
     private func packInstances(denom: Double) {
@@ -487,11 +460,13 @@ final class TreemapNSView: NSView, CALayerDelegate {
             instances.append(TileInstance(
                 origin: SIMD4<Float>(Float(r.minX), 0, Float(r.minY), 0),
                 size: SIMD4<Float>(Float(r.width), 0, Float(r.height), dim),
-                color: floatColor(for: tile, weight: weight)))
+                color: tileColor(for: tile, weight: weight)))
         }
     }
 
-    private func cgColor(for tile: TreemapTile, weight: Double) -> CGColor {
+    /// sRGB RGBA for a tile, memoised in a bounded `(hueIndex, bucket)` LUT —
+    /// no per-frame `NSColor`/hashing on the resize hot path.
+    private func tileColor(for tile: TreemapTile, weight: Double) -> SIMD4<Float> {
         let hueIdx: Int
         if let ext = tile.file?.extName {
             hueIdx = Theme.stableIndex(ext, paletteCount)
@@ -507,50 +482,22 @@ final class TreemapNSView: NSView, CALayerDelegate {
         let bucket = min(Self.brightnessBuckets - 1, Int(weight * Double(Self.brightnessBuckets)))
         let lutKey = hueIdx * Self.brightnessBuckets + bucket
         if let cached = colorLUT[lutKey] { return cached }
-        let color = NSColor(theme.treemapTypeColor(
-            hueIndex: hueIdx, weight: (Double(bucket) + 0.5) / Double(Self.brightnessBuckets))).cgColor
-        colorLUT[lutKey] = color
-        return color
-    }
-
-    /// sRGB RGBA for a tile (Metal path), memoised in the same `(hueIndex, bucket)` LUT
-    /// shape as `cgColor` — no per-frame `NSColor`/hashing on the resize hot path.
-    private func floatColor(for tile: TreemapTile, weight: Double) -> SIMD4<Float> {
-        let hueIdx: Int
-        if let ext = tile.file?.extName {
-            hueIdx = Theme.stableIndex(ext, paletteCount)
-        } else {
-            let oid = ObjectIdentifier(tile.node)
-            if let cached = hueIndexCache[oid] {
-                hueIdx = cached
-            } else {
-                hueIdx = Theme.stableIndex(tile.node.dominantExt.displayName, paletteCount)
-                hueIndexCache[oid] = hueIdx
-            }
-        }
-        let bucket = min(Self.brightnessBuckets - 1, Int(weight * Double(Self.brightnessBuckets)))
-        let lutKey = hueIdx * Self.brightnessBuckets + bucket
-        if let cached = colorLUTf[lutKey] { return cached }
         let ns = NSColor(theme.treemapTypeColor(
             hueIndex: hueIdx, weight: (Double(bucket) + 0.5) / Double(Self.brightnessBuckets)))
         let s = ns.usingColorSpace(.sRGB) ?? ns
         let v = SIMD4<Float>(Float(s.redComponent), Float(s.greenComponent), Float(s.blueComponent), 1)
-        colorLUTf[lutKey] = v
+        colorLUT[lutKey] = v
         return v
     }
 
-    /// Push the current tiles to screen: a GPU render (Metal) or a layer redraw (CG).
-    /// During a zoom animation `zoomViewport` overrides the full-bounds camera so the map
-    /// pushes toward / pulls back from a folder (same tiles, a moving orthographic camera).
+    /// Push the current tiles to screen (a GPU render). During a zoom animation
+    /// `zoomViewport` overrides the full-bounds camera so the map pushes toward /
+    /// pulls back from a folder (same tiles, a moving orthographic camera).
     private func presentTiles() {
-        if let renderer, let metalLayer {
-            let viewport = zoomViewport ?? CGRect(origin: .zero, size: bounds.size)
-            renderer.render(into: metalLayer, instances: instances,
-                            camera: Camera.ortho(viewport: viewport),
-                            clearColor: backgroundComps, borderColor: borderComps)
-        } else {
-            tileLayer.setNeedsDisplay()
-        }
+        let viewport = zoomViewport ?? CGRect(origin: .zero, size: bounds.size)
+        renderer.render(into: metalLayer, instances: instances,
+                        camera: Camera.ortho(viewport: viewport),
+                        clearColor: backgroundComps, borderColor: borderComps)
     }
 
     private func tileSize(_ tile: TreemapTile) -> Int64 {
@@ -578,63 +525,15 @@ final class TreemapNSView: NSView, CALayerDelegate {
 
     func draw(_ layer: CALayer, in ctx: CGContext) {
         // The layer context is native Core Graphics: bottom-left, y-up, text upright.
-        // The tile rects are top-left, so each is flipped into this space at draw time
+        // The rects are top-left, so each is flipped into this space at draw time
         // (`flip`). No context or text-matrix flips — so glyphs can never mirror.
-        if layer === tileLayer, renderer == nil {
-            drawTiles(in: ctx, height: layer.bounds.height)
-        } else if layer === overlayLayer {
-            drawOverlay(in: ctx, size: layer.bounds.size)
-        }
+        guard layer === overlayLayer else { return }
+        drawOverlay(in: ctx, size: layer.bounds.size)
     }
 
     /// Flip a top-left tile rect into the context's native bottom-left space.
     private func flip(_ r: CGRect, _ height: CGFloat) -> CGRect {
         CGRect(x: r.minX, y: height - r.maxY, width: r.width, height: r.height)
-    }
-
-    private func drawTiles(in ctx: CGContext, height: CGFloat) {
-        let n = tiles.count
-        guard n > 0, colors.count == n else { return }
-        let highlightName = selectedExt?.displayName
-        let hasSearch = highlightName == nil && !searchMatchIDs.isEmpty
-
-        for i in 0..<n {
-            let tile = tiles[i]
-            if tile.rect.width <= 0.5 || tile.rect.height <= 0.5 { continue }
-            let r = flip(tile.rect, height)
-
-            ctx.setFillColor(colors[i])
-            ctx.fill(r)
-
-            // Cushion sheen (light top → dark bottom); skip the tiniest tiles.
-            if r.width > 6 && r.height > 6 {
-                ctx.saveGState()
-                ctx.clip(to: r)
-                ctx.drawLinearGradient(cushionGradient,
-                                       start: CGPoint(x: r.midX, y: r.maxY),
-                                       end: CGPoint(x: r.midX, y: r.minY),
-                                       options: [.drawsBeforeStartLocation, .drawsAfterEndLocation])
-                ctx.restoreGState()
-            }
-
-            var dimmed = false
-            if let highlightName {
-                let tileExt = tile.file?.extName ?? tile.node.dominantExt.displayName
-                dimmed = tileExt != highlightName
-            } else if hasSearch {
-                dimmed = !isUnderMatch(tile.node)
-            }
-            if dimmed {
-                ctx.setFillColor(Self.dimCG)
-                ctx.fill(r)
-            }
-
-            if r.width > 3 && r.height > 3 {
-                ctx.setStrokeColor(borderCG)
-                ctx.setLineWidth(0.6)
-                ctx.stroke(r)
-            }
-        }
     }
 
     private func drawOverlay(in ctx: CGContext, size: CGSize) {

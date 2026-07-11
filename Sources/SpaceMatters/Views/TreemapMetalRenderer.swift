@@ -273,8 +273,8 @@ final class TreemapMetalRenderer {
         return o;
     }
 
-    // Fill → cushion sheen (light top → dark bottom, 3 stops matching the CG gradient)
-    // → dim (highlight/search) → border. All per-pixel, all free on the GPU.
+    // Fill → cushion sheen (light top → dark bottom, 3 stops) → dim (highlight/search)
+    // → border. All per-pixel, all free on the GPU.
     fragment float4 treemapFragment(VOut in [[stage_in]],
                                     constant Uniforms& u [[buffer(1)]]) {
         float3 col = in.color.rgb;
