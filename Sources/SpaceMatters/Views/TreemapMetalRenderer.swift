@@ -5,11 +5,11 @@ import simd
 // GPU renderer for the treemap tiles (SPEC-09). The engine is 3D-native from the
 // start — instanced 3D quads, an MVP camera and a depth buffer — but the current
 // view is its *orthographic top-down projection*: flat tiles (height 0) seen from
-// straight above, which is pixel-identical to the old 2D map. Going 3D later is a
-// camera + height change, not a rewrite (SPEC-09 §9).
+// straight above, the classic 2D treemap. Going 3D later is a camera + height
+// change, not a rewrite (SPEC-09 §9).
 //
-// Only the tile *fill* moves to the GPU; layout, colour source, hit-testing and the
-// selection/hover overlay stay where they were. One `drawPrimitives(instanceCount:)`
+// Only the tile *fill* is the GPU's job; layout, colour source, hit-testing and the
+// selection/hover overlay live in `TreemapNSView`. One `drawPrimitives(instanceCount:)`
 // draws every tile in a single call — the answer to "thousands of CPU fillRect".
 
 /// One tile, as uploaded to the GPU. 3D-native: `origin`/`size` carry a Y (height)
@@ -34,8 +34,8 @@ struct Camera {
     /// onto the drawable: worldX vx→vx+vw to NDC −1→+1, worldZ vy→vy+vh (top→bottom) to
     /// NDC +1→−1. The full-view camera passes the whole bounds; an animated zoom passes a
     /// shrinking/growing sub-rect so the map pushes toward (or pulls back from) a folder.
-    /// Ortho of flat tiles preserves proportions, so the result is iso-visual with the
-    /// CoreGraphics map. z is a constant mid-depth; the Y column stays 0 until boxes extrude.
+    /// Ortho of flat tiles preserves proportions, so the map reads as plain 2D.
+    /// z is a constant mid-depth; the Y column stays 0 until boxes extrude.
     static func ortho(viewport v: CGRect) -> Camera {
         let vw = max(Double(v.width), 1), vh = max(Double(v.height), 1)
         let vx = Double(v.minX), vy = Double(v.minY)
@@ -91,9 +91,9 @@ final class TreemapMetalRenderer {
         let pd = MTLRenderPipelineDescriptor()
         pd.vertexFunction = vfn
         pd.fragmentFunction = ffn
-        pd.colorAttachments[0].pixelFormat = .bgra8Unorm   // non-sRGB: store sRGB values as-is → matches CG
+        pd.colorAttachments[0].pixelFormat = .bgra8Unorm   // non-sRGB: colours arrive sRGB-encoded, stored as-is
         pd.depthAttachmentPixelFormat = .depth32Float
-        pd.sampleCount = sc
+        pd.rasterSampleCount = sc
         guard let pipeline = try? device.makeRenderPipelineState(descriptor: pd) else { return nil }
 
         // Coplanar flat tiles never overlap, so `.lessEqual` (equal-z samples pass,

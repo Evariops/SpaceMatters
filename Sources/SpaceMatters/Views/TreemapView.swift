@@ -223,7 +223,7 @@ final class TreemapNSView: NSView, CALayerDelegate {
         self.renderer = renderer
         let ml = CAMetalLayer()
         ml.device = renderer.device
-        ml.pixelFormat = .bgra8Unorm            // non-sRGB: store sRGB values as-is → matches CG
+        ml.pixelFormat = .bgra8Unorm            // non-sRGB: tile colours are already sRGB-encoded (`tileColor`)
         ml.framebufferOnly = true
         ml.isOpaque = true
         // `presentsWithTransaction` is turned on only while resizing (see
