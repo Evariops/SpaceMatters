@@ -43,8 +43,14 @@ final class ScanController {
 
     /// The node currently focused in the treemap / selected in the list.
     var selection: FSNode?
-    /// The directory the treemap is zoomed into (defaults to root).
+    /// The directory the treemap is focused on (defaults to root). SPEC-10: this
+    /// is a *derived* value while the camera roams (`cameraDidFocus`), and an
+    /// explicit request when navigation asks for it (`zoomRequestID` bumps).
     var zoomRoot: FSNode?
+    /// Bumped by every explicit navigation (double-click, outline, breadcrumb,
+    /// ⌘↑…) — the treemap answers with an animated camera fit. Camera-derived
+    /// focus updates change `zoomRoot` without bumping this.
+    private(set) var zoomRequestID: Int = 0
 
     /// Which directories are expanded in the outline (central, so the treemap can
     /// programmatically expand ancestors to reveal a selection).
@@ -1151,7 +1157,15 @@ final class ScanController {
         guard node.isDirectory else { return }
         zoomRoot = node
         setSelection(node)
-        bump()
+        zoomRequestID &+= 1
+    }
+
+    /// SPEC-10: the treemap camera settled over `node` — follow it in the
+    /// breadcrumb/list without triggering a camera flight back (no request bump)
+    /// and without hijacking the selection.
+    func cameraDidFocus(_ node: FSNode) {
+        guard node !== zoomRoot else { return }
+        zoomRoot = node
     }
 
     /// Breadcrumb path: scan root → current zoom root.
@@ -1168,7 +1182,7 @@ final class ScanController {
     func navigate(to node: FSNode) {
         zoomRoot = node
         reveal(node) // sets selection, selectedRowID, revealTarget, expands ancestors
-        bump()
+        zoomRequestID &+= 1
     }
 
     func zoomOut() {
@@ -1176,14 +1190,14 @@ final class ScanController {
             zoomRoot = parent
             setSelection(parent)
             revealTarget = parent // scroll the list to the newly focused node
-            bump()
+            zoomRequestID &+= 1
         }
     }
 
     func resetZoom() {
         zoomRoot = root
         setSelection(root)
-        bump()
+        zoomRequestID &+= 1
     }
 
     /// Whether zooming out is possible (drives the breadcrumb button + ⌘↑).

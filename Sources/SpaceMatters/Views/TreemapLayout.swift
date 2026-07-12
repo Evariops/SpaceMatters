@@ -115,7 +115,10 @@ enum TreemapLayout {
         return result
     }
 
-    fileprivate struct Item {
+    /// One child slot of a node's layout: a sub-directory, the node's own-files
+    /// block, or (SPEC-05 / file LOD) an individual file. Shared with
+    /// `TreemapWorld`, which reuses the same decision/geometry passes.
+    struct Item {
         let weight: Double
         let node: FSNode
         let isFileBlock: Bool
@@ -197,7 +200,8 @@ enum TreemapLayout {
 
     /// Build a node's size-independent items, sorted by weight (descending) so the
     /// squarify decisions and placement can run without re-sorting on every frame.
-    private static func buildItems(
+    /// Internal: `TreemapWorld` builds its per-node entries from the same items.
+    static func buildItems(
         node: FSNode, depth: Int, metric: SizeMetric, files: [FileTileInfo]?
     ) -> (items: [Item], weights: [Double]) {
         var items: [Item] = []

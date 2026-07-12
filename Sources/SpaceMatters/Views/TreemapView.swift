@@ -5,9 +5,15 @@ import QuartzCore
 
 /// Treemap view. The map itself is drawn by a plain AppKit `NSView`
 /// (`TreemapNSView`) rather than a SwiftUI `Canvas`, so a window resize is driven
-/// straight by AppKit — `setFrameSize` → recompute rects → redraw — with **no**
+/// straight by AppKit — `setFrameSize` → camera update → redraw — with **no**
 /// SwiftUI recompute / reconcile / display-list trip per frame. Profiling showed
 /// that per-frame SwiftUI machinery, not the drawing, was the resize bottleneck.
+///
+/// SPEC-10: the tiles live in a persistent *world* (`TreemapWorld`) and the view
+/// looks at it through a camera. Resize, pan and zoom are camera moves (no
+/// relayout); navigation is map-like (scroll to pan, pinch/wheel to zoom, double
+/// click to dive); detail follows the camera (projected-size LOD); and every
+/// structural change of the world is morph-animated instead of teleporting.
 ///
 /// This thin SwiftUI wrapper only: (1) reads the controller's observable inputs so
 /// SwiftUI calls `updateNSView` when they change, (2) hosts the hover-label overlay
@@ -38,6 +44,7 @@ struct TreemapView: View {
                 theme: theme,
                 version: controller.version,
                 zoomRoot: controller.zoomRoot,
+                zoomRequestID: controller.zoomRequestID,
                 metric: controller.metric,
                 selection: controller.selection,
                 selectedExt: controller.selectedExt,
@@ -121,14 +128,15 @@ private struct HoverPill: View {
 }
 
 /// Bridges the AppKit `TreemapNSView` into SwiftUI. `updateNSView` pushes the
-/// current observable inputs; the NSView decides what that implies (relayout vs a
-/// cheap overlay/dimming redraw).
+/// current observable inputs; the NSView decides what that implies (world sync,
+/// camera navigation, or a cheap overlay/dimming redraw).
 private struct TreemapRepresentable: NSViewRepresentable {
     let renderer: TreemapMetalRenderer
     let controller: ScanController
     let theme: Theme
     let version: UInt64
     let zoomRoot: FSNode?
+    let zoomRequestID: Int
     let metric: SizeMetric
     let selection: FSNode?
     let selectedExt: ExtKey?
@@ -141,29 +149,29 @@ private struct TreemapRepresentable: NSViewRepresentable {
         let view = TreemapNSView(renderer: renderer)
         view.onHover = onHover
         view.apply(controller: controller, theme: theme, version: version, zoomRoot: zoomRoot,
-                   metric: metric, selection: selection, selectedExt: selectedExt,
-                   searchMatchIDs: searchMatchIDs, highlightVersion: highlightVersion)
+                   zoomRequestID: zoomRequestID, metric: metric, selection: selection,
+                   selectedExt: selectedExt, searchMatchIDs: searchMatchIDs,
+                   highlightVersion: highlightVersion)
         return view
     }
 
     func updateNSView(_ view: TreemapNSView, context: Context) {
         view.onHover = onHover
         view.apply(controller: controller, theme: theme, version: version, zoomRoot: zoomRoot,
-                   metric: metric, selection: selection, selectedExt: selectedExt,
-                   searchMatchIDs: searchMatchIDs, highlightVersion: highlightVersion)
+                   zoomRequestID: zoomRequestID, metric: metric, selection: selection,
+                   selectedExt: selectedExt, searchMatchIDs: searchMatchIDs,
+                   highlightVersion: highlightVersion)
     }
 }
 
-/// The drawn treemap: an AppKit view AppKit resizes directly. Tiles are rendered by
-/// the GPU into the view's backing `CAMetalLayer` (SPEC-09); the hover outline +
-/// selection spotlight live in a CG overlay layer (redrawn on hover/selection
-/// alone), so hovering never re-renders the ~thousands of tiles.
-///
-/// Allocation discipline (the resize hot path is `setFrameSize` → `relayout` →
-/// `presentTiles`): tile colours (a bounded LUT), the hue-index cache and theme
-/// CGColors are all reused across frames; the per-frame `instances`/`sizeScratch`
-/// buffers keep their capacity. Only the tiles array (whose rects genuinely change
-/// every frame) is rebuilt.
+/// The drawn treemap: an AppKit view AppKit resizes directly. Tiles live in the
+/// persistent `TreemapWorld` and are rendered by the GPU into the view's backing
+/// `CAMetalLayer` through a camera; the hover outline + selection spotlight live
+/// in a CG overlay layer that follows the camera. A camera move (resize, pan,
+/// zoom) re-renders with a new matrix — no layout, no instance packing, no
+/// allocation. The draw list rebuilds only when the camera leaves the built
+/// margin, crosses an LOD threshold, or the data changes — and structural
+/// changes morph instead of jumping.
 final class TreemapNSView: NSView, CALayerDelegate {
     var onHover: ((HoverInfo?) -> Void)?
 
@@ -172,6 +180,7 @@ final class TreemapNSView: NSView, CALayerDelegate {
     private var theme = Theme(isDark: true)
     private var version: UInt64 = .max
     private var zoomRoot: FSNode?
+    private var zoomRequestID: Int = .min
     private var metric: SizeMetric = .physical
     private var selection: FSNode?
     private var selectedExt: ExtKey?
@@ -179,20 +188,50 @@ final class TreemapNSView: NSView, CALayerDelegate {
     private var highlightVersion: Int = .min
     private var isDark = true
 
-    // Layout state.
-    private var tiles: [TreemapTile] = []
-    private var instances: [TileInstance] = []    // GPU instances (culled to visible tiles)
+    // The world and the camera (SPEC-10).
+    private let world = TreemapWorld()
+    private var camera = WorldCamera(rect: .zero)
+    /// Camera glued to the world bounds: a resize re-fits instead of preserving scale.
+    private var fitMode = true
+    private var scanRoot: FSNode?
+
+    // Draw list (world coordinates) & GPU instances (camera-rebased floats).
+    private var tiles: [TreemapWorld.Tile] = []
     private var regions: [ObjectIdentifier: CGRect] = [:]
     private var regionsBuilt = false
-    private var hovered: TreemapTile?
+    private var instances: [TileInstance] = []
+    private var rebaseOrigin = CGPoint.zero
+    /// World rect the current build covers (visible + margin) and its scale — the
+    /// camera can roam inside without a rebuild.
+    private var builtRect = CGRect.zero
+    private var builtScale: (sx: CGFloat, sy: CGFloat) = (1, 1)
+    /// World rects of the previous build, keyed by tile identity — morph pairing.
+    private var lastRects: [TreemapWorld.TileKey: CGRect] = [:]
+    private var hovered: TreemapWorld.Tile?
 
-    // Tile layer: the view's backing `CAMetalLayer` (SPEC-09). The selection/hover
-    // overlay stays a CG layer above it (Phase 1).
+    // Morph clock (structural transitions) + camera animation (navigation fits).
+    private var animLink: CADisplayLink?
+    private var morphStart: CFTimeInterval = -1
+    private var morphT: Float = 1
+    private static let morphDuration: CFTimeInterval = 0.22
+    private var camFrom = CGRect.zero
+    private var camTo = CGRect.zero
+    private var camStart: CFTimeInterval = -1
+    private var camAnimating = false
+    private static let camDuration: CFTimeInterval = 0.5
+
+    /// Debounced camera-settle work: derive the focused folder for the breadcrumb.
+    private var focusWork: DispatchWorkItem?
+    /// One-shot follow-up when a file listing was still loading during a build.
+    private var fileRetryScheduled = false
+    private var fileAttempts: [ObjectIdentifier: Int] = [:]
+
+    // Layers.
     private let metalLayer: CAMetalLayer
     private let renderer: TreemapMetalRenderer
     private let overlayLayer = CALayer()
 
-    // MARK: Caches (persist across relayouts)
+    // MARK: Caches (persist across rebuilds)
 
     private static let brightnessBuckets = 256
     private let paletteCount = Theme.paletteHues.count
@@ -200,9 +239,6 @@ final class TreemapNSView: NSView, CALayerDelegate {
     private var colorLUT: [SIMD4<Float>?] = []
     private var colorKey: ColorKey?
     private var sizeScratch: [Int64] = []
-
-    private var rootFilesCache: [FileTileInfo]?
-    private var rootFilesKey: RootFilesKey?
 
     // Theme-derived CGColors for the overlay (rebuilt on theme change).
     private var backgroundCG = CGColor(gray: 0, alpha: 1)
@@ -216,6 +252,11 @@ final class TreemapNSView: NSView, CALayerDelegate {
     private static let hoverCG = CGColor(gray: 1, alpha: 0.95)
 
     private struct ColorKey: Equatable { let isDark: Bool; let version: UInt64 }
+
+    /// Aspect drift (window vs world) beyond which the end of a live resize
+    /// re-bakes the world at the new aspect (animated). Below it, the bounded
+    /// stretch is kept — decisions stay put.
+    private static let aspectHysteresis: CGFloat = 0.10
 
     // MARK: Setup
 
@@ -269,15 +310,42 @@ final class TreemapNSView: NSView, CALayerDelegate {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        if window == nil { cancelZoom() }     // break the CADisplayLink → self cycle on teardown
+        if window == nil { cancelAnimations() }   // break the CADisplayLink → self cycle on teardown
     }
 
     private func setScale(_ scale: CGFloat) {
         metalLayer.contentsScale = scale
-        metalLayer.drawableSize = CGSize(width: bounds.width * scale, height: bounds.height * scale)
+        updateDrawableSize(pooled: false)
         presentTiles()
         overlayLayer.contentsScale = scale
         overlayLayer.setNeedsDisplay()
+    }
+
+    /// Size the drawable. During a live resize the drawable is *pooled*: rounded up
+    /// to 256-px steps and cropped via `contentsRect`, so the CAMetalLayer's
+    /// IOSurface pool survives the drag instead of reallocating per frame
+    /// (SPEC-10 §3.6 — the profiled hitch source). At rest the size is exact.
+    private func updateDrawableSize(pooled: Bool) {
+        let scale = metalLayer.contentsScale
+        let target = CGSize(width: max(bounds.width * scale, 1), height: max(bounds.height * scale, 1))
+        if pooled {
+            let pw = (Int(target.width) + 255) & ~255
+            let ph = (Int(target.height) + 255) & ~255
+            let current = metalLayer.drawableSize
+            let w = max(CGFloat(pw), current.width)
+            let h = max(CGFloat(ph), current.height)
+            metalLayer.drawableSize = CGSize(width: w, height: h)
+            metalLayer.contentsRect = CGRect(x: 0, y: 0, width: target.width / w, height: target.height / h)
+        } else {
+            metalLayer.drawableSize = target
+            metalLayer.contentsRect = CGRect(x: 0, y: 0, width: 1, height: 1)
+        }
+    }
+
+    /// Pixel size actually displayed (≤ drawableSize when pooled).
+    private var contentPixelSize: CGSize {
+        let scale = metalLayer.contentsScale
+        return CGSize(width: bounds.width * scale, height: bounds.height * scale)
     }
 
     // Synchronous presents (`presentsWithTransaction`) only while the window is
@@ -292,61 +360,106 @@ final class TreemapNSView: NSView, CALayerDelegate {
     override func viewDidEndLiveResize() {
         super.viewDidEndLiveResize()
         metalLayer.presentsWithTransaction = false
+        updateDrawableSize(pooled: false)
+        // Aspect hysteresis: a drag that left the window/world aspects too far
+        // apart re-bakes the world at the new aspect — the one global re-decide
+        // allowed, and it morphs (SPEC-10 §3.1).
+        if fitMode, bounds.height > 1 {
+            let viewAspect = bounds.width / bounds.height
+            if abs(viewAspect / world.aspect - 1) > Self.aspectHysteresis {
+                world.rebake(aspect: viewAspect)
+                camera.rect = world.worldBounds
+                rebuildTiles(morph: true)
+            }
+        }
+        presentTiles()
+        overlayLayer.setNeedsDisplay()
     }
 
     // MARK: SwiftUI → view
 
     func apply(controller: ScanController, theme: Theme, version: UInt64, zoomRoot: FSNode?,
-               metric: SizeMetric, selection: FSNode?, selectedExt: ExtKey?,
+               zoomRequestID: Int, metric: SizeMetric, selection: FSNode?, selectedExt: ExtKey?,
                searchMatchIDs: Set<ObjectIdentifier>, highlightVersion: Int) {
         self.controller = controller
-        let oldZoomRoot = self.zoomRoot   // capture before the assignment below (for zoom animation)
-        let oldMetric = self.metric
 
         let themeChanged = isDark != theme.isDark
         self.theme = theme
         self.isDark = theme.isDark
         if themeChanged { rebuildThemeColors() }
 
-        let structural = version != self.version || zoomRoot !== self.zoomRoot
-            || metric != self.metric || themeChanged
+        // The world's root is the *scan* root — the camera navigates inside it.
+        var root = zoomRoot
+        while let parent = root?.parent { root = parent }
+        let rootChanged = root !== scanRoot
+
+        let dataChanged = version != self.version || metric != self.metric || themeChanged
+        let navRequested = zoomRequestID != self.zoomRequestID && self.zoomRequestID != .min
+        let firstApply = self.zoomRequestID == .min
         let highlightChanged = selectedExt != self.selectedExt
             || highlightVersion != self.highlightVersion || searchMatchIDs != self.searchMatchIDs
         let selectionChanged = selection !== self.selection
 
         self.version = version
         self.zoomRoot = zoomRoot
+        self.zoomRequestID = zoomRequestID
         self.metric = metric
         self.selectedExt = selectedExt
         self.searchMatchIDs = searchMatchIDs
         self.highlightVersion = highlightVersion
         self.selection = selection
+        self.scanRoot = root
 
-        if structural {
-            // A pure zoom navigation (from the treemap or the outline) animates the camera;
-            // anything else (scan update, metric, theme) relays out instantly.
-            if zoomRoot !== oldZoomRoot, let oldRoot = oldZoomRoot, let newRoot = zoomRoot,
-               zoomLink == nil, !inLiveResize, !instances.isEmpty,
-               startZoomAnimation(from: oldRoot, to: newRoot) {
-                overlayLayer.setNeedsDisplay()
-            } else if zoomLink != nil, zoomRoot === oldZoomRoot, metric == oldMetric, !themeChanged {
-                // Version-only bump (the 10 Hz scan tick, an FSEvents dirty-dot
-                // repaint) while the camera animates: defer the relayout to the
-                // end of the animation instead of cancelling it — otherwise the
-                // push-in can never complete during a live scan.
-                pendingRelayout = true
-            } else {
-                if zoomLink != nil { cancelZoom() }
-                relayout()
-                presentTiles()
-                overlayLayer.setNeedsDisplay()
+        guard let root else {
+            tiles = []; instances = []; regions = [:]; regionsBuilt = false
+            renderer.upload(instances: [], previous: nil)
+            presentTiles()
+            overlayLayer.setNeedsDisplay()
+            return
+        }
+        world.sync(root: root, metric: metric, version: version)
+
+        if rootChanged || firstApply {
+            // A new scan (or first appearance): fresh world, camera at fit.
+            cancelAnimations()
+            fitMode = true
+            if bounds.width > 1, bounds.height > 1 {
+                let viewAspect = bounds.width / bounds.height
+                if abs(viewAspect / world.aspect - 1) > Self.aspectHysteresis {
+                    world.rebake(aspect: viewAspect)
+                }
             }
-        } else {
+            camera.rect = world.worldBounds
+            rebuildTiles(morph: false)
+            presentTiles()
+            overlayLayer.setNeedsDisplay()
+            return
+        }
+
+        if dataChanged {
+            // Scan tick / FSEvents refresh / metric change: entries revalidate
+            // lazily (ε-local), and whatever moved morphs (SPEC-10 §3.4). A pure
+            // theme change only recolours — no motion to animate.
+            rebuildTiles(morph: !themeChanged)
+            presentTiles()
+            overlayLayer.setNeedsDisplay()
+        }
+
+        if navRequested, let target = zoomRoot {
+            // Explicit navigation (double-click, outline, breadcrumb, ⌘↑): an
+            // animated camera fit — the world does not move.
+            if let rect = world.worldRect(of: target, root: root) {
+                animateCamera(to: target === root ? world.worldBounds : fitTarget(for: rect))
+                fitMode = target === root
+            }
+        }
+
+        if !dataChanged {
             if selectionChanged && selection != nil && !regionsBuilt {
-                relayout()               // need the region map to outline the new selection
+                rebuildTiles(morph: false)   // need the region map to outline the new selection
                 presentTiles()
             } else if highlightChanged {
-                computeColors()          // dimming changed; rects unchanged → repack (Metal folds dim in)
+                repackInstances()            // dimming changed; rects unchanged → repack
                 presentTiles()
             }
             if selectionChanged { overlayLayer.setNeedsDisplay() }
@@ -367,59 +480,127 @@ final class TreemapNSView: NSView, CALayerDelegate {
                             Float(ns.blueComponent), Float(ns.alphaComponent))
     }
 
-    // MARK: Resize (AppKit-driven — the hot path)
+    // MARK: Resize (AppKit-driven — now a camera move)
 
     override func setFrameSize(_ newSize: NSSize) {
-        let changed = newSize != frame.size
+        let oldSize = frame.size
+        let changed = newSize != oldSize
         super.setFrameSize(newSize)
         guard changed else { return }
-        // A resize mid-zoom (split-divider drag — not a window live-resize) would
-        // render the old layout's camera over the new layout: fast-forward to the
-        // end state first, then lay out at the new size below.
-        if zoomLink != nil { finishZoom() }
         overlayLayer.frame = bounds
-        // Backing-layer frame is managed by AppKit; we only resize the drawable + redraw.
-        let scale = window?.backingScaleFactor ?? 2
-        metalLayer.drawableSize = CGSize(width: bounds.width * scale, height: bounds.height * scale)
+        updateDrawableSize(pooled: inLiveResize)
         // This frame's present must stay atomic with the bounds change (no
         // band behind a split-divider drag); reverted below unless a window
         // live-resize keeps the synchronous path on.
         metalLayer.presentsWithTransaction = true
-        // The squarified layout is now monotone under resize (TreemapLayout freezes the
-        // discrete row/orientation/recurse decisions and reruns only continuous geometry),
-        // so a full relayout every frame flows smoothly — no freeze/settle needed.
-        relayout()
+        if fitMode {
+            camera.rect = world.worldBounds
+        } else if oldSize.width > 1, oldSize.height > 1 {
+            // Free camera: keep the scale, reveal more/less world (map-window feel).
+            let cx = camera.rect.midX, cy = camera.rect.midY
+            let w = camera.rect.width * newSize.width / oldSize.width
+            let h = camera.rect.height * newSize.height / oldSize.height
+            camera.rect = clampedViewport(CGRect(x: cx - w / 2, y: cy - h / 2, width: w, height: h))
+        }
+        maybeRebuild()
         presentTiles()
         overlayLayer.setNeedsDisplay()
         if !inLiveResize { metalLayer.presentsWithTransaction = false }
     }
 
-    // MARK: Layout (size-dependent placement + colours)
+    // MARK: World → GPU (the only non-camera work)
 
-    private func relayout() {
-        pendingRelayout = false   // any relayout consumes a deferred one
-        hovered = nil
-        guard let controller, let zoomRoot, bounds.width > 1, bounds.height > 1 else {
-            tiles = []; instances.removeAll(keepingCapacity: true)
-            regions = [:]; regionsBuilt = false
+    /// Rebuild the LOD tile set for the current camera and pack it into GPU
+    /// instances. `morph` pairs each tile with its previous world rect (or its
+    /// nearest ancestor's) and animates the transition.
+    private func rebuildTiles(morph: Bool) {
+        guard let controller, let root = scanRoot, bounds.width > 1, bounds.height > 1,
+              camera.rect.width > 0, camera.rect.height > 0 else {
+            tiles = []; instances = []; regions = [:]; regionsBuilt = false
+            renderer.upload(instances: [], previous: nil)
             return
         }
-        let rect = bounds.insetBy(dx: 1, dy: 1)
-        let rootFiles = rootFileTiles(for: zoomRoot, controller: controller)
-        let needRegions = selection != nil
-        let result = controller.treemapLayout(root: zoomRoot, rect: rect, rootFiles: rootFiles,
-                                              needsRegions: needRegions)
+        hovered = nil
+        let scale = camera.scale(viewSize: bounds.size)
+        let needsRegions = selection != nil
+        let result = world.build(root: root, visible: camera.rect, scale: scale,
+                                 needsRegions: needsRegions, files: { [weak self] node in
+            self?.fileTiles(for: node, controller: controller)
+        })
         tiles = result.tiles
         regions = result.regions
-        regionsBuilt = needRegions
-        computeColors()
+        regionsBuilt = needsRegions
+        builtRect = camera.rect.insetBy(dx: -camera.rect.width * TreemapWorld.buildMargin,
+                                        dy: -camera.rect.height * TreemapWorld.buildMargin)
+        builtScale = scale
+        if result.pendingFiles { scheduleFileRetry() }
+
+        // Morph pairing: previous world rect per tile key, falling back to the
+        // nearest ancestor's previous rect (a newly expanded child grows out of
+        // its parent — the map's "tile split").
+        var previous: [TileInstance]? = nil
+        let doMorph = morph && !lastRects.isEmpty && !inLiveResize
+        packInstances()
+        if doMorph {
+            var prev = instances
+            for i in tiles.indices {
+                let key = TreemapWorld.TileKey(tiles[i])
+                let prevRect = lastRects[key] ?? ancestorRect(for: tiles[i].node)
+                if let prevRect {
+                    prev[i].origin.x = Float(prevRect.minX - rebaseOrigin.x)
+                    prev[i].origin.z = Float(prevRect.minY - rebaseOrigin.y)
+                    prev[i].size.x = Float(prevRect.width)
+                    prev[i].size.z = Float(prevRect.height)
+                }
+            }
+            previous = prev
+        }
+        var rects: [TreemapWorld.TileKey: CGRect] = [:]
+        rects.reserveCapacity(tiles.count)
+        for tile in tiles { rects[TreemapWorld.TileKey(tile)] = tile.rect }
+        lastRects = rects
+
+        renderer.upload(instances: instances, previous: previous)
+        if previous != nil { startMorph() } else { morphT = 1 }
     }
 
-    /// Rebuild the GPU `instances` from the current tiles. Size is read once per tile
-    /// (into `sizeScratch`) and reused for both the max pass and the weight, halving
-    /// the atomic loads; `instances` keeps its buffer capacity across frames.
-    private func computeColors() {
+    /// Nearest ancestor of `node` that had a rect in the previous build.
+    private func ancestorRect(for node: FSNode) -> CGRect? {
+        var cur: FSNode? = node
+        while let n = cur {
+            if let r = lastRects[TreemapWorld.TileKey(id: ObjectIdentifier(n), isFileBlock: false, fileName: nil)] {
+                return r
+            }
+            cur = n.parent
+        }
+        return nil
+    }
+
+    /// Rebuild the camera-dependent parts only when the camera leaves the built
+    /// margin or its scale drifts past the LOD band. Pure camera frames skip this.
+    private func maybeRebuild() {
+        guard scanRoot != nil else { return }
+        guard builtRect.width > 0 else {
+            // Nothing built yet (the first apply ran before the view had a size).
+            rebuildTiles(morph: false)
+            return
+        }
+        let scale = camera.scale(viewSize: bounds.size)
+        let scaleDrift = max(scale.sx / builtScale.sx, scale.sy / builtScale.sy)
+        let outgrown = !builtRect.contains(camera.rect)
+        if outgrown || scaleDrift > 1.3 || scaleDrift < 0.77 {
+            // Morph on zoom-driven rebuilds (LOD splits/merges — the Maps feel);
+            // pan-driven edge fills appear instantly.
+            rebuildTiles(morph: scaleDrift > 1.3 || scaleDrift < 0.77)
+        }
+    }
+
+    /// Pack `tiles` into GPU `instances`: camera-rebased world rect on the ground
+    /// plane (Float precision holds because coordinates are relative to the built
+    /// visible rect — the floating origin), packed sRGB colour, dim folded in.
+    private func packInstances() {
         let n = tiles.count
+        rebaseOrigin = builtRect.origin
         let key = ColorKey(isDark: isDark, version: version)
         if colorKey != key {
             hueIndexCache.removeAll(keepingCapacity: true)
@@ -433,22 +614,14 @@ final class TreemapNSView: NSView, CALayerDelegate {
             sizeScratch[i] = s
             if s > maxSize { maxSize = s }
         }
-        packInstances(denom: Double(maxSize))
-    }
-
-    /// Pack `tiles` into GPU `instances`: world rect on the ground plane
-    /// (top-left, height 0), packed sRGB colour, dim folded in. Sub-pixel tiles are
-    /// culled here — `instances` may be shorter than `tiles`; hit-testing uses `tiles`.
-    private func packInstances(denom: Double) {
-        let n = tiles.count
-        instances.removeAll(keepingCapacity: true)
-        instances.reserveCapacity(n)
+        let denom = Double(maxSize)
         let highlightName = selectedExt?.displayName
         let hasSearch = highlightName == nil && !searchMatchIDs.isEmpty
+        instances.removeAll(keepingCapacity: true)
+        instances.reserveCapacity(n)
         for i in 0..<n {
             let tile = tiles[i]
             let r = tile.rect
-            if r.width <= 0.5 || r.height <= 0.5 { continue }
             let weight = min(1.0, max(0.0, pow(Double(sizeScratch[i]) / denom, 0.40)))
             var dim: Float = 0
             if let highlightName {
@@ -458,15 +631,57 @@ final class TreemapNSView: NSView, CALayerDelegate {
                 dim = 1
             }
             instances.append(TileInstance(
-                origin: SIMD4<Float>(Float(r.minX), 0, Float(r.minY), 0),
+                origin: SIMD4<Float>(Float(r.minX - rebaseOrigin.x), 0, Float(r.minY - rebaseOrigin.y), 0),
                 size: SIMD4<Float>(Float(r.width), 0, Float(r.height), dim),
                 color: tileColor(for: tile, weight: weight)))
         }
     }
 
+    /// Highlight/search change: same tiles, new dims — repack and re-upload.
+    private func repackInstances() {
+        packInstances()
+        renderer.upload(instances: instances, previous: nil)
+        morphT = 1
+    }
+
+    private func tileSize(_ tile: TreemapWorld.Tile) -> Int64 {
+        if let file = tile.file { return file.size }
+        return tile.isFileBlock ? tile.node.directFilesSize(metric) : tile.node.size(metric)
+    }
+
+    /// File tiles for a folder whose block crossed the file-LOD threshold.
+    /// `nil` = listing still loading (a one-shot rebuild retries shortly).
+    private func fileTiles(for node: FSNode, controller: ScanController) -> [FileTileInfo]? {
+        guard controller.isHostScan, !controller.isScanning else { return [] }
+        let items = controller.filesIn(node)
+        if items.isEmpty && node.directFileCount > 0 {
+            let id = ObjectIdentifier(node)
+            let attempts = fileAttempts[id, default: 0]
+            if attempts < 3 {
+                fileAttempts[id] = attempts + 1
+                return nil   // in flight
+            }
+            return []        // failed/blocked: keep the aggregate block
+        }
+        return items.map {
+            FileTileInfo(name: $0.name, size: $0.size(metric), extName: OutlineRowView.extDisplay($0.name))
+        }
+    }
+
+    private func scheduleFileRetry() {
+        guard !fileRetryScheduled else { return }
+        fileRetryScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            guard let self else { return }
+            self.fileRetryScheduled = false
+            self.rebuildTiles(morph: true)
+            self.presentTiles()
+        }
+    }
+
     /// sRGB RGBA for a tile, memoised in a bounded `(hueIndex, bucket)` LUT —
-    /// no per-frame `NSColor`/hashing on the resize hot path.
-    private func tileColor(for tile: TreemapTile, weight: Double) -> SIMD4<Float> {
+    /// no per-frame `NSColor`/hashing on the hot path.
+    private func tileColor(for tile: TreemapWorld.Tile, weight: Double) -> SIMD4<Float> {
         let hueIdx: Int
         if let ext = tile.file?.extName {
             hueIdx = Theme.stableIndex(ext, paletteCount)
@@ -490,56 +705,209 @@ final class TreemapNSView: NSView, CALayerDelegate {
         return v
     }
 
-    /// Push the current tiles to screen (a GPU render). During a zoom animation
-    /// `zoomViewport` overrides the full-bounds camera so the map pushes toward /
-    /// pulls back from a folder (same tiles, a moving orthographic camera).
+    /// Push the current world to screen through the camera — a pure GPU render.
     private func presentTiles() {
-        let viewport = zoomViewport ?? CGRect(origin: .zero, size: bounds.size)
-        renderer.render(into: metalLayer, instances: instances,
-                        camera: Camera.ortho(viewport: viewport),
-                        clearColor: backgroundComps, borderColor: borderComps)
+        let viewport = camera.rect.offsetBy(dx: -rebaseOrigin.x, dy: -rebaseOrigin.y)
+        renderer.draw(into: metalLayer,
+                      camera: Camera.ortho(viewport: viewport),
+                      pointsPerUnit: camera.scale(viewSize: bounds.size),
+                      morph: morphT,
+                      clearColor: backgroundComps,
+                      borderColor: borderComps,
+                      contentSize: contentPixelSize)
     }
 
-    private func tileSize(_ tile: TreemapTile) -> Int64 {
-        if let file = tile.file { return file.size }
-        return tile.isFileBlock ? tile.node.directFilesSize(metric) : tile.node.size(metric)
+    // MARK: Camera navigation (SPEC-10 M2 — the map)
+
+    /// Expand a node's rect to the world aspect (the camera rect's invariant
+    /// aspect), so a navigation fit never changes the on-screen stretch.
+    private func fitTarget(for rect: CGRect) -> CGRect {
+        let aspect = world.aspect
+        var w = rect.width, h = rect.height
+        if w / h > aspect { h = w / aspect } else { w = h * aspect }
+        // Slight breathing room around the target folder.
+        w *= 1.02; h *= 1.02
+        return clampedViewport(CGRect(x: rect.midX - w / 2, y: rect.midY - h / 2, width: w, height: h))
     }
 
-    /// The zoom root's own files as tiles (SPEC-05), memoised by (zoom, metric,
-    /// version) so a resize reuses the mapping instead of re-deriving extension
-    /// labels for up to `maxFilesPerFolder` files every frame.
-    private func rootFileTiles(for zoom: FSNode, controller: ScanController) -> [FileTileInfo]? {
-        guard controller.isHostScan, !controller.isScanning else { return nil }
-        let key = RootFilesKey(zoom: ObjectIdentifier(zoom), metric: metric, version: version)
-        if rootFilesKey == key { return rootFilesCache }
-        let items = controller.filesIn(zoom)
-        let mapped: [FileTileInfo]? = items.isEmpty ? nil : items.map {
-            FileTileInfo(name: $0.name, size: $0.size(metric), extName: OutlineRowView.extDisplay($0.name))
+    /// Keep the viewport inside the world (when smaller) and snap to fit (when
+    /// it would exceed it). Also bounds the zoom-in so Double math stays sane.
+    private func clampedViewport(_ rect: CGRect) -> CGRect {
+        var r = rect
+        let wb = world.worldBounds
+        let minW = wb.width / 1_000_000
+        if r.width < minW {
+            let f = minW / r.width
+            r = CGRect(x: r.midX - r.width * f / 2, y: r.midY - r.height * f / 2,
+                       width: r.width * f, height: r.height * f)
         }
-        rootFilesCache = mapped
-        rootFilesKey = key
-        return mapped
+        if r.width >= wb.width || r.height >= wb.height {
+            return wb
+        }
+        if r.minX < wb.minX { r.origin.x = wb.minX }
+        if r.minY < wb.minY { r.origin.y = wb.minY }
+        if r.maxX > wb.maxX { r.origin.x = wb.maxX - r.width }
+        if r.maxY > wb.maxY { r.origin.y = wb.maxY - r.height }
+        return r
     }
 
-    // MARK: Drawing
+    override func scrollWheel(with event: NSEvent) {
+        guard scanRoot != nil else { return }
+        let isGesture = event.phase != [] || event.momentumPhase != []
+        if isGesture {
+            // Trackpad: two-finger pan — the content follows the fingers
+            // (`scrollingDelta` already folds in the natural-scrolling preference).
+            let delta = CGSize(width: event.scrollingDeltaX, height: event.scrollingDeltaY)
+            camera.pan(byView: delta, viewSize: bounds.size)
+            camera.rect = clampedViewport(camera.rect)
+            fitMode = camera.rect == world.worldBounds
+        } else {
+            // Mouse wheel: zoom toward the cursor (the Maps convention).
+            let p = topLeftPoint(event)
+            let factor = pow(1.1, event.scrollingDeltaY)
+            zoomCamera(by: factor, anchor: p)
+        }
+        cameraMoved()
+    }
+
+    override func magnify(with event: NSEvent) {
+        guard scanRoot != nil else { return }
+        zoomCamera(by: 1 + event.magnification, anchor: topLeftPoint(event))
+        cameraMoved()
+    }
+
+    private func zoomCamera(by factor: CGFloat, anchor: CGPoint) {
+        guard factor > 0 else { return }
+        camera.zoom(by: factor, anchorView: anchor, viewSize: bounds.size)
+        camera.rect = clampedViewport(camera.rect)
+        fitMode = camera.rect == world.worldBounds
+    }
+
+    /// Common postlude of every interactive camera move.
+    private func cameraMoved() {
+        camAnimating = false
+        maybeRebuild()
+        presentTiles()
+        overlayLayer.setNeedsDisplay()
+        scheduleFocusDerivation()
+    }
+
+    /// After the camera settles, derive the deepest folder containing the view —
+    /// the breadcrumb/list follow the map (`zoomRoot` as a derived value).
+    private func scheduleFocusDerivation() {
+        focusWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, let controller = self.controller, let root = self.scanRoot else { return }
+            let focus = self.world.focusNode(root: root, visible: self.camera.rect)
+            if focus !== controller.zoomRoot { controller.cameraDidFocus(focus) }
+        }
+        focusWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
+    }
+
+    /// Mouse location in top-left view coordinates (the world's orientation).
+    private func topLeftPoint(_ event: NSEvent) -> CGPoint {
+        let p = convert(event.locationInWindow, from: nil)
+        return CGPoint(x: p.x, y: bounds.height - p.y)
+    }
+
+    // MARK: Animation clock (camera fits + morphs share one link)
+
+    private func animateCamera(to target: CGRect) {
+        camFrom = camera.rect
+        camTo = target
+        camStart = -1
+        camAnimating = true
+        ensureLink()
+    }
+
+    private func startMorph() {
+        morphT = 0
+        morphStart = -1
+        ensureLink()
+    }
+
+    private func ensureLink() {
+        guard animLink == nil else { return }
+        let link = displayLink(target: self, selector: #selector(animStep(_:)))
+        link.add(to: .main, forMode: .common)
+        animLink = link
+    }
+
+    @objc private func animStep(_ link: CADisplayLink) {
+        var active = false
+        if camAnimating {
+            if camStart < 0 { camStart = link.timestamp }
+            let t = min(1, (link.timestamp - camStart) / Self.camDuration)
+            camera.rect = interpolatedViewport(easeInOut(t))
+            if t >= 1 {
+                camAnimating = false
+                camera.rect = camTo
+                fitMode = camera.rect == world.worldBounds
+                maybeRebuild()
+                overlayLayer.setNeedsDisplay()
+                scheduleFocusDerivation()
+            } else {
+                active = true
+            }
+        }
+        if morphT < 1 {
+            if morphStart < 0 { morphStart = link.timestamp }
+            let t = min(1, (link.timestamp - morphStart) / Self.morphDuration)
+            morphT = Float(easeInOut(t))
+            if t < 1 { active = true }
+        }
+        presentTiles()
+        if !active {
+            animLink?.invalidate()
+            animLink = nil
+        }
+    }
+
+    private func cancelAnimations() {
+        animLink?.invalidate()
+        animLink = nil
+        camAnimating = false
+        morphT = 1
+        focusWork?.cancel()
+    }
+
+    /// Geometric interpolation of the viewport (constant-velocity zoom) between the
+    /// two framings, `e` already eased.
+    private func interpolatedViewport(_ e: Double) -> CGRect {
+        let a = camFrom, b = camTo
+        let aw = max(Double(a.width), 0.5), ah = max(Double(a.height), 0.5)
+        let w = aw * pow(Double(b.width) / aw, e)
+        let h = ah * pow(Double(b.height) / ah, e)
+        let cx = Double(a.midX) + (Double(b.midX) - Double(a.midX)) * e
+        let cy = Double(a.midY) + (Double(b.midY) - Double(a.midY)) * e
+        return CGRect(x: cx - w / 2, y: cy - h / 2, width: w, height: h)
+    }
+
+    private func easeInOut(_ t: Double) -> Double {
+        t < 0.5 ? 4 * t * t * t : 1 - pow(-2 * t + 2, 3) / 2
+    }
+
+    // MARK: Drawing (CG overlay — follows the camera)
 
     func draw(_ layer: CALayer, in ctx: CGContext) {
         // The layer context is native Core Graphics: bottom-left, y-up, text upright.
-        // The rects are top-left, so each is flipped into this space at draw time
-        // (`flip`). No context or text-matrix flips — so glyphs can never mirror.
+        // World rects are converted to top-left view coordinates via the camera,
+        // then flipped into this space at draw time (`flip`).
         guard layer === overlayLayer else { return }
         drawOverlay(in: ctx, size: layer.bounds.size)
     }
 
-    /// Flip a top-left tile rect into the context's native bottom-left space.
+    /// Flip a top-left view rect into the context's native bottom-left space.
     private func flip(_ r: CGRect, _ height: CGFloat) -> CGRect {
         CGRect(x: r.minX, y: height - r.maxY, width: r.width, height: r.height)
     }
 
     private func drawOverlay(in ctx: CGContext, size: CGSize) {
-        guard zoomLink == nil else { return }   // hidden during a zoom (CG can't follow the Metal camera)
-        if let selection, let sel = selectionRect(for: selection) {
-            let r = flip(sel, size.height)
+        guard !camAnimating else { return }   // redrawn when the camera lands
+        if let selection, let sel = selectionRect(for: selection),
+           case let r = flip(camera.worldToView(sel, viewSize: bounds.size), size.height),
+           r.intersects(CGRect(origin: .zero, size: size)) {
             // Spotlight: dim everything outside the selected region.
             ctx.setFillColor(Self.spotlightDimCG)
             ctx.addRect(CGRect(origin: .zero, size: size))
@@ -560,7 +928,7 @@ final class TreemapNSView: NSView, CALayerDelegate {
             ctx.restoreGState()
         }
         if let hovered {
-            let r = flip(hovered.rect, size.height)
+            let r = flip(camera.worldToView(hovered.rect, viewSize: bounds.size), size.height)
             ctx.setStrokeColor(Self.hoverCG)
             ctx.setLineWidth(1.5)
             ctx.stroke(r.insetBy(dx: 0.75, dy: 0.75))
@@ -576,14 +944,15 @@ final class TreemapNSView: NSView, CALayerDelegate {
         return false
     }
 
-    /// Bounding region of a directory in the current layout, falling back to the
+    /// Bounding region of a directory in the current build, falling back to the
     /// nearest ancestor that has one (the tile it visually lives inside).
     private func selectionRect(for node: FSNode) -> CGRect? {
-        if node === zoomRoot { return nil }
         var cur: FSNode? = node
         while let n = cur {
-            if let r = regions[ObjectIdentifier(n)] { return r }
-            if n === zoomRoot { break }
+            if let r = regions[ObjectIdentifier(n)] {
+                // Selecting the whole visible world would spotlight everything: skip.
+                return r.contains(camera.rect) ? nil : r
+            }
             cur = n.parent
         }
         return nil
@@ -592,14 +961,13 @@ final class TreemapNSView: NSView, CALayerDelegate {
     // MARK: Hit testing & interaction
 
     /// The topmost tile at `point` (a mouse location in view coordinates). Mouse
-    /// coordinates arrive bottom-left; the tiles are stored top-left (matching the
-    /// layout), so flip Y before hit-testing. Sub-pixel tiles are skipped with the
-    /// same 0.5 pt threshold as the renderers — hover/click/menu must never land
+    /// coordinates arrive bottom-left; the camera converts to world space. Tiles
+    /// below the sub-pixel cull can't be hit — hover/click/menu must never land
     /// on a tile the user can't see. Named to avoid clashing with `NSView.hitTest(_:)`.
-    private func tileAt(_ point: CGPoint) -> TreemapTile? {
-        let p = CGPoint(x: point.x, y: bounds.height - point.y)
-        for tile in tiles.reversed()
-        where tile.rect.width > 0.5 && tile.rect.height > 0.5 && tile.rect.contains(p) {
+    private func tileAt(_ point: CGPoint) -> TreemapWorld.Tile? {
+        let pTop = CGPoint(x: point.x, y: bounds.height - point.y)
+        let p = camera.viewToWorld(pTop, viewSize: bounds.size)
+        for tile in tiles.reversed() where tile.rect.contains(p) {
             return tile
         }
         return nil
@@ -617,7 +985,7 @@ final class TreemapNSView: NSView, CALayerDelegate {
     }
 
     override func mouseMoved(with event: NSEvent) {
-        guard zoomLink == nil else { return }   // ignore hover while a zoom animates
+        guard !camAnimating else { return }   // ignore hover while the camera flies
         let p = convert(event.locationInWindow, from: nil)
         let hit = tileAt(p)
         if hit?.rect != hovered?.rect {
@@ -635,11 +1003,11 @@ final class TreemapNSView: NSView, CALayerDelegate {
     }
 
     override func mouseUp(with event: NSEvent) {
-        guard zoomLink == nil else { return }   // let a running zoom animation finish
+        guard !camAnimating else { return }   // let a running camera flight finish
         let tile = tileAt(convert(event.locationInWindow, from: nil))
         if event.clickCount >= 2 {
-            // Double-click: open a file tile, dive into a folder tile (animated), or pop
-            // back out on a leaf/gap — a mouse-only way to zoom.
+            // Double-click: open a file tile, dive into a folder tile (an animated
+            // camera fit via the controller round-trip), or pull back on a leaf/gap.
             guard let controller else { return }
             if let tile {
                 if let file = tile.file {
@@ -647,7 +1015,7 @@ final class TreemapNSView: NSView, CALayerDelegate {
                         controller.openItem((base == "/" ? "/" : base + "/") + file.name)
                     }
                 } else if tile.node.isDirectory {
-                    controller.zoom(into: tile.node)   // apply() animates the transition
+                    controller.zoom(into: tile.node)   // apply() flies the camera there
                 } else {
                     controller.zoomOut()
                 }
@@ -659,132 +1027,7 @@ final class TreemapNSView: NSView, CALayerDelegate {
         }
     }
 
-    // MARK: Animated zoom (a moving orthographic camera)
-
-    private var zoomLink: CADisplayLink?
-    private var zoomFrom = CGRect.zero
-    private var zoomTo = CGRect.zero
-    private var zoomStart: CFTimeInterval = -1
-    private var zoomViewport: CGRect?              // nil = full-bounds camera (no animation)
-    private var zoomOnDone: (() -> Void)?
-    /// A version bump arrived mid-animation; the relayout it asked for runs when
-    /// the camera lands (consumed by `relayout()`).
-    private var pendingRelayout = false
-    private static let zoomDuration: CFTimeInterval = 0.5
-
-    /// Route a zoom navigation (from *any* entry point — treemap double-click, the left
-    /// outline, ⌘↑, breadcrumb) into an animated camera move. `apply()` calls this when the
-    /// zoom root changed. Returns false when it can't animate (e.g. a sideways jump between
-    /// unrelated branches), so the caller falls back to an instant relayout.
-    private func startZoomAnimation(from oldRoot: FSNode, to newRoot: FSNode) -> Bool {
-        let full = CGRect(origin: .zero, size: bounds.size)
-        if isUnder(newRoot, orIs: oldRoot) {
-            // Zoom IN: newRoot sits inside the *current* (old) layout, still in `tiles`. Push
-            // the camera onto its region, keeping the old tiles; settle to the new layout at end.
-            guard let r = regionRect(for: newRoot, in: tiles), r.width > 1, r.height > 1 else { return false }
-            animateZoom(from: full, to: r) { [weak self] in self?.settleAfterZoom() }
-            return true
-        } else if isUnder(oldRoot, orIs: newRoot) {
-            // Zoom OUT: lay out the new (parent) view now, then pull the camera back from where
-            // the old root sits in it to the full view.
-            relayout()
-            guard let r = regionRect(for: oldRoot, in: tiles), r.width > 1, r.height > 1 else {
-                presentTiles(); overlayLayer.setNeedsDisplay(); return true
-            }
-            animateZoom(from: r, to: full) { [weak self] in
-                self?.presentTiles(); self?.overlayLayer.setNeedsDisplay()
-            }
-            return true
-        }
-        return false   // unrelated branches → instant relayout
-    }
-
-    private func settleAfterZoom() {
-        relayout()
-        presentTiles()
-        overlayLayer.setNeedsDisplay()
-    }
-
-    /// Bounding rect of `ancestor`'s subtree within `tileList` (union of its tiles) — where a
-    /// folder sits in a layout, without depending on the (optional) region map being built.
-    private func regionRect(for ancestor: FSNode, in tileList: [TreemapTile]) -> CGRect? {
-        var union: CGRect?
-        for tile in tileList where isUnder(tile.node, orIs: ancestor) {
-            union = union.map { $0.union(tile.rect) } ?? tile.rect
-        }
-        return union
-    }
-
-    private func isUnder(_ node: FSNode, orIs ancestor: FSNode) -> Bool {
-        var cur: FSNode? = node
-        while let n = cur {
-            if n === ancestor { return true }
-            cur = n.parent
-        }
-        return false
-    }
-
-    private func animateZoom(from: CGRect, to: CGRect, onDone: @escaping () -> Void) {
-        zoomFrom = from
-        zoomTo = to
-        zoomStart = -1
-        zoomViewport = from
-        zoomOnDone = onDone
-        let link = displayLink(target: self, selector: #selector(zoomStep(_:)))
-        link.add(to: .main, forMode: .common)
-        zoomLink = link
-        presentTiles()                      // first frame at `from`
-        overlayLayer.setNeedsDisplay()       // clear the CG overlay (it can't follow the camera)
-    }
-
-    @objc private func zoomStep(_ link: CADisplayLink) {
-        if zoomStart < 0 { zoomStart = link.timestamp }
-        let t = min(1, (link.timestamp - zoomStart) / Self.zoomDuration)
-        zoomViewport = interpolatedViewport(easeInOut(t))
-        presentTiles()
-        if t >= 1 { finishZoom() }
-    }
-
-    private func finishZoom() {
-        zoomLink?.invalidate()
-        zoomLink = nil
-        zoomViewport = nil
-        let done = zoomOnDone
-        zoomOnDone = nil
-        done?()                             // commit the zoom → apply → relayout → full-view present
-        if pendingRelayout {                // deferred scan-tick relayout (zoom-out path doesn't relayout)
-            relayout()
-            presentTiles()
-            overlayLayer.setNeedsDisplay()
-        }
-    }
-
-    /// Cancel a zoom without committing it (e.g. the view leaves its window mid-animation),
-    /// so the `CADisplayLink → self` retain cycle can't outlive the view.
-    private func cancelZoom() {
-        zoomLink?.invalidate()
-        zoomLink = nil
-        zoomViewport = nil
-        zoomOnDone = nil
-    }
-
-    /// Geometric interpolation of the viewport (constant-velocity zoom) between the two
-    /// framings, `e` already eased.
-    private func interpolatedViewport(_ e: Double) -> CGRect {
-        let a = zoomFrom, b = zoomTo
-        let aw = max(Double(a.width), 0.5), ah = max(Double(a.height), 0.5)
-        let w = aw * pow(Double(b.width) / aw, e)
-        let h = ah * pow(Double(b.height) / ah, e)
-        let cx = Double(a.midX) + (Double(b.midX) - Double(a.midX)) * e
-        let cy = Double(a.midY) + (Double(b.midY) - Double(a.midY)) * e
-        return CGRect(x: cx - w / 2, y: cy - h / 2, width: w, height: h)
-    }
-
-    private func easeInOut(_ t: Double) -> Double {
-        t < 0.5 ? 4 * t * t * t : 1 - pow(-2 * t + 2, 3) / 2
-    }
-
-    private func hoverInfo(for tile: TreemapTile) -> HoverInfo {
+    private func hoverInfo(for tile: TreemapWorld.Tile) -> HoverInfo {
         if let file = tile.file {
             return HoverInfo(title: file.name, isDirectory: false, sizeText: Format.bytes(file.size))
         }
@@ -805,7 +1048,7 @@ final class TreemapNSView: NSView, CALayerDelegate {
     // MARK: Context menu
 
     override func menu(for event: NSEvent) -> NSMenu? {
-        guard zoomLink == nil else { return nil }   // no context menu mid-zoom
+        guard !camAnimating else { return nil }   // no context menu mid-flight
         let p = convert(event.locationInWindow, from: nil)
         guard let tile = tileAt(p), let controller else { return nil }
         let menu = NSMenu()
@@ -843,13 +1086,6 @@ final class TreemapNSView: NSView, CALayerDelegate {
             menu.addItem(ClosureMenuItem(title: "Copy Path (in VM)", symbol: "doc.on.doc") { controller.copyPath(path) })
         }
     }
-}
-
-/// Identifies the inputs that determine the zoom root's file tiles.
-private struct RootFilesKey: Equatable {
-    let zoom: ObjectIdentifier
-    let metric: SizeMetric
-    let version: UInt64
 }
 
 /// An `NSMenuItem` that runs a closure when chosen.
