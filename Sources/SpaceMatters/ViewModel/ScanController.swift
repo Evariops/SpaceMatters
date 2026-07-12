@@ -504,6 +504,9 @@ final class ScanController {
     @ObservationIgnored private var layoutCache = TreemapLayout.Cache()
 
     private static let maxFilesPerFolder = 2000
+    /// Above this subtree file count, a targeted refresh skips the (single-
+    /// threaded) old-extensions disk walk — see `invalidate(subtree:)`.
+    private static let extReconcileMaxFiles: Int64 = 100_000
 
     func isExpanded(_ node: FSNode) -> Bool { expanded.contains(node) }
 
@@ -982,10 +985,23 @@ final class ScanController {
         let oldP = node.aggPhysical.load(ordering: .relaxed)
         let oldC = node.fileCount.load(ordering: .relaxed)
         let oldDirs = Self.subtreeDirCount(node)
-        let oldExt = await Task.detached(priority: .userInitiated) {
-            DirectoryScanner.subtreeExtensions(path: path)
-        }.value
-        guard epoch == treeEpoch else { return false }
+        // The File-types reconciliation needs a *single-threaded* disk walk of
+        // the subtree's old per-extension bytes. On a refresh rooted near the
+        // home folder (millions of files) that walk dominates the refresh by
+        // minutes — the parallel re-scan itself takes seconds. Above a bound,
+        // skip it: sizes, counts and the tree stay exact; the extensions panel
+        // drifts by this subtree's delta until the next full Rescan (the same
+        // accepted best-effort class as shared-extension changes below).
+        let reconcileExt = oldC <= Self.extReconcileMaxFiles
+        let oldExt: [ExtKey: ExtStat]
+        if reconcileExt {
+            oldExt = await Task.detached(priority: .userInitiated) {
+                DirectoryScanner.subtreeExtensions(path: path)
+            }.value
+            guard epoch == treeEpoch else { return false }
+        } else {
+            oldExt = [:]
+        }
 
         // Capture navigation state that points *into* the subtree — its descendant
         // nodes are about to be replaced by fresh objects — then drop the strong
@@ -1030,7 +1046,7 @@ final class ScanController {
         // sub-contribution isn't stored per node (the low-RAM design), so the
         // panel may be off by the change delta until the next full rescan. Sizes,
         // counts and folder count above are always exact.
-        if let ds = scanner as? DirectoryScanner {
+        if reconcileExt, let ds = scanner as? DirectoryScanner {
             ds.subtractExtensions(oldExt)
             ds.mergeExtensions(sub.snapshotRawExtensions())
         }
