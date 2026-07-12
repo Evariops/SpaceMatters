@@ -33,6 +33,13 @@ import Foundation
         }
     }
 
+    static func waitForCleaning(_ c: CleanupController, timeout: TimeInterval = 5) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while c.state != .cleaning && Date() < deadline {
+            await Task.yield()
+        }
+    }
+
     // MARK: Catalog
 
     @Test func catalogStaysInsideHome() {
@@ -229,6 +236,55 @@ import Foundation
         c.toggleAll() // all → none
         #expect(c.selectAllState == .none)
         #expect(c.selectedRows.isEmpty)
+    }
+
+    /// A confirmed batch survives leaving the mode: every deletion runs to
+    /// completion, only the UI writes are dropped, and the controller lands
+    /// back on a terminal state instead of a forever-`.cleaning` brick.
+    @Test func stopMidCleanCompletesBatchAndRestoresState() async throws {
+        let (root, cache) = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let cache2 = root.appendingPathComponent("cache2")
+        try FileManager.default.createDirectory(at: cache2, withIntermediateDirectories: true)
+        try Data(count: 4096).write(to: cache2.appendingPathComponent("c.bin"))
+        let second = Cleanable(id: "test-cache-2", name: "Second cache", category: "Test",
+                               icon: "shippingbox", note: "fixture", paths: [cache2.path])
+        let c = CleanupController(catalog: [Self.cleanable([cache.path]), second],
+                                  allowedRoot: root.path)
+        c.load()
+        await Self.waitForReady(c)
+        c.toggleAll()
+
+        let batch = Task { await c.cleanSelected() }
+        await Self.waitForCleaning(c)
+        c.stop() // user leaves the mode right after confirming
+        await batch.value
+
+        #expect(c.state == .ready)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: cache.path).isEmpty)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: cache2.path).isEmpty)
+        #expect(c.lastFreed == 0) // results are never stamped on a session that left
+    }
+
+    /// A reload asked for mid-clean (mode re-entered) is deferred, not dropped:
+    /// the batch is left untouched and fresh rows appear once it lands.
+    @Test func reloadDuringCleanIsDeferredUntilBatchEnds() async throws {
+        let (root, cache) = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let c = CleanupController(catalog: [Self.cleanable([cache.path])], allowedRoot: root.path)
+        c.load()
+        await Self.waitForReady(c)
+        c.toggle("test-cache")
+
+        let batch = Task { await c.cleanSelected() }
+        await Self.waitForCleaning(c)
+        c.load() // re-entering the mode mid-batch
+        #expect(c.state == .cleaning) // rows/state untouched under the operation
+
+        await batch.value
+        await Self.waitForReady(c)
+        #expect(c.rows.count == 1) // deferred reload ran: fresh detection…
+        #expect(c.totalFound == 0) // …and the emptied cache re-measured at zero
     }
 
     /// Entries whose paths don't exist disappear; existing ones keep only their

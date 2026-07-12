@@ -89,17 +89,25 @@ struct CleanupResultView: View {
                         subtitle: controller.state == .sizing ? "still measuring…" : "\(controller.rows.count) locations")
             summaryCard("Selected", value: Format.bytes(controller.totalSelected),
                         subtitle: "\(controller.selectedRows.count) of \(controller.rows.count)")
-            if controller.lastFreed > 0 {
+            // Shown as soon as a clean ran — a batch where everything failed
+            // must not hide its failures behind the absent card.
+            if controller.lastFreed > 0 || controller.lastFailures > 0 || controller.lastRefused > 0 {
                 summaryCard("Freed", value: Format.bytes(controller.lastFreed),
-                            subtitle: controller.lastFailures > 0
-                                ? "\(controller.lastFailures) items couldn't be removed"
-                                : "measured after cleaning",
-                            accent: true)
+                            subtitle: freedSubtitle, accent: true)
             }
             Spacer()
         }
         .padding(.horizontal, 14).padding(.vertical, 8)
         .background(theme.panelBackground)
+    }
+
+    /// Failures (in use, locked) and fence refusals (a bug indicator) are
+    /// different stories — never fold one into the other.
+    private var freedSubtitle: String {
+        var parts: [String] = []
+        if controller.lastFailures > 0 { parts.append("\(controller.lastFailures) in use or locked") }
+        if controller.lastRefused > 0 { parts.append("\(controller.lastRefused) skipped by the safety fence") }
+        return parts.isEmpty ? "measured after cleaning" : parts.joined(separator: " · ")
     }
 
     private func summaryCard(_ title: String, value: String, subtitle: String, accent: Bool = false) -> some View {
