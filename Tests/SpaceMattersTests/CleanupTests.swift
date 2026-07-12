@@ -174,7 +174,8 @@ import Foundation
     @Test func controllerSizesSelectsAndCleans() async throws {
         let (root, cache) = try Self.makeFixture()
         defer { try? FileManager.default.removeItem(at: root) }
-        let c = CleanupController(catalog: [Self.cleanable([cache.path])], allowedRoot: root.path)
+        let c = CleanupController(catalog: [Self.cleanable([cache.path])], allowedRoot: root.path,
+                                  journal: { _ in }) // fixtures must never write the user's journal
         c.load()
         await Self.waitForReady(c)
 
@@ -196,7 +197,8 @@ import Foundation
     @Test func cleanRefusedWhileSizing() async throws {
         let (root, cache) = try Self.makeFixture()
         defer { try? FileManager.default.removeItem(at: root) }
-        let c = CleanupController(catalog: [Self.cleanable([cache.path])], allowedRoot: root.path)
+        let c = CleanupController(catalog: [Self.cleanable([cache.path])], allowedRoot: root.path,
+                                  journal: { _ in }) // fixtures must never write the user's journal
         c.load()
         #expect(c.state == .sizing)
 
@@ -220,7 +222,7 @@ import Foundation
         let second = Cleanable(id: "test-cache-2", name: "Second cache", category: "Test",
                                icon: "shippingbox", note: "fixture", paths: [cache2.path])
         let c = CleanupController(catalog: [Self.cleanable([cache.path]), second],
-                                  allowedRoot: root.path)
+                                  allowedRoot: root.path, journal: { _ in })
         c.load()
         await Self.waitForReady(c)
 
@@ -250,7 +252,7 @@ import Foundation
         let second = Cleanable(id: "test-cache-2", name: "Second cache", category: "Test",
                                icon: "shippingbox", note: "fixture", paths: [cache2.path])
         let c = CleanupController(catalog: [Self.cleanable([cache.path]), second],
-                                  allowedRoot: root.path)
+                                  allowedRoot: root.path, journal: { _ in })
         c.load()
         await Self.waitForReady(c)
         c.toggleAll()
@@ -271,7 +273,8 @@ import Foundation
     @Test func reloadDuringCleanIsDeferredUntilBatchEnds() async throws {
         let (root, cache) = try Self.makeFixture()
         defer { try? FileManager.default.removeItem(at: root) }
-        let c = CleanupController(catalog: [Self.cleanable([cache.path])], allowedRoot: root.path)
+        let c = CleanupController(catalog: [Self.cleanable([cache.path])], allowedRoot: root.path,
+                                  journal: { _ in }) // fixtures must never write the user's journal
         c.load()
         await Self.waitForReady(c)
         c.toggle("test-cache")
@@ -304,7 +307,8 @@ import Foundation
                 await calls.bump()
                 return ProcessResult(stdout: Data(), stderr: Data("store is busy".utf8),
                                      exitCode: 1, timedOut: false)
-            })
+            },
+            journal: { _ in })
         c.load()
         await Self.waitForReady(c)
         #expect(c.rows.first?.nativeLabel == "fake prune")
@@ -329,7 +333,7 @@ import Foundation
         let trash = Cleanable(id: "trash", name: "Trash", category: "System",
                               icon: "trash.fill", note: "fixture", paths: [trashDir.path])
         let c = CleanupController(catalog: [Self.cleanable([cache.path]), trash],
-                                  allowedRoot: root.path)
+                                  allowedRoot: root.path, journal: { _ in })
         c.load()
         await Self.waitForReady(c)
 
@@ -350,7 +354,8 @@ import Foundation
         defer { try? FileManager.default.removeItem(at: root) }
         let c = CleanupController(
             catalog: [Self.cleanable([cache.path])], allowedRoot: root.path,
-            blockedReason: { id, _ in id == "test-cache" ? "would break venvs" : nil })
+            blockedReason: { id, _ in id == "test-cache" ? "would break venvs" : nil },
+            journal: { _ in })
         c.load()
         await Self.waitForReady(c)
 
@@ -480,9 +485,50 @@ import Foundation
         #expect(detected.isEmpty)
     }
 
-    /// size never measures through a symlinked root — denied, consistently with
-    /// what detect and clean decide, even when called directly.
-    @Test func sizeIsDeniedOnSymlinkedRoot() throws {
+    /// A cache root removed by its native cleaner (dotnet deletes its folders
+    /// outright) is *empty*, not "Needs access": ENOENT and EACCES are
+    /// different stories. First field catch of the operation journal.
+    @Test func vanishedRootSizesAsZeroNotDenied() throws {
+        let (root, cache) = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let gone = root.appendingPathComponent("vanished").path
+        #expect(CleanupEngine.size(of: Self.cleanable([gone])) == .sized(0))
+
+        // Mixed: the existing path still measures, the vanished one adds nothing.
+        guard case .sized(let bytes) = CleanupEngine.size(of: Self.cleanable([cache.path, gone])) else {
+            Issue.record("expected .sized for a mixed existing+vanished item")
+            return
+        }
+        #expect(bytes >= 150_000)
+    }
+
+    /// An unreadable root (permissions) still reads as denied — that is the
+    /// case the "Needs access" row is for.
+    @Test func unreadableRootStaysDenied() throws {
+        let (root, cache) = try Self.makeFixture()
+        defer {
+            chmod(cache.path, 0o755)
+            try? FileManager.default.removeItem(at: root)
+        }
+        chmod(cache.path, 0o000)
+        #expect(CleanupEngine.size(of: Self.cleanable([cache.path])) == .denied)
+    }
+
+    /// clean() on a vanished root reports nothing at all — neither a failure
+    /// nor a fence refusal; there is simply nothing to do.
+    @Test func cleanTreatsVanishedRootAsNoop() throws {
+        let (root, _) = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let gone = root.appendingPathComponent("vanished").path
+        let result = CleanupEngine.clean(Self.cleanable([gone]), allowedRoot: root.path)
+        #expect(result == CleanupEngine.CleanResult())
+    }
+
+    /// size never measures through a symlinked root (ELOOP under O_NOFOLLOW).
+    /// detect excludes it anyway; a direct call answers "nothing cleanable
+    /// here" (0 B) — not "needs access", which would send the user to grant
+    /// Full Disk Access for a relocated cache.
+    @Test func sizeNeverMeasuresThroughSymlinkedRoot() throws {
         let (root, _) = try Self.makeFixture()
         defer { try? FileManager.default.removeItem(at: root) }
         let victim = root.appendingPathComponent("victim")
@@ -491,7 +537,7 @@ import Foundation
         let link = root.appendingPathComponent("linked-cache")
         try FileManager.default.createSymbolicLink(at: link, withDestinationURL: victim)
 
-        #expect(CleanupEngine.size(of: Self.cleanable([link.path])) == .denied)
+        #expect(CleanupEngine.size(of: Self.cleanable([link.path])) == .sized(0))
     }
 }
 

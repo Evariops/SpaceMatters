@@ -127,6 +127,7 @@ enum CleanupEngine {
     static func size(of item: Cleanable) -> Measure {
         var total: Int64 = 0
         var openedAny = false
+        var deniedRoot = false
         let buffer = UnsafeMutableRawPointer.allocate(byteCount: bufferSize, alignment: 16)
         defer { buffer.deallocate() }
 
@@ -137,7 +138,14 @@ enum CleanupEngine {
                 // target (detect refuses it; clean would too), and a directory
                 // swapped for a link between enumeration and open is not chased.
                 let fd = open(dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
-                guard fd >= 0 else { continue }
+                guard fd >= 0 else {
+                    // ENOENT and EACCES are different stories: a root that no
+                    // longer exists is *empty* (native cleaners like dotnet
+                    // remove their directories outright), only a root we're not
+                    // allowed to open reads as "needs access".
+                    if dir == root && (errno == EACCES || errno == EPERM) { deniedRoot = true }
+                    continue
+                }
                 if dir == root { openedAny = true }
                 let prefix = dir + "/"
                 _ = enumerateDirectory(fd: fd, buffer: buffer, bufferSize: bufferSize) { entry in
@@ -155,7 +163,8 @@ enum CleanupEngine {
                 close(fd)
             }
         }
-        return openedAny ? .sized(total) : .denied
+        if openedAny { return .sized(total) }
+        return deniedRoot ? .denied : .sized(0)
     }
 
     // MARK: Cleaning
@@ -184,13 +193,18 @@ enum CleanupEngine {
         let fm = FileManager.default
 
         for root in item.paths {
+            var rootStat = stat()
+            if lstat(root, &rootStat) != 0 {
+                // A vanished root is nothing to clean, not a fence violation —
+                // a native cleaner may have removed the directory outright.
+                if errno != ENOENT { result.failed += 1 }
+                continue
+            }
             guard passesFence(root, allowedRoot: allowedRoot) else {
                 result.refused += 1
                 continue
             }
-            var rootStat = stat()
-            guard lstat(root, &rootStat) == 0,
-                  let children = try? fm.contentsOfDirectory(atPath: root) else {
+            guard let children = try? fm.contentsOfDirectory(atPath: root) else {
                 result.failed += 1
                 continue
             }
