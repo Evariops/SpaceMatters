@@ -179,6 +179,10 @@ final class ScanController {
     /// Gated by `diskChangeBudget` so ordinary per-second churn doesn't keep it
     /// lit (issue #14).
     private(set) var diskChanged = false
+    /// A targeted refresh (`refreshDirty`) is re-scanning dirty subtrees right
+    /// now — the banner shows progress instead of vanishing, and incoming
+    /// FSEvents keep marking paths without touching the (stale) banner state.
+    private(set) var isRefreshing = false
     /// Signed net change in the scanned volume's used space since the current
     /// result finished — positive means it grew, negative means space was freed.
     /// Shown in the banner and compared against `diskChangeBudget` to gate it.
@@ -1093,6 +1097,11 @@ final class ScanController {
             guard let node = nearestNode(toPath: p), let np = path(for: node) else { continue }
             if dirtyPaths.insert(np).inserted { touched = true }
         }
+        // Mid-refresh: keep collecting dirty paths, but leave the banner alone —
+        // the free-space baseline is stale until the refresh re-bases it, and a
+        // bump here would repaint the treemap over half-reconciled aggregates
+        // (the transient wrong totals seen while a big subtree re-scans).
+        guard !isRefreshing else { return }
         // Gate the banner on net used-space movement so ordinary per-second churn
         // (logs, caches ticking over) doesn't keep it lit (issue #14). The dirty
         // dots still track every touched subtree for the targeted Refresh.
@@ -1125,6 +1134,8 @@ final class ScanController {
         }
         dirtyPaths.removeAll()
         diskChanged = false
+        isRefreshing = true
+        defer { isRefreshing = false }
         let epoch = treeEpoch
         for p in roots {
             guard epoch == treeEpoch else { return } // Rescan/Home mid-refresh
@@ -1135,10 +1146,14 @@ final class ScanController {
             }
         }
         scanDate = Date()
-        // Re-baseline the budget so the banner measures drift from *this* refresh.
+        // Re-baseline the budget so the banner measures drift from *this*
+        // refresh; events collected mid-refresh re-evaluate from here (dirty
+        // dots stay, banner off until real drift crosses the budget again).
         baselineFreeBytes = volumeFreeBytes()
         changedBytes = 0
         shownBytes = 0
+        diskChanged = false
+        bump()   // repaint the dots for any trailing dirty paths
     }
 
     private func refreshTotals() {

@@ -68,7 +68,7 @@ private struct FilesystemResultView: View {
                 Divider().overlay(theme.separator)
             }
 
-            if controller.diskChanged {
+            if controller.diskChanged || controller.isRefreshing {
                 DiskChangedBanner(controller: controller)
                 Divider().overlay(theme.separator)
             }
@@ -119,7 +119,6 @@ private struct ErrorBanner: View {
 private struct DiskChangedBanner: View {
     let controller: ScanController
     @Environment(\.theme) private var theme
-    @State private var refreshing = false
 
     /// Spell out how much moved, and in which direction, so the banner is a
     /// signal worth acting on rather than a permanent fixture (issue #14).
@@ -131,17 +130,21 @@ private struct DiskChangedBanner: View {
     }
 
     var body: some View {
+        // Progress lives on the controller: the banner view is recreated when
+        // `diskChanged` flips (a local @State would reset mid-refresh), and the
+        // refresh itself can take a while on a big dirty subtree.
+        let refreshing = controller.isRefreshing
         HStack(spacing: 10) {
             Image(systemName: "arrow.triangle.2.circlepath")
                 .font(.system(size: 13))
                 .foregroundStyle(theme.accent)
-            Text(Self.message(for: controller.changedBytes))
+            Text(refreshing ? "Refreshing the changed folders…"
+                            : Self.message(for: controller.changedBytes))
                 .font(.system(size: 11))
                 .foregroundStyle(theme.textPrimary)
             Spacer(minLength: 8)
             Button {
-                refreshing = true
-                Task { await controller.refreshDirty(); refreshing = false }
+                Task { await controller.refreshDirty() }
             } label: {
                 HStack(spacing: 5) {
                     if refreshing { ProgressView().controlSize(.mini) }
