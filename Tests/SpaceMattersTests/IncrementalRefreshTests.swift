@@ -431,6 +431,36 @@ import Foundation
         #expect(c.changedBytes == 0)
     }
 
+    /// A *leaf* directory whose extension table a re-stat snapshotted is fully
+    /// known — when it vanishes, its File-types contribution is subtracted
+    /// exactly and no drift is ever marked (the watched-download-vanishing QA
+    /// case, end to end).
+    @Test func vanishedLeafWithKnownTableSubtractsExactly() async throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("mds-leaf-\(UUID().uuidString)")
+        try fm.createDirectory(at: root.appendingPathComponent("leafy"), withIntermediateDirectories: true)
+        try Data(count: 4096).write(to: root.appendingPathComponent("keep.dat"))
+        try Data(count: 8192).write(to: root.appendingPathComponent("leafy/a.png"))
+        try Data(count: 4096).write(to: root.appendingPathComponent("leafy/b.png"))
+        defer { try? fm.removeItem(at: root) }
+        let c = await Self.scanned(root)
+        let leafy = try #require(NavigationTests.child(c.root!, "leafy"))
+
+        // Warm the complete listing so the first delta already diffs exactly.
+        _ = c.filesIn(leafy)
+        await Self.waitUntil { !c.filesIn(leafy).isEmpty }
+        try Data(count: 4096).write(to: root.appendingPathComponent("leafy/c.png"))
+        #expect(await c.restatDirectory(leafy))     // stores leafy's table
+        #expect(c.extRows.first { $0.name == ".png" }?.count == 3)
+        #expect(!c.typesDrifted)
+
+        try fm.removeItem(at: root.appendingPathComponent("leafy"))
+        #expect(await c.restatDirectory(c.root!))   // leaf vanishes, table known
+        #expect(c.extRows.first { $0.name == ".png" } == nil)
+        #expect(c.extRows.first { $0.name == ".dat" }?.count == 1)
+        #expect(!c.typesDrifted)                    // exact all the way
+    }
+
     /// Exact counting mode: a reconciled directory holding hardlinked files
     /// raises the dedup-drift marker (their bytes were attributed locally).
     @Test func exactModeMarksHardlinkDrift() async throws {

@@ -1610,12 +1610,23 @@ final class ScanController {
         // Structural diff first (against the node *now*, post-suspension).
         // Disappeared: subtract the subtree's aggregates and detach — the same
         // brick as user deletion, so navigation state is lifted to a survivor.
-        // The File-types table can't be reconciled for content that no longer
-        // exists on disk (no per-node inventory, by design) — marked drift.
+        // File-types: content gone from disk can't be re-walked, but a *leaf*
+        // directory a past re-stat snapshotted is fully known — subtract its
+        // table exactly (the QA case: a watched download vanishing). Anything
+        // deeper or never-snapshotted stays a marked drift.
+        let prefix = path == "/" ? "/" : path + "/"
         let currentDirs = node.children
         let currentNames = Set(currentDirs.map(\.name))
         for child in currentDirs where !snap.subdirNames.contains(child.name) {
-            if child.fileCount.load(ordering: .relaxed) > 0 { typesDrifted = true }
+            let childPath = prefix + child.name
+            if let known = extSnapshots[childPath], child.childCount == 0,
+               let ds = scanner as? DirectoryScanner {
+                ds.subtractExtensions(known)
+                extRows = ds.snapshotExtensions(metric: metric, limit: 250)
+            } else if child.fileCount.load(ordering: .relaxed) > 0 {
+                typesDrifted = true
+            }
+            pruneExtSnapshots(under: childPath)
             applyDirectoryRemoval(child)
         }
         // Appeared: attach fresh nodes and scan *only that new content*, all
@@ -1623,7 +1634,6 @@ final class ScanController {
         // exactly — nothing of it was ever booked before.
         let appeared = snap.subdirNames.subtracting(currentNames).sorted()
         if !appeared.isEmpty {
-            let prefix = path == "/" ? "/" : path + "/"
             var seeds: [DirectoryScanner.Seed] = []
             for name in appeared {
                 let child = FSNode(name: name, parent: node, isDirectory: true)
