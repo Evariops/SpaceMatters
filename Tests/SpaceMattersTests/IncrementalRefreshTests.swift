@@ -29,6 +29,20 @@ import Foundation
 
     static func precise(_ path: String) -> FSChange { FSChange(path: path, flags: 0) }
 
+    static func lossy(_ path: String) -> FSChange {
+        FSChange(path: path, flags: FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs))
+    }
+
+    /// Pump the run loop + yield until `cond` holds (the silent reconciler runs
+    /// as MainActor tasks — it needs the actor to breathe).
+    static func waitUntil(timeout: TimeInterval = 5, _ cond: () -> Bool) async {
+        let end = Date().addingTimeInterval(timeout)
+        while !cond() && Date() < end {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+            await Task.yield()
+        }
+    }
+
     // MARK: Re-stat: pure file deltas, no sub-scan
 
     /// A file grows in an already-scanned directory: one re-stat propagates the
@@ -243,6 +257,155 @@ import Foundation
         #expect(NavigationTests.child(c.root!, "beta") === beta) // additive, no rebuild
         let new1 = try #require(NavigationTests.child(beta, "new1"))
         #expect(NavigationTests.child(new1, "new2") != nil)
+    }
+
+    // MARK: Live reconciliation (M3 — the default)
+
+    /// The core promise: a change lands in the map with *no click at all*. A
+    /// forged precise event reconciles silently — no banner, no rebuild.
+    @Test func preciseEventReconcilesAutomatically() async throws {
+        let root = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let c = await Self.scanned(root)
+        let alpha = try #require(NavigationTests.child(c.root!, "alpha"))
+        let alphaLogBefore = alpha.aggLogical.load(ordering: .relaxed)
+
+        try Data(count: 262_144).write(to: root.appendingPathComponent("alpha/live.dat"))
+        c.handleDiskChanges([Self.precise(root.appendingPathComponent("alpha").path)])
+
+        await Self.waitUntil { alpha.aggLogical.load(ordering: .relaxed) == alphaLogBefore + 262_144 }
+        #expect(alpha.aggLogical.load(ordering: .relaxed) == alphaLogBefore + 262_144)
+        #expect(c.autoRestatCount >= 1)
+        #expect(!c.diskChanged)                                  // silent
+        #expect(!c.isRefreshing)                                 // no spinner either
+        #expect(NavigationTests.child(c.root!, "alpha") === alpha)
+    }
+
+    /// A dense burst coalesces to *its own* ancestor (one parallel subtree
+    /// pass), never to the global common ancestor — and scattered dirty paths
+    /// nearby stay individual re-stats.
+    @Test func denseBurstCoalescesToItsClusterAncestor() async throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("mds-burst-\(UUID().uuidString)")
+        for i in 0..<20 {
+            try fm.createDirectory(at: root.appendingPathComponent("burst/d\(i)"), withIntermediateDirectories: true)
+        }
+        try fm.createDirectory(at: root.appendingPathComponent("calm"), withIntermediateDirectories: true)
+        try Data(count: 4096).write(to: root.appendingPathComponent("calm/c.dat"))
+        defer { try? fm.removeItem(at: root) }
+        let c = await Self.scanned(root)
+
+        // Touch every burst dir + the calm one, forge the whole batch at once.
+        var changes: [FSChange] = []
+        for i in 0..<20 {
+            try Data(count: 4096).write(to: root.appendingPathComponent("burst/d\(i)/f.dat"))
+            changes.append(Self.precise(root.appendingPathComponent("burst/d\(i)").path))
+        }
+        try Data(count: 8192).write(to: root.appendingPathComponent("calm/c2.dat"))
+        changes.append(Self.precise(root.appendingPathComponent("calm").path))
+        c.handleDiskChanges(changes)
+
+        let burst = try #require(NavigationTests.child(c.root!, "burst"))
+        let calm = try #require(NavigationTests.child(c.root!, "calm"))
+        await Self.waitUntil {
+            burst.aggLogical.load(ordering: .relaxed) == 20 * 4096
+                && calm.aggLogical.load(ordering: .relaxed) == 4096 + 8192
+        }
+        #expect(burst.aggLogical.load(ordering: .relaxed) == 20 * 4096)
+        #expect(calm.aggLogical.load(ordering: .relaxed) == 4096 + 8192)
+        #expect(c.autoSubtreeScanCount == 1)   // the cluster, as ONE pass
+        #expect(c.autoRestatCount == 1)        // calm stayed individual
+        #expect(!c.diskChanged)
+    }
+
+    /// Sustained churn on one subtree: the second `MustScanSubDirs` within the
+    /// cooldown window is deferred (stays dirty), not re-scanned immediately.
+    @Test func cooldownAbsorbsRepeatedSubtreeChurn() async throws {
+        let root = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let c = await Self.scanned(root)
+        let alphaPath = root.appendingPathComponent("alpha").path
+
+        c.handleDiskChanges([Self.lossy(alphaPath)])
+        await Self.waitUntil { c.autoSubtreeScanCount == 1 }
+        #expect(c.autoSubtreeScanCount == 1)
+
+        c.handleDiskChanges([Self.lossy(alphaPath)])
+        // Give the reconciler ample room to (wrongly) run a second pass.
+        try await Task.sleep(for: .milliseconds(300))
+        await Task.yield()
+        #expect(c.autoSubtreeScanCount == 1)             // absorbed by cooldown
+        #expect(!c.dirtyPaths.isEmpty)                   // still marked, not lost
+    }
+
+    /// Above the consent threshold the catch-up parks and lights the banner;
+    /// pressing Refresh (the consent) runs it and clears everything.
+    @Test func oversizeCatchupWaitsForConsent() async throws {
+        let root = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let c = await Self.scanned(root)
+        c.consentMaxFiles = 1 // alpha subtree holds 2 files — over the bar
+        let alpha = try #require(NavigationTests.child(c.root!, "alpha"))
+        let deep = try #require(NavigationTests.child(alpha, "deep"))
+
+        try Data(count: 65536).write(to: root.appendingPathComponent("alpha/big.dat"))
+        c.handleDiskChanges([Self.lossy(root.appendingPathComponent("alpha").path)])
+
+        await Self.waitUntil { c.diskChanged }
+        #expect(c.diskChanged)                           // banner asks
+        #expect(c.autoSubtreeScanCount == 0)             // nothing ran silently
+        #expect(c.pendingConsentFiles >= 2)
+        #expect(NavigationTests.child(alpha, "deep") === deep) // untouched
+
+        await c.refreshDirty()                           // consent
+        #expect(!c.diskChanged)
+        #expect(c.pendingConsentPaths.isEmpty)
+        #expect(alpha.aggLogical.load(ordering: .relaxed) == 4096 + 8192 + 65536)
+    }
+
+    // MARK: Planner (pure)
+
+    /// Clustering policy on synthetic paths: a dense run coalesces to its own
+    /// ancestor, scattered paths stay individual, an oversized target needs
+    /// consent, a cooling-down target is deferred.
+    @Test func plannerClustersCapsAndDefers() throws {
+        var needs: [String: ScanController.DirtyNeed] = [:]
+        for i in 0..<20 { needs["/seed/dense/d\(i)"] = .restat }
+        needs["/seed/lonely"] = .restat
+        needs["/seed/other/spot"] = .restat
+        needs["/seed/huge"] = .subtree      // MustScanSubDirs, over consent
+        needs["/seed/cooling"] = .subtree   // recently auto-scanned
+
+        let fileCounts: [String: Int64] = [
+            "/seed/dense": 500, "/seed/huge": 1_000_000, "/seed/cooling": 10,
+            "/seed": 2_000_000,
+        ]
+        let plan = ScanController.planReconciliation(
+            needs: needs,
+            fileCount: { fileCounts[$0] },
+            underCooldown: { $0 == "/seed/cooling" },
+            clusterMinRun: 16,
+            subtreeAutoMaxFiles: 100_000,
+            consentMaxFiles: 500_000,
+            restatCap: 256
+        )
+        #expect(plan.subtrees == ["/seed/dense"])
+        #expect(Set(plan.restats) == ["/seed/lonely", "/seed/other/spot"])
+        #expect(plan.consent == ["/seed/huge"])
+        #expect(plan.deferred == ["/seed/cooling"])
+    }
+
+    /// The cap bounds one cycle's precise work; the spill stays for the next.
+    @Test func plannerCapsRestatsPerCycle() throws {
+        var needs: [String: ScanController.DirtyNeed] = [:]
+        for i in 0..<10 { needs["/seed/s\(i)"] = .restat }
+        let plan = ScanController.planReconciliation(
+            needs: needs, fileCount: { _ in nil }, underCooldown: { _ in false },
+            clusterMinRun: 16, subtreeAutoMaxFiles: 100_000,
+            consentMaxFiles: 500_000, restatCap: 4)
+        #expect(plan.restats.count == 4)
+        #expect(plan.deferred.count == 6)
+        #expect(plan.subtrees.isEmpty && plan.consent.isEmpty)
     }
 
     /// A `.subtree` ancestor subsumes its dirty descendants; a `.restat`

@@ -211,6 +211,36 @@ final class ScanController {
     @ObservationIgnored private var watcher: FSWatcher?
     @ObservationIgnored private var watchPaths: [String] = []
 
+    // SPEC-11 §3.3 knobs — instance-level so tests can tighten them.
+    /// A run of at least this many dirty directories under one ancestor is
+    /// cheaper to re-scan as one parallel subtree pass than one by one.
+    @ObservationIgnored var clusterMinRun = 16
+    /// Ceiling for a *silent* auto subtree re-scan (~1 s of parallel I/O).
+    @ObservationIgnored var subtreeAutoMaxFiles: Int64 = 100_000
+    /// Above this, a catch-up costs several seconds of full-tilt CPU — ask
+    /// first (the banner's one remaining job).
+    @ObservationIgnored var consentMaxFiles: Int64 = 500_000
+    /// Precise re-stats per reconcile cycle; the excess stays dirty for the next.
+    @ObservationIgnored var restatCapPerCycle = 256
+    /// Minimum spacing between two auto re-scans of the same subtree — sustained
+    /// churn (a build loop) marks dirty and waits instead of burning CPU.
+    @ObservationIgnored var autoSubtreeCooldown: TimeInterval = 10
+
+    /// Auto catch-ups too big to run without asking (SPEC-11 §3.4) — they stay
+    /// dirty and light the banner; the Refresh button is the consent.
+    private(set) var pendingConsentPaths: Set<String> = []
+    /// Total files under the pending catch-ups, for the banner text.
+    private(set) var pendingConsentFiles: Int64 = 0
+
+    // Reconciler instrumentation (tests assert on these; cheap to keep).
+    @ObservationIgnored private(set) var autoRestatCount = 0
+    @ObservationIgnored private(set) var autoSubtreeScanCount = 0
+
+    @ObservationIgnored private var reconcileRunning = false
+    @ObservationIgnored private var reconcileAgain = false
+    @ObservationIgnored private var reconcileRetryScheduled = false
+    @ObservationIgnored private var lastAutoSubtreeScan: [String: Date] = [:]
+
     /// Whether a node sits on a changed path (drives the per-row "dirty" dot).
     func isDirty(_ node: FSNode) -> Bool {
         guard !dirtyPaths.isEmpty, let p = path(for: node) else { return false }
@@ -1098,6 +1128,9 @@ final class ScanController {
         dirtyPaths.removeAll()
         dirtyNeeds.removeAll()
         watchRootChanged = false
+        pendingConsentPaths.removeAll()
+        pendingConsentFiles = 0
+        lastAutoSubtreeScan.removeAll()
         diskChanged = false
         changedBytes = 0
         shownBytes = 0
@@ -1130,24 +1163,215 @@ final class ScanController {
             if c.mustScanSubDirs { dirtyNeeds[np] = .subtree }
             else if dirtyNeeds[np] == nil { dirtyNeeds[np] = .restat }
         }
-        // Mid-refresh: keep collecting dirty paths, but leave the banner alone —
+        // Mid-refresh: keep collecting dirty paths, but reconcile only after —
         // the free-space baseline is stale until the refresh re-bases it, and a
         // bump here would repaint the treemap over half-reconciled aggregates
         // (the transient wrong totals seen while a big subtree re-scans).
         guard !isRefreshing else { return }
-        // Gate the banner on net used-space movement so ordinary per-second churn
-        // (logs, caches ticking over) doesn't keep it lit (issue #14). The dirty
-        // dots still track every touched subtree for the targeted Refresh.
         if let base = baselineFreeBytes, let free = volumeFreeBytes() {
             changedBytes = base - free
         }
-        let show = !dirtyPaths.isEmpty && abs(changedBytes) >= diskChangeBudget
-        let repaint = touched || show != diskChanged || (show && changedBytes != shownBytes)
-        diskChanged = show
-        if repaint {
-            shownBytes = changedBytes
-            bump() // repaint the dirty dots + banner
+        if touched { bump() } // repaint the dirty dots
+        updateBannerState()
+        // Live by default (SPEC-11): apply what just changed, silently.
+        scheduleReconcile()
+    }
+
+    /// Post-M3 the banner is a *last resort*: it appears only when the watched
+    /// root is gone, or when an auto catch-up is big enough to need consent.
+    /// Ordinary changes reconcile silently — the map just breathes.
+    private func updateBannerState() {
+        let show = watchRootChanged || !pendingConsentPaths.isEmpty
+        if show != diskChanged {
+            diskChanged = show
+            bump()
         }
+    }
+
+    // MARK: Live reconciliation (SPEC-11 M3 — the default)
+
+    /// What one reconcile cycle decided to do with the dirty set. Pure output of
+    /// `planReconciliation` so the clustering/consent/cooldown policy is testable
+    /// without a filesystem.
+    struct ReconcilePlan: Equatable {
+        /// Precise single-directory re-stats (milliseconds each).
+        var restats: [String] = []
+        /// Auto subtree re-scans: `MustScanSubDirs` targets and dense clusters.
+        var subtrees: [String] = []
+        /// Too big to run silently — stay dirty, light the banner, wait for the
+        /// user's Refresh (SPEC-11 §3.4).
+        var consent: [String] = []
+        /// Cooldown or cap spill — stay dirty, retried on a later cycle.
+        var deferred: [String] = []
+    }
+
+    /// Decide how to reconcile the dirty set. Bursts coalesce by *common-prefix
+    /// clustering*, never to the global common ancestor: a run of ≥
+    /// `clusterMinRun` dirty directories under one ancestor becomes a single
+    /// parallel subtree pass **iff** that ancestor is small enough to re-scan
+    /// silently (`subtreeAutoMaxFiles`); scattered paths stay individual
+    /// re-stats, capped per cycle. `fileCount` resolves a path to its subtree
+    /// file count (`nil` = not in the tree, e.g. above the seed).
+    static func planReconciliation(
+        needs: [String: DirtyNeed],
+        fileCount: (String) -> Int64?,
+        underCooldown: (String) -> Bool,
+        clusterMinRun: Int,
+        subtreeAutoMaxFiles: Int64,
+        consentMaxFiles: Int64,
+        restatCap: Int
+    ) -> ReconcilePlan {
+        func isUnder(_ p: String, _ ancestor: String) -> Bool {
+            p == ancestor || p.hasPrefix(ancestor == "/" ? "/" : ancestor + "/")
+        }
+
+        // Subsumption: a `.subtree` ancestor covers everything below it.
+        var subtreeTargets: [String] = []
+        var precise: [String] = []
+        for p in needs.keys.sorted(by: { $0.count < $1.count }) {
+            guard !subtreeTargets.contains(where: { isUnder(p, $0) }) else { continue }
+            if needs[p] == .subtree { subtreeTargets.append(p) } else { precise.append(p) }
+        }
+
+        // Cluster dense runs of precise paths. Every proper ancestor prefix of a
+        // dirty path is an existing node's path (dirty paths are node paths), so
+        // counting per-prefix is exact. Deepest qualifying ancestors win —
+        // tight clusters (node_modules) beat broad ones (the repo).
+        if precise.count >= clusterMinRun {
+            var counts: [String: Int] = [:]
+            for p in precise {
+                var prefix = Substring(p)
+                while let cut = prefix.lastIndex(of: "/"), cut != prefix.startIndex {
+                    prefix = prefix[..<cut]
+                    counts[String(prefix), default: 0] += 1
+                }
+            }
+            let candidates = counts.filter { $0.value >= clusterMinRun }.keys
+                .sorted { a, b in a.count != b.count ? a.count > b.count : a < b }
+            var chosen: [String] = []
+            for cand in candidates {
+                guard !chosen.contains(where: { isUnder(cand, $0) || isUnder($0, cand) }),
+                      !subtreeTargets.contains(where: { isUnder(cand, $0) }),
+                      let fc = fileCount(cand), fc <= subtreeAutoMaxFiles
+                else { continue }
+                chosen.append(cand)
+            }
+            if !chosen.isEmpty {
+                precise.removeAll { p in chosen.contains { isUnder(p, $0) } }
+                subtreeTargets += chosen
+            }
+        }
+
+        var plan = ReconcilePlan()
+        for t in subtreeTargets {
+            let fc = fileCount(t)
+            if let fc, fc > consentMaxFiles { plan.consent.append(t) }
+            else if underCooldown(t) { plan.deferred.append(t) }
+            else { plan.subtrees.append(t) }
+        }
+        plan.restats = Array(precise.prefix(restatCap))
+        plan.deferred += precise.dropFirst(restatCap)
+        return plan
+    }
+
+    /// Kick (or re-kick) the reconciler. Coalesces re-entrant pokes: one runner
+    /// at a time; a poke while running queues exactly one follow-up cycle.
+    private func scheduleReconcile() {
+        guard !dirtyNeeds.isEmpty else { return }
+        guard !reconcileRunning else { reconcileAgain = true; return }
+        reconcileRunning = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.reconcileRunning = false }
+            repeat {
+                self.reconcileAgain = false
+                await self.reconcileNow()
+            } while self.reconcileAgain
+            self.scheduleDeferredRetry()
+        }
+    }
+
+    /// Deferred paths (cooldown, cap spill, a refused op) stay dirty with no
+    /// event to re-poke us — retry on a one-shot timer instead of spinning.
+    private func scheduleDeferredRetry() {
+        guard !dirtyNeeds.isEmpty, !reconcileRetryScheduled else { return }
+        reconcileRetryScheduled = true
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(2))
+            guard let self else { return }
+            self.reconcileRetryScheduled = false
+            self.scheduleReconcile()
+        }
+    }
+
+    /// One reconcile cycle: plan against the current dirty set, execute, keep
+    /// the leftovers dirty. Runs silently — no banner, no spinner; the treemap
+    /// morphs on each applied delta (SPEC-10 absorbs the bumps).
+    private func reconcileNow() async {
+        guard isHostScan, phase == .finished, !isRefreshing, !dirtyNeeds.isEmpty else { return }
+        let now = Date()
+        let plan = Self.planReconciliation(
+            needs: dirtyNeeds,
+            fileCount: { [weak self] p in
+                guard let self, let n = self.node(at: p) else { return nil }
+                return n.fileCount.load(ordering: .relaxed)
+            },
+            underCooldown: { [weak self] p in
+                guard let self, let last = self.lastAutoSubtreeScan[p] else { return false }
+                return now.timeIntervalSince(last) < self.autoSubtreeCooldown
+            },
+            clusterMinRun: clusterMinRun,
+            subtreeAutoMaxFiles: subtreeAutoMaxFiles,
+            consentMaxFiles: consentMaxFiles,
+            restatCap: restatCapPerCycle
+        )
+
+        // Everything this cycle executes leaves the dirty set now; failures
+        // re-enter it. Consent + deferred paths stay dirty (and keep their dot).
+        func consume(_ target: String) {
+            dirtyNeeds = dirtyNeeds.filter { p, _ in
+                !(p == target || p.hasPrefix(target == "/" ? "/" : target + "/"))
+            }
+            dirtyPaths = dirtyPaths.filter { p in
+                !(p == target || p.hasPrefix(target == "/" ? "/" : target + "/"))
+            }
+        }
+
+        let epoch = treeEpoch
+        for p in plan.restats {
+            guard epoch == treeEpoch, !isRefreshing else { return }
+            consume(p)
+            guard let node = nearestNode(toPath: p) else { continue }
+            autoRestatCount += 1
+            if !(await restatDirectory(node)) {
+                dirtyPaths.insert(p); dirtyNeeds[p] = .restat
+            }
+        }
+        for p in plan.subtrees {
+            guard epoch == treeEpoch, !isRefreshing else { return }
+            consume(p)
+            guard let node = nearestNode(toPath: p) else { continue }
+            lastAutoSubtreeScan[p] = Date()
+            autoSubtreeScanCount += 1
+            if !(await invalidate(subtree: node)) {
+                dirtyPaths.insert(p); dirtyNeeds[p] = .subtree
+            }
+        }
+
+        // Applied deltas move the honest baseline: re-measure so the statfs
+        // budget keeps gating drift, not what we just reconciled.
+        if !plan.restats.isEmpty || !plan.subtrees.isEmpty {
+            baselineFreeBytes = volumeFreeBytes()
+            changedBytes = 0
+            shownBytes = 0
+        }
+
+        pendingConsentPaths = Set(plan.consent)
+        pendingConsentFiles = plan.consent.reduce(0) { total, p in
+            guard let n = node(at: p) else { return total }
+            return total + n.fileCount.load(ordering: .relaxed)
+        }
+        updateBannerState()
     }
 
     /// Reconcile the dirty directories and clear the badge. Precise events get a
@@ -1155,7 +1379,11 @@ final class ScanController {
     /// where FSEvents lost detail get the subtree re-scan (SPEC-02 `invalidate`).
     /// A `.subtree` ancestor subsumes everything below it; `.restat` subsumes
     /// nothing (it's non-recursive), so precise descendants keep their own pass.
+    /// Post-M3 this is the *consent* path: the silent reconciler parks anything
+    /// above `consentMaxFiles` and lights the banner; pressing Refresh runs it.
     func refreshDirty() async {
+        pendingConsentPaths.removeAll()
+        pendingConsentFiles = 0
         guard !dirtyPaths.isEmpty else {
             diskChanged = false; changedBytes = 0; shownBytes = 0
             baselineFreeBytes = volumeFreeBytes()
@@ -1203,6 +1431,9 @@ final class ScanController {
         shownBytes = 0
         diskChanged = false
         bump()   // repaint the dots for any trailing dirty paths
+        // Trailing events collected mid-refresh: hand them to the reconciler
+        // (it runs after `isRefreshing` drops on return).
+        scheduleReconcile()
     }
 
     // MARK: Per-directory re-stat (SPEC-11)
