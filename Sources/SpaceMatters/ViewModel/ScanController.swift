@@ -733,7 +733,12 @@ final class ScanController {
             guard isOpen else { return }
 
             let kids = sortedChildren(node)
-            let files = filesIn(node) // pre-sorted by the current metric (cached)
+            // Pre-sorted by the current metric (cached). Files at zero size *in the
+            // current metric* are dropped — a space tool has nothing to say about
+            // them (macOS marker files like `.localized`, empty locks…), and a 0 B
+            // on-disk file that still has logical bytes reappears in Logical mode.
+            // Sorted descending → the zero tail is a prefix cut, not a filter pass.
+            let files = filesIn(node).prefix(while: { $0.size(metric) > 0 })
             let childMax = max(kids.first?.size(metric) ?? 0, files.first?.size(metric) ?? 0, 1)
 
             // Merge folders + files by size, biggest first.
