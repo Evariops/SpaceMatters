@@ -427,10 +427,14 @@ final class TreemapNSView: NSView, CALayerDelegate {
         }
 
         if dataChanged {
-            // Scan tick / FSEvents refresh / metric change: entries revalidate
+            // FSEvents refresh / deletion / metric change: entries revalidate
             // lazily (ε-local), and whatever moved morphs (SPEC-10 §3.4). A pure
-            // theme change only recolours — no motion to animate.
-            rebuildTiles(morph: !themeChanged)
+            // theme change only recolours — no motion to animate. And a *live
+            // scan* teleports: it restructures violently at 10 Hz, so sliding
+            // tiles would never land — the map read as scattered squares over
+            // the root underlay. Instant rebuilds keep every frame a coherent
+            // tiling; the morphs come back for the calm post-scan life.
+            rebuildTiles(morph: !themeChanged && !controller.isScanning)
             presentTiles()
             overlayLayer.setNeedsDisplay()
         }
