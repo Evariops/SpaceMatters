@@ -494,6 +494,52 @@ import Foundation
         #expect(plan.subtrees.isEmpty && plan.consent.isEmpty)
     }
 
+    // MARK: Live QA at scale (opt-in)
+
+    /// Replays the 2026-07-12 finding at real scale (opt-in: `SM_QA_LIVE=1`):
+    /// scan a big working tree, then land a 512 MiB file in a brand-new
+    /// directory. It must appear in the totals **without any user action**
+    /// within the FSEvents latency (~1 s) + milliseconds of reconcile — against
+    /// the 25 s + a click the old subtree refresh cost. Then deletion melts it.
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["SM_QA_LIVE"] != nil))
+    func liveReconcileAtScale() async throws {
+        let fm = FileManager.default
+        let base = fm.homeDirectoryForCurrentUser.appendingPathComponent("sources")
+        let qaDir = base.appendingPathComponent("__sm_qa_live__")
+        try? fm.removeItem(at: qaDir) // leftovers from a crashed run
+        defer { try? fm.removeItem(at: qaDir) }
+
+        let c = ScanController()
+        c.scan(url: base)
+        await NavigationTests.waitForScan(c, timeout: 300)
+        #expect(c.phase == .finished)
+        let physBefore = c.root!.aggPhysical.load(ordering: .relaxed)
+        let size = 512 * 1024 * 1024
+
+        try fm.createDirectory(at: qaDir, withIntermediateDirectories: true)
+        try Data(count: size).write(to: qaDir.appendingPathComponent("blob.bin"))
+        let t0 = Date()
+        await Self.waitUntil(timeout: 10) {
+            c.root!.aggPhysical.load(ordering: .relaxed) >= physBefore + Int64(size)
+        }
+        let appearLatency = Date().timeIntervalSince(t0)
+        print("QA live: +512 MiB reconciled in \(String(format: "%.2f", appearLatency))s after write")
+        #expect(c.root!.aggPhysical.load(ordering: .relaxed) >= physBefore + Int64(size))
+        #expect(appearLatency < 3) // ~1 s FSEvents latency + reconcile
+        #expect(!c.diskChanged)    // silent — no banner at any point
+        #expect(!c.isRefreshing)
+
+        try fm.removeItem(at: qaDir)
+        let t1 = Date()
+        await Self.waitUntil(timeout: 10) {
+            c.root!.aggPhysical.load(ordering: .relaxed) < physBefore + Int64(size) / 2
+        }
+        let meltLatency = Date().timeIntervalSince(t1)
+        print("QA live: deletion melted in \(String(format: "%.2f", meltLatency))s")
+        #expect(meltLatency < 3)
+        #expect(!c.diskChanged)
+    }
+
     /// A `.subtree` ancestor subsumes its dirty descendants; a `.restat`
     /// ancestor subsumes nothing (it's non-recursive) — both children survive.
     @Test func subsumptionFollowsNeedSemantics() async throws {

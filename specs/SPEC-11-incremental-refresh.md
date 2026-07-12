@@ -4,7 +4,7 @@
 > **Ce qu'on n'exploite pas** : la sémantique précise de FSEvents en granularité répertoire — un événement sans `MustScanSubDirs` signifie « **le contenu direct de CE répertoire** a changé ». Une passe `getattrlistbulk` non récursive sur ce seul répertoire (millisecondes) suffit à calculer le delta exact et à le propager.
 > **Décision (actée)** : le **live est le mode par défaut**. Les changements s'appliquent automatiquement — deltas **par répertoire, propagés** pour les événements précis ; re-scan de sous-arbre **auto-déclenché** (coalescé à l'ancêtre commun) quand FSEvents avoue une perte de détail. Il n'y a **pas de fallback dormant** : les deux mécanismes sont nominaux, chacun sur son régime. Le bandeau + bouton Refresh ne subsistent qu'en **dernier recours** — un rattrapage automatique qui serait assez gros pour mériter le consentement de l'utilisateur. La carte devient un tableau de bord *vivant* qui respire par morphs (SPEC-10).
 > **Dépendances** : PR #26 (bandeau honnête pendant refresh), SPEC-10 mergée (ε-revalidation locale + morphs — le treemap absorbe déjà des updates incrémentaux avec grâce).
-> **Statut** : 🚧 **EN IMPLÉMENTATION** (branche `spec/11-incremental-refresh`).
+> **Statut** : ✅ **IMPLÉMENTÉ** (2026-07-12, branche `spec/11-incremental-refresh`, M1–M4). Mesuré à l'échelle (955 k fichiers / 55 Go) : +512 MiB dans un dossier *nouveau* → totaux exacts **0,01 s** après la fin de l'écriture ; suppression fondue en **0,73 s** — sans clic, sans bandeau. Objectif §1 (< 1 s) dépassé.
 
 ## 1. Objectif
 
@@ -31,7 +31,7 @@ Tous les événements convergent vers une **file de réconciliation sérialisée
 2. **Delta = absolu − état du nœud, calculé au moment de l'apply** sur le MainActor — jamais un delta pré-calculé (deux re-stats en vol sur le même dossier convergent en last-writer-wins au lieu d'appliquer un delta périmé) → propagation `wrappingAdd` jusqu'à la racine. Le treemap voit le bump et morphe.
 3. **Diff des sous-dossiers** (diff de noms, à l'apply) : apparu → mini-scan `DirectoryScanner` du seul nouveau sous-arbre rattaché à `P` — en respectant `skipPaths`/mount-points **comme le scan initial** (sinon double-comptage firmlink Data) ; disparu → soustraction des agrégats + détachement (plomberie `applyDirectoryRemoval`, qui relève déjà zoom/sélection/expansion vers le survivant).
 4. **File-types** : diff **exact** par extension via un **snapshot par-dossier** (LRU borné, ~4096 dossiers) alimenté par chaque re-stat — exact dès le second delta sur un dossier ; amorcé par `fileCache` quand il détient le listing complet (< 2000 items, sa borne). Sans ancien snapshot : on ne touche pas la table (dérive marquée, même classe de compromis que PR #26). Plus de walk récursif nulle part sur ce chemin.
-5. **Caches** : le listing obtenu en 1 rafraîchit `fileCache` (l'outline suit sans I/O) ; `sortCache` purgé (l'ordre par taille a pu changer) ; un **seul bump de version par cycle** de réconciliation, pas par delta — l'ε-revalidation SPEC-10 ne tourne qu'une fois.
+5. **Caches** : le listing obtenu en 1 rafraîchit `fileCache` (l'outline suit sans I/O) ; `sortCache` purgé (l'ordre par taille a pu changer). Les bumps de version par delta se coalescent naturellement par tour de runloop (SwiftUI ne repeint qu'une fois par tour) — pendant un gros cycle, la carte se met à jour progressivement au lieu de sauter d'un coup.
 6. **Invariants de sûreté** inchangés : epoch re-vérifié après chaque suspension, ancêtres retenus, `structuralOpActive` exclusif.
 
 ### 3.3 Rattrapage automatique (pas un fallback dormant — un second régime nominal)
@@ -58,7 +58,7 @@ Un seul cas le fait apparaître : un rattrapage automatique (§3.3) dont le sous
 
 - **Fixtures** (pattern NavigationTests) : créer/supprimer/retailler un fichier dans un dossier scanné → agrégats exacts propagés jusqu'à la racine **sans** sub-scan (compteur d'appels scanner espionnable) ; dossier créé avec contenu → mini-scan du seul sous-arbre ; dossier supprimé → soustraction exacte.
 - **Rattrapage auto** : événement forgé avec `MustScanSubDirs` → re-scan auto du sous-arbre, sans bandeau ; rafale synthétique (> N dirs) → coalescence à l'ancêtre commun + un seul re-scan ; rafale géante (> seuil de consentement) → bandeau, et lui seul.
-- **Live QA** : rejouer le scénario du 2026-07-12 (`dd` 4 GiB à la racine du home) → apparition dans la carte **< 1 s** après la latence FSEvents, **sans clic**, morph à l'appui ; suppression → fonte ; `npm install` dans un repo → un seul rattrapage coalescé, silencieux.
+- **Live QA** : rejouer le scénario du 2026-07-12 (`dd` 4 GiB à la racine du home) → apparition dans la carte **< 1 s** après la latence FSEvents, **sans clic**, morph à l'appui ; suppression → fonte ; `npm install` dans un repo → un seul rattrapage coalescé, silencieux. ✅ *Mesuré headless à l'échelle (`SM_QA_LIVE=1`, 955 k fichiers) : apparition 0,01 s, fonte 0,73 s — voir `liveReconcileAtScale`.*
 - **Cohérence** : après une salve de deltas, `du -skx` byte-exact vs agrégats (la méthode de vérif des audits) ; drift statfs vs `changedBytes` sous le budget.
 
 ## 6. Risques & hypothèses (🔬)
