@@ -5,11 +5,11 @@ import simd
 // GPU renderer for the treemap tiles (SPEC-09). The engine is 3D-native from the
 // start — instanced 3D quads, an MVP camera and a depth buffer — but the current
 // view is its *orthographic top-down projection*: flat tiles (height 0) seen from
-// straight above, which is pixel-identical to the old 2D map. Going 3D later is a
-// camera + height change, not a rewrite (SPEC-09 §9).
+// straight above, the classic 2D treemap. Going 3D later is a camera + height
+// change, not a rewrite (SPEC-09 §9).
 //
-// Only the tile *fill* moves to the GPU; layout, colour source, hit-testing and the
-// selection/hover overlay stay where they were. One `drawPrimitives(instanceCount:)`
+// Only the tile *fill* is the GPU's job; layout, colour source, hit-testing and the
+// selection/hover overlay live in `TreemapNSView`. One `drawPrimitives(instanceCount:)`
 // draws every tile in a single call — the answer to "thousands of CPU fillRect".
 
 /// One tile, as uploaded to the GPU. 3D-native: `origin`/`size` carry a Y (height)
@@ -34,8 +34,8 @@ struct Camera {
     /// onto the drawable: worldX vx→vx+vw to NDC −1→+1, worldZ vy→vy+vh (top→bottom) to
     /// NDC +1→−1. The full-view camera passes the whole bounds; an animated zoom passes a
     /// shrinking/growing sub-rect so the map pushes toward (or pulls back from) a folder.
-    /// Ortho of flat tiles preserves proportions, so the result is iso-visual with the
-    /// CoreGraphics map. z is a constant mid-depth; the Y column stays 0 until boxes extrude.
+    /// Ortho of flat tiles preserves proportions, so the map reads as plain 2D.
+    /// z is a constant mid-depth; the Y column stays 0 until boxes extrude.
     static func ortho(viewport v: CGRect) -> Camera {
         let vw = max(Double(v.width), 1), vh = max(Double(v.height), 1)
         let vx = Double(v.minX), vy = Double(v.minY)
@@ -67,9 +67,7 @@ final class TreemapMetalRenderer {
     private var instanceBuffers: [MTLBuffer?]
     private var frameIndex = 0
 
-    private let sampleCount: Int
     private let transientStorage: MTLStorageMode
-    private var msaaTexture: MTLTexture?
     private var depthTexture: MTLTexture?
     private var attachmentSize = CGSize.zero
 
@@ -82,22 +80,21 @@ final class TreemapMetalRenderer {
               let vfn = library.makeFunction(name: "treemapVertex"),
               let ffn = library.makeFunction(name: "treemapFragment") else { return nil }
 
-        // 4× MSAA smooths the tile seams so they don't shimmer as fractional edges crawl
-        // across the pixel grid during a live resize. Near-free on Apple Silicon (TBDR:
-        // memoryless samples resolved in-tile). Falls back to 1× where unsupported.
-        let sc = device.supportsTextureSampleCount(4) ? 4 : 1
+        // No MSAA: every edge in the map is axis-aligned and the tile borders are
+        // anti-aliased in the fragment shader, so multisampling had nothing to smooth
+        // (verified by eye at 1× vs 4× on Retina). Revisit when the 3D camera lands —
+        // perspective brings diagonals.
         let transient: MTLStorageMode = device.supportsFamily(.apple2) ? .memoryless : .private
 
         let pd = MTLRenderPipelineDescriptor()
         pd.vertexFunction = vfn
         pd.fragmentFunction = ffn
-        pd.colorAttachments[0].pixelFormat = .bgra8Unorm   // non-sRGB: store sRGB values as-is → matches CG
+        pd.colorAttachments[0].pixelFormat = .bgra8Unorm   // non-sRGB: colours arrive sRGB-encoded, stored as-is
         pd.depthAttachmentPixelFormat = .depth32Float
-        pd.sampleCount = sc
         guard let pipeline = try? device.makeRenderPipelineState(descriptor: pd) else { return nil }
 
-        // Coplanar flat tiles never overlap, so `.lessEqual` (equal-z samples pass,
-        // painter's order wins) avoids MSAA seam rejection; ready for real depth in 3D.
+        // Coplanar flat tiles never overlap, so `.lessEqual` (equal-z fragments pass,
+        // painter's order wins) keeps shared edges seam-free; ready for real depth in 3D.
         let dsd = MTLDepthStencilDescriptor()
         dsd.depthCompareFunction = .lessEqual
         dsd.isDepthWriteEnabled = true
@@ -107,7 +104,6 @@ final class TreemapMetalRenderer {
         self.queue = queue
         self.pipeline = pipeline
         self.depthState = depthState
-        self.sampleCount = sc
         self.transientStorage = transient
         self.instanceBuffers = Array(repeating: nil, count: Self.maxInflight)
     }
@@ -133,15 +129,8 @@ final class TreemapMetalRenderer {
         var uniforms = Uniforms(viewProj: camera.viewProjection, borderColor: borderColor)
 
         let rpd = MTLRenderPassDescriptor()
-        if sampleCount > 1 {
-            // Render into the MSAA texture, resolve down into the drawable on store.
-            rpd.colorAttachments[0].texture = msaaTexture
-            rpd.colorAttachments[0].resolveTexture = drawable.texture
-            rpd.colorAttachments[0].storeAction = .multisampleResolve
-        } else {
-            rpd.colorAttachments[0].texture = drawable.texture
-            rpd.colorAttachments[0].storeAction = .store
-        }
+        rpd.colorAttachments[0].texture = drawable.texture
+        rpd.colorAttachments[0].storeAction = .store
         rpd.colorAttachments[0].loadAction = .clear
         rpd.colorAttachments[0].clearColor = MTLClearColor(
             red: Double(clearColor.x), green: Double(clearColor.y), blue: Double(clearColor.z), alpha: 1)
@@ -213,21 +202,9 @@ final class TreemapMetalRenderer {
 
         let dd = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .depth32Float, width: w, height: h, mipmapped: false)
-        dd.textureType = sampleCount > 1 ? .type2DMultisample : .type2D
-        dd.sampleCount = sampleCount
         dd.usage = .renderTarget
         dd.storageMode = transientStorage
         depthTexture = device.makeTexture(descriptor: dd)
-
-        if sampleCount > 1 {
-            let cd = MTLTextureDescriptor.texture2DDescriptor(
-                pixelFormat: .bgra8Unorm, width: w, height: h, mipmapped: false)
-            cd.textureType = .type2DMultisample
-            cd.sampleCount = sampleCount
-            cd.usage = .renderTarget
-            cd.storageMode = transientStorage
-            msaaTexture = device.makeTexture(descriptor: cd)
-        }
         attachmentSize = size
     }
 
@@ -273,8 +250,8 @@ final class TreemapMetalRenderer {
         return o;
     }
 
-    // Fill → cushion sheen (light top → dark bottom, 3 stops matching the CG gradient)
-    // → dim (highlight/search) → border. All per-pixel, all free on the GPU.
+    // Fill → cushion sheen (light top → dark bottom, 3 stops) → dim (highlight/search)
+    // → border. All per-pixel, all free on the GPU.
     fragment float4 treemapFragment(VOut in [[stage_in]],
                                     constant Uniforms& u [[buffer(1)]]) {
         float3 col = in.color.rgb;
