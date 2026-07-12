@@ -70,7 +70,7 @@ jobs:
           echo "CODESIGN_ID=$IDENTITY" >> "$GITHUB_ENV"
 
       - name: Build app bundle
-        run: VERSION="${TAG_NAME#v}" ./bundle.sh release
+        run: VERSION="${TAG_NAME#v}" ./Packaging/bundle.sh release
 
       - name: Hardened-runtime sign + verify
         if: env.HAS_SIGNING == 'true'

@@ -17,7 +17,7 @@
 #   DEVELOPER_ID    "Developer ID Application: Your Name (TEAMID)"   (required)
 #   NOTARY_PROFILE  keychain profile name                            (default: spacematters-notary)
 set -euo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 : "${DEVELOPER_ID:?Set DEVELOPER_ID to your 'Developer ID Application: …' identity}"
 NOTARY_PROFILE="${NOTARY_PROFILE:-spacematters-notary}"
@@ -30,7 +30,7 @@ DMG="SpaceMatters-${VERSION}.dmg"
 echo "▸ Building & bundling ${VERSION} with ${DEVELOPER_ID}"
 # Bundle (icon, plist, git version) signed with the Developer ID — the stable
 # cdhash is what makes the Full Disk Access grant persist across builds.
-CODESIGN_ID="$DEVELOPER_ID" ./bundle.sh release
+CODESIGN_ID="$DEVELOPER_ID" ./Packaging/bundle.sh release
 
 echo "▸ Hardened-runtime sign + verify"
 codesign --force --deep --options runtime --timestamp --sign "$DEVELOPER_ID" "$APP"

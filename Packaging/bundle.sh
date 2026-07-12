@@ -1,7 +1,8 @@
 #!/bin/bash
 # Build SpaceMatters and assemble a double-clickable SpaceMatters.app bundle.
+# Lives in Packaging/ but works from the repo root: the bundle is written there.
 set -euo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 CONFIG="${1:-release}"
 APP="SpaceMatters.app"
@@ -68,7 +69,7 @@ PLIST
 # Set CODESIGN_ID to a stable self-signed identity to keep those grants:
 #   1) Keychain Access ▸ Certificate Assistant ▸ Create a Certificate…
 #      name "SpaceMatters", type "Code Signing", self-signed.
-#   2) export CODESIGN_ID="SpaceMatters"   (then re-run ./bundle.sh)
+#   2) export CODESIGN_ID="SpaceMatters"   (then re-run ./Packaging/bundle.sh)
 SIGN_ID="${CODESIGN_ID:--}"
 # Prefer a hardened runtime; fall back without it (needed for a debuggable
 # ad-hoc build). Only a *total* signing failure is fatal — don't mask it.
