@@ -57,7 +57,12 @@ struct CleanupResultView: View {
     private var confirmMessage: String {
         let names = controller.selectedRows.map(\.item.name).joined(separator: ", ")
         var message = "\(names) — about \(Format.bytes(controller.totalSelected)) will be reclaimed. "
-            + "Caches are re-downloaded or rebuilt on demand; emptying the Trash is permanent."
+            + "Caches are re-downloaded or rebuilt on demand."
+        // The Trash is the one selected target that is user data, not a cache —
+        // its warning appears exactly when it applies, so it is never diluted.
+        if controller.selectedRows.contains(where: { $0.id == "trash" }) {
+            message += "\n\n⚠️ The Trash is not a cache: emptying it permanently deletes those files."
+        }
         let tools = activeWarnings.values.reduce(into: Set<String>()) { $0.formUnion($1) }
         if !tools.isEmpty {
             message += "\n\n⚠️ Running right now: \(tools.sorted().joined(separator: ", ")) — "
@@ -349,6 +354,11 @@ private struct CleanupRowView: View {
             }
             .buttonStyle(.plain)
             .help("Grant Full Disk Access to measure and clean this location")
+        case .blocked(let reason):
+            Label("Protected", systemImage: "exclamationmark.shield.fill")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(Color(hex: 0xE0915A))
+                .help(reason)
         }
     }
 
@@ -357,6 +367,7 @@ private struct CleanupRowView: View {
         case .pending: return "measuring"
         case .sized(let bytes): return Format.bytes(bytes)
         case .denied: return "needs Full Disk Access"
+        case .blocked(let reason): return "protected: \(reason)"
         }
     }
 

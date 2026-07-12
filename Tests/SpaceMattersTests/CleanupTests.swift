@@ -318,6 +318,74 @@ import Foundation
         #expect(c.state == .ready)
     }
 
+    /// The Trash is user data, not a cache: the select-all header ignores it in
+    /// both directions — it is only ever selected row by row.
+    @Test func selectAllNeverTouchesTheTrash() async throws {
+        let (root, cache) = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let trashDir = root.appendingPathComponent(".Trash")
+        try FileManager.default.createDirectory(at: trashDir, withIntermediateDirectories: true)
+        try Data(count: 4096).write(to: trashDir.appendingPathComponent("t.bin"))
+        let trash = Cleanable(id: "trash", name: "Trash", category: "System",
+                              icon: "trash.fill", note: "fixture", paths: [trashDir.path])
+        let c = CleanupController(catalog: [Self.cleanable([cache.path]), trash],
+                                  allowedRoot: root.path)
+        c.load()
+        await Self.waitForReady(c)
+
+        c.toggleAll()
+        #expect(c.selectAllState == .all) // all *cache* rows selected…
+        #expect(c.selectedRows.map(\.id) == ["test-cache"]) // …Trash left alone
+
+        c.toggle("trash") // explicit per-row opt-in still works
+        #expect(c.selectedRows.count == 2)
+        c.toggleAll() // all → none clears caches, not the hand-picked Trash
+        #expect(c.selectedRows.map(\.id) == ["trash"])
+    }
+
+    /// A blocked target (uv in link-mode=symlink) is shown but never sized,
+    /// never selectable — and a stale selection doesn't survive into it.
+    @Test func blockedRowIsVisibleButInert() async throws {
+        let (root, cache) = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let c = CleanupController(
+            catalog: [Self.cleanable([cache.path])], allowedRoot: root.path,
+            blockedReason: { id, _ in id == "test-cache" ? "would break venvs" : nil })
+        c.load()
+        await Self.waitForReady(c)
+
+        #expect(c.rows.first?.size == .blocked("would break venvs"))
+        c.toggle("test-cache") // the model refuses, not just the disabled checkbox
+        c.toggleAll()
+        #expect(c.selectedRows.isEmpty)
+        #expect(c.state == .ready) // an all-blocked catalog still settles
+
+        await c.cleanSelected()
+        #expect(FileManager.default.fileExists(atPath: cache.appendingPathComponent("a.bin").path))
+    }
+
+    /// The uv guard reads the environment and uv's user-level config.
+    @Test func uvSymlinkModeDetection() throws {
+        #expect(CleanupEngine.uvSymlinkMode(home: "/nonexistent", environment: [:]) == false)
+        #expect(CleanupEngine.uvSymlinkMode(home: "/nonexistent",
+                                            environment: ["UV_LINK_MODE": "symlink"]))
+        #expect(CleanupEngine.uvSymlinkMode(home: "/nonexistent",
+                                            environment: ["UV_LINK_MODE": "hardlink"]) == false)
+
+        let fm = FileManager.default
+        let home = fm.temporaryDirectory.appendingPathComponent("sm-uv-\(UUID().uuidString)")
+        defer { try? fm.removeItem(at: home) }
+        let configDir = home.appendingPathComponent(".config/uv")
+        try fm.createDirectory(at: configDir, withIntermediateDirectories: true)
+        try #"link-mode = "symlink""#.write(
+            to: configDir.appendingPathComponent("uv.toml"), atomically: true, encoding: .utf8)
+        #expect(CleanupEngine.uvSymlinkMode(home: home.path, environment: [:]))
+
+        try #"# link-mode = "symlink""#.write(
+            to: configDir.appendingPathComponent("uv.toml"), atomically: true, encoding: .utf8)
+        #expect(CleanupEngine.uvSymlinkMode(home: home.path, environment: [:]) == false)
+    }
+
     /// Entries whose paths don't exist disappear; existing ones keep only their
     /// existing paths.
     @Test func detectFiltersMissingPaths() throws {

@@ -57,11 +57,11 @@ enum CleanupEngine {
                 paths: [home + "/Library/Caches/Yarn"]),
             Cleanable(
                 id: "pnpm", name: "pnpm store", category: "JavaScript", icon: "shippingbox",
-                note: "Content-addressable package store, re-downloaded on demand.",
+                note: "Package store — projects keep their files (hard links), re-downloaded on demand.",
                 paths: [home + "/Library/pnpm/store", home + "/.pnpm-store"]),
             Cleanable(
                 id: "nuget", name: "NuGet packages", category: ".NET", icon: "archivebox.fill",
-                note: "Global packages + HTTP cache, restored on next build.",
+                note: "Global packages + HTTP cache, restored on next build (needs feed access).",
                 paths: [
                     home + "/.nuget/packages",
                     home + "/.local/share/NuGet/http-cache",
@@ -81,7 +81,7 @@ enum CleanupEngine {
                 paths: [home + "/.gradle/caches"]),
             Cleanable(
                 id: "maven", name: "Maven repository", category: "JVM", icon: "gearshape.2",
-                note: "Local artifact repository, re-downloaded on next build.",
+                note: "Re-downloaded on next build — except JARs installed by hand (install:install-file).",
                 paths: [home + "/.m2/repository"]),
             Cleanable(
                 id: "cargo", name: "Cargo registry", category: "Rust & Go", icon: "wrench.and.screwdriver.fill",
@@ -93,7 +93,7 @@ enum CleanupEngine {
                 paths: [home + "/Library/Caches/go-build"]),
             Cleanable(
                 id: "homebrew", name: "Homebrew downloads", category: "Homebrew", icon: "mug.fill",
-                note: "Bottle and formula downloads (what `brew cleanup` removes).",
+                note: "Bottle, cask and API downloads, re-fetched on demand.",
                 paths: [home + "/Library/Caches/Homebrew"]),
         ]
     }
@@ -223,6 +223,26 @@ enum CleanupEngine {
         let fence = allowedRoot.hasSuffix("/") ? allowedRoot : allowedRoot + "/"
         return root.hasPrefix(fence) && root != fence && isRealDirectory(root)
             && staysInsideFence(root, allowedRoot: allowedRoot)
+    }
+
+    /// uv `link-mode = symlink` makes every virtualenv point INTO the cache:
+    /// cleaning it would break all installed packages — uv's own docs say the
+    /// same of `uv cache clean`. Checked from the environment and uv's
+    /// user-level config; when true, the uv target must not be offered.
+    static func uvSymlinkMode(home: String = NSHomeDirectory(),
+                              environment: [String: String] = ProcessInfo.processInfo.environment) -> Bool {
+        if environment["UV_LINK_MODE"] == "symlink" { return true }
+        let configDir = environment["XDG_CONFIG_HOME"] ?? (home + "/.config")
+        guard let text = try? String(contentsOfFile: configDir + "/uv/uv.toml", encoding: .utf8) else {
+            return false
+        }
+        for line in text.split(separator: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if !trimmed.hasPrefix("#"), trimmed.hasPrefix("link-mode"), trimmed.contains("symlink") {
+                return true
+            }
+        }
+        return false
     }
 
     /// True only for a directory that is not itself a symlink (`lstat`, so the

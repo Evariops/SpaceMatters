@@ -15,6 +15,9 @@ final class CleanupController {
         case sized(Int64)
         /// Exists but unreadable — typically the Trash without Full Disk Access.
         case denied
+        /// Cleaning this target on this machine would break things (uv in
+        /// `link-mode=symlink`) — never sized, never selectable, reason shown.
+        case blocked(String)
     }
 
     struct Row: Identifiable {
@@ -47,11 +50,13 @@ final class CleanupController {
     /// lands, instead of being dropped (or worse, resetting rows under it).
     private var pendingReload = false
 
-    /// Which native cleaner (if any) handles a target, and how one is executed.
-    /// Both are injectable: cleaning is destructive, tests must be able to
-    /// observe it without ever spawning a real tool.
+    /// Which native cleaner (if any) handles a target, how one is executed, and
+    /// which targets are blocked outright on this machine. All injectable:
+    /// cleaning is destructive, tests must be able to observe every path
+    /// without spawning a real tool or depending on this machine's config.
     private let nativeLookup: @Sendable (String, String) -> NativeCleaner?
     private let nativeRunner: @Sendable (NativeCleaner) async -> ProcessResult
+    private let blockedReason: @Sendable (String, String) -> String?
 
     /// `catalog`/`allowedRoot` are injectable so tests can run against fixtures;
     /// the app uses the built-in catalog fenced to the user's home.
@@ -62,11 +67,17 @@ final class CleanupController {
          nativeRunner: @escaping @Sendable (NativeCleaner) async -> ProcessResult = { native in
             await ProcessRunner.run(native.binary, native.arguments,
                                     timeout: native.timeout, environment: native.environment)
+         },
+         blockedReason: @escaping @Sendable (String, String) -> String? = { id, home in
+            id == "uv" && CleanupEngine.uvSymlinkMode(home: home)
+                ? "uv link-mode is \"symlink\" — cleaning would break your virtualenvs"
+                : nil
          }) {
         self.catalog = catalog
         self.allowedRoot = allowedRoot
         self.nativeLookup = nativeLookup
         self.nativeRunner = nativeRunner
+        self.blockedReason = blockedReason
     }
 
     func load() {
@@ -84,15 +95,20 @@ final class CleanupController {
         lastRefused = 0
         lastNativeIssues = []
         let detected = CleanupEngine.detect(catalog, allowedRoot: allowedRoot)
-        // Keep existing selections across a refresh; drop ones that vanished.
+        let blocked = Dictionary(uniqueKeysWithValues: detected.compactMap { item in
+            blockedReason(item.id, allowedRoot).map { (item.id, $0) }
+        })
+        // Keep existing selections across a refresh; drop ones that vanished
+        // (or got blocked meanwhile).
         let previouslySelected = Set(rows.filter(\.selected).map(\.id))
         rows = detected.map {
             Row(item: $0,
                 nativeLabel: nativeLookup($0.id, allowedRoot)?.label,
-                selected: previouslySelected.contains($0.id))
+                size: blocked[$0.id].map(SizeState.blocked) ?? .pending,
+                selected: previouslySelected.contains($0.id) && blocked[$0.id] == nil)
         }
-        state = rows.isEmpty ? .ready : .sizing
-        for item in detected {
+        state = rows.contains { $0.size == .pending } ? .sizing : .ready
+        for item in detected where blocked[item.id] == nil {
             Task {
                 let measure = await Task.detached(priority: .userInitiated) {
                     CleanupEngine.size(of: item)
@@ -112,8 +128,11 @@ final class CleanupController {
         pendingReload = false
     }
 
+    /// The model guards itself: a pending/denied/blocked row cannot be selected
+    /// however the call arrives, not just because the checkbox is disabled.
     func toggle(_ id: String) {
-        guard let idx = rows.firstIndex(where: { $0.id == id }) else { return }
+        guard let idx = rows.firstIndex(where: { $0.id == id }),
+              rows[idx].size.isSelectable else { return }
         rows[idx].selected.toggle()
     }
 
@@ -121,10 +140,17 @@ final class CleanupController {
 
     enum SelectAllState { case none, some, all }
 
-    /// Select-all checkbox state over the *selectable* rows (denied/pending
-    /// rows have no trustworthy size and never count).
+    /// Select-all drives the *cache* rows only. The Trash is the one target
+    /// that is user data, not a regenerable cache — it is selected row by row,
+    /// never swept up in momentum, and the header checkbox ignores it both ways.
+    private func isBulkSelectable(_ row: Row) -> Bool {
+        row.size.isSelectable && row.item.id != "trash"
+    }
+
+    /// Select-all checkbox state over the bulk-selectable rows (denied/pending/
+    /// blocked rows have no trustworthy size and never count; nor does Trash).
     var selectAllState: SelectAllState {
-        let selectable = rows.filter(\.size.isSelectable)
+        let selectable = rows.filter(isBulkSelectable)
         let selected = selectable.filter(\.selected).count
         if selected == 0 { return .none }
         return selected == selectable.count ? .all : .some
@@ -133,8 +159,8 @@ final class CleanupController {
     /// Standard macOS cycle: all → none; none or mixed → all.
     func toggleAll() {
         let target = selectAllState != .all
-        for idx in rows.indices {
-            rows[idx].selected = target && rows[idx].size.isSelectable
+        for idx in rows.indices where isBulkSelectable(rows[idx]) {
+            rows[idx].selected = target
         }
     }
 
