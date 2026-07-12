@@ -19,6 +19,8 @@ final class CleanupController {
 
     struct Row: Identifiable {
         let item: Cleanable
+        /// Set when the vendor's own cleaner will run instead of file removal.
+        var nativeLabel: String?
         var size: SizeState = .pending
         var selected = false
         var id: String { item.id }
@@ -33,6 +35,10 @@ final class CleanupController {
     /// Paths the safety fence refused during the last clean — a bug indicator
     /// (detect and clean disagreeing), surfaced distinctly from plain failures.
     private(set) var lastRefused = 0
+    /// Native cleaners that exited non-zero during the last clean ("Homebrew —
+    /// brew cleanup: …"). Surfaced as an alert; never retried as file removal —
+    /// the failure may be the vendor's lock doing its job.
+    private(set) var lastNativeIssues: [String] = []
 
     private let catalog: [Cleanable]
     private let allowedRoot: String
@@ -41,12 +47,26 @@ final class CleanupController {
     /// lands, instead of being dropped (or worse, resetting rows under it).
     private var pendingReload = false
 
+    /// Which native cleaner (if any) handles a target, and how one is executed.
+    /// Both are injectable: cleaning is destructive, tests must be able to
+    /// observe it without ever spawning a real tool.
+    private let nativeLookup: @Sendable (String, String) -> NativeCleaner?
+    private let nativeRunner: @Sendable (NativeCleaner) async -> ProcessResult
+
     /// `catalog`/`allowedRoot` are injectable so tests can run against fixtures;
     /// the app uses the built-in catalog fenced to the user's home.
     init(catalog: [Cleanable] = CleanupEngine.catalog(),
-         allowedRoot: String = NSHomeDirectory()) {
+         allowedRoot: String = NSHomeDirectory(),
+         nativeLookup: @escaping @Sendable (String, String) -> NativeCleaner? =
+            { NativeCleaner.available(for: $0, home: $1) },
+         nativeRunner: @escaping @Sendable (NativeCleaner) async -> ProcessResult = { native in
+            await ProcessRunner.run(native.binary, native.arguments,
+                                    timeout: native.timeout, environment: native.environment)
+         }) {
         self.catalog = catalog
         self.allowedRoot = allowedRoot
+        self.nativeLookup = nativeLookup
+        self.nativeRunner = nativeRunner
     }
 
     func load() {
@@ -62,10 +82,15 @@ final class CleanupController {
         lastFreed = 0
         lastFailures = 0
         lastRefused = 0
+        lastNativeIssues = []
         let detected = CleanupEngine.detect(catalog, allowedRoot: allowedRoot)
         // Keep existing selections across a refresh; drop ones that vanished.
         let previouslySelected = Set(rows.filter(\.selected).map(\.id))
-        rows = detected.map { Row(item: $0, selected: previouslySelected.contains($0.id)) }
+        rows = detected.map {
+            Row(item: $0,
+                nativeLabel: nativeLookup($0.id, allowedRoot)?.label,
+                selected: previouslySelected.contains($0.id))
+        }
         state = rows.isEmpty ? .ready : .sizing
         for item in detected {
             Task {
@@ -148,12 +173,20 @@ final class CleanupController {
 
         var failures = 0
         var refused = 0
+        var issues: [String] = []
         for item in targets {
-            let result = await Task.detached(priority: .userInitiated) {
-                CleanupEngine.clean(item, allowedRoot: root)
-            }.value
-            failures += result.failed
-            refused += result.refused
+            // Availability is resolved at clean time, not load time: the label
+            // shown is a promise, the decision here is the truth.
+            if let native = nativeLookup(item.id, root) {
+                let result = await nativeRunner(native)
+                if !result.ok { issues.append("\(item.name) — \(native.label): \(result.diagnostic)") }
+            } else {
+                let result = await Task.detached(priority: .userInitiated) {
+                    CleanupEngine.clean(item, allowedRoot: root)
+                }.value
+                failures += result.failed
+                refused += result.refused
+            }
             let measure = await Task.detached(priority: .userInitiated) {
                 CleanupEngine.size(of: item)
             }.value
@@ -163,6 +196,7 @@ final class CleanupController {
         if id == loadID { // results belong to the session that confirmed them
             lastFailures = failures
             lastRefused = refused
+            lastNativeIssues = issues
             lastFreed = max(0, before - totalSelected)
             for idx in rows.indices { rows[idx].selected = false }
         }
@@ -172,6 +206,8 @@ final class CleanupController {
             load()
         }
     }
+
+    func dismissNativeIssues() { lastNativeIssues = [] }
 
     // MARK: Private
 

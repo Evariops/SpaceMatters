@@ -45,6 +45,13 @@ struct CleanupResultView: View {
         } message: {
             Text(confirmMessage)
         }
+        .alert("A cleaner reported a problem", isPresented: Binding(
+            get: { !controller.lastNativeIssues.isEmpty },
+            set: { if !$0 { controller.dismissNativeIssues() } })) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(controller.lastNativeIssues.joined(separator: "\n"))
+        }
     }
 
     private var confirmMessage: String {
@@ -297,6 +304,15 @@ private struct CleanupRowView: View {
                 .foregroundStyle(theme.textSecondary)
                 .lineLimit(1)
                 .layoutPriority(1)
+
+            if let native = row.nativeLabel {
+                Text("via \(native)")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(theme.accent.opacity(0.85))
+                    .padding(.horizontal, 5).padding(.vertical, 1)
+                    .background(Capsule().fill(theme.accent.opacity(0.12)))
+                    .layoutPriority(1)
+            }
 
             Spacer(minLength: 8)
 

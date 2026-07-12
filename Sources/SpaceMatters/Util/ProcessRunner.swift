@@ -66,10 +66,16 @@ enum ProcessTree {
 /// deadlock (a chatty child that fills the pipe while we wait on exit).
 enum ProcessRunner {
     /// Synchronous run with a deadline. Safe to call from a detached task.
-    static func runSync(_ executable: String, _ args: [String], timeout: TimeInterval = 20) -> ProcessResult {
+    /// `environment` entries are merged over the inherited environment.
+    static func runSync(_ executable: String, _ args: [String], timeout: TimeInterval = 20,
+                        environment: [String: String]? = nil) -> ProcessResult {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = args
+        if let environment {
+            process.environment = ProcessInfo.processInfo.environment
+                .merging(environment) { _, override in override }
+        }
         let outPipe = Pipe(), errPipe = Pipe()
         process.standardOutput = outPipe
         process.standardError = errPipe
@@ -78,10 +84,15 @@ enum ProcessRunner {
 
     /// Async run with the same deadline, plus cooperative cancellation: cancelling
     /// the surrounding `Task` terminates the process instead of waiting it out.
-    static func run(_ executable: String, _ args: [String], timeout: TimeInterval = 20) async -> ProcessResult {
+    static func run(_ executable: String, _ args: [String], timeout: TimeInterval = 20,
+                    environment: [String: String]? = nil) async -> ProcessResult {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = args
+        if let environment {
+            process.environment = ProcessInfo.processInfo.environment
+                .merging(environment) { _, override in override }
+        }
         let outPipe = Pipe(), errPipe = Pipe()
         process.standardOutput = outPipe
         process.standardError = errPipe

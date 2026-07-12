@@ -287,6 +287,37 @@ import Foundation
         #expect(c.totalFound == 0) // …and the emptied cache re-measured at zero
     }
 
+    /// When a native cleaner is available the vendor's tool runs and the file
+    /// engine never touches the cache; a non-zero exit is surfaced, not
+    /// silently retried as file removal (the failure may be the vendor's lock
+    /// doing its job).
+    @Test func nativeCleanerReplacesFileRemovalAndSurfacesFailure() async throws {
+        let (root, cache) = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fake = NativeCleaner(binary: "/usr/bin/false", arguments: [],
+                                 environment: [:], timeout: 5, label: "fake prune")
+        let calls = CallCounter()
+        let c = CleanupController(
+            catalog: [Self.cleanable([cache.path])], allowedRoot: root.path,
+            nativeLookup: { id, _ in id == "test-cache" ? fake : nil },
+            nativeRunner: { _ in
+                await calls.bump()
+                return ProcessResult(stdout: Data(), stderr: Data("store is busy".utf8),
+                                     exitCode: 1, timedOut: false)
+            })
+        c.load()
+        await Self.waitForReady(c)
+        #expect(c.rows.first?.nativeLabel == "fake prune")
+
+        c.toggle("test-cache")
+        await c.cleanSelected()
+
+        #expect(await calls.count == 1)
+        #expect(FileManager.default.fileExists(atPath: cache.appendingPathComponent("a.bin").path))
+        #expect(c.lastNativeIssues == ["Test cache — fake prune: store is busy"])
+        #expect(c.state == .ready)
+    }
+
     /// Entries whose paths don't exist disappear; existing ones keep only their
     /// existing paths.
     @Test func detectFiltersMissingPaths() throws {
@@ -349,4 +380,10 @@ import Foundation
 
         #expect(CleanupEngine.size(of: Self.cleanable([link.path])) == .denied)
     }
+}
+
+/// Serialized call counter usable from `@Sendable` closures in tests.
+private actor CallCounter {
+    private(set) var count = 0
+    func bump() { count += 1 }
 }
