@@ -57,11 +57,11 @@ enum CleanupEngine {
                 paths: [home + "/Library/Caches/Yarn"]),
             Cleanable(
                 id: "pnpm", name: "pnpm store", category: "JavaScript", icon: "shippingbox",
-                note: "Content-addressable package store, re-downloaded on demand.",
+                note: "Package store — projects keep their files (hard links), re-downloaded on demand.",
                 paths: [home + "/Library/pnpm/store", home + "/.pnpm-store"]),
             Cleanable(
                 id: "nuget", name: "NuGet packages", category: ".NET", icon: "archivebox.fill",
-                note: "Global packages + HTTP cache, restored on next build.",
+                note: "Global packages + HTTP cache, restored on next build (needs feed access).",
                 paths: [
                     home + "/.nuget/packages",
                     home + "/.local/share/NuGet/http-cache",
@@ -81,7 +81,7 @@ enum CleanupEngine {
                 paths: [home + "/.gradle/caches"]),
             Cleanable(
                 id: "maven", name: "Maven repository", category: "JVM", icon: "gearshape.2",
-                note: "Local artifact repository, re-downloaded on next build.",
+                note: "Re-downloaded on next build — except JARs installed by hand (install:install-file).",
                 paths: [home + "/.m2/repository"]),
             Cleanable(
                 id: "cargo", name: "Cargo registry", category: "Rust & Go", icon: "wrench.and.screwdriver.fill",
@@ -93,15 +93,19 @@ enum CleanupEngine {
                 paths: [home + "/Library/Caches/go-build"]),
             Cleanable(
                 id: "homebrew", name: "Homebrew downloads", category: "Homebrew", icon: "mug.fill",
-                note: "Bottle and formula downloads (what `brew cleanup` removes).",
+                note: "Bottle, cask and API downloads, re-fetched on demand.",
                 paths: [home + "/Library/Caches/Homebrew"]),
         ]
     }
 
-    /// The catalog restricted to entries with at least one existing path.
-    static func detect(_ catalog: [Cleanable]) -> [Cleanable] {
+    /// The catalog restricted to entries with at least one path that passes the
+    /// same fence as `clean` (existing real directory, no symlinked root, still
+    /// inside `allowedRoot` once resolved). Deciding at detection time keeps the
+    /// UI honest: a relocated cache is never shown, sized through its link, and
+    /// then refused at cleaning time with gigabytes left on screen.
+    static func detect(_ catalog: [Cleanable], allowedRoot: String = NSHomeDirectory()) -> [Cleanable] {
         catalog.compactMap { item in
-            let existing = item.paths.filter { FileManager.default.fileExists(atPath: $0) }
+            let existing = item.paths.filter { passesFence($0, allowedRoot: allowedRoot) }
             guard !existing.isEmpty else { return nil }
             return Cleanable(id: item.id, name: item.name, category: item.category,
                              icon: item.icon, note: item.note, paths: existing)
@@ -123,14 +127,25 @@ enum CleanupEngine {
     static func size(of item: Cleanable) -> Measure {
         var total: Int64 = 0
         var openedAny = false
+        var deniedRoot = false
         let buffer = UnsafeMutableRawPointer.allocate(byteCount: bufferSize, alignment: 16)
         defer { buffer.deallocate() }
 
         for root in item.paths {
             var stack = [root]
             while let dir = stack.popLast() {
-                let fd = open(dir, O_RDONLY | O_DIRECTORY)
-                guard fd >= 0 else { continue }
+                // O_NOFOLLOW: a symlinked root must not be measured through its
+                // target (detect refuses it; clean would too), and a directory
+                // swapped for a link between enumeration and open is not chased.
+                let fd = open(dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+                guard fd >= 0 else {
+                    // ENOENT and EACCES are different stories: a root that no
+                    // longer exists is *empty* (native cleaners like dotnet
+                    // remove their directories outright), only a root we're not
+                    // allowed to open reads as "needs access".
+                    if dir == root && (errno == EACCES || errno == EPERM) { deniedRoot = true }
+                    continue
+                }
                 if dir == root { openedAny = true }
                 let prefix = dir + "/"
                 _ = enumerateDirectory(fd: fd, buffer: buffer, bufferSize: bufferSize) { entry in
@@ -148,7 +163,8 @@ enum CleanupEngine {
                 close(fd)
             }
         }
-        return openedAny ? .sized(total) : .denied
+        if openedAny { return .sized(total) }
+        return deniedRoot ? .denied : .sized(0)
     }
 
     // MARK: Cleaning
@@ -175,11 +191,16 @@ enum CleanupEngine {
     static func clean(_ item: Cleanable, allowedRoot: String = NSHomeDirectory()) -> CleanResult {
         var result = CleanResult()
         let fm = FileManager.default
-        let fence = allowedRoot.hasSuffix("/") ? allowedRoot : allowedRoot + "/"
 
         for root in item.paths {
-            guard root.hasPrefix(fence), root != fence, isRealDirectory(root),
-                  staysInsideFence(root, allowedRoot: allowedRoot) else {
+            var rootStat = stat()
+            if lstat(root, &rootStat) != 0 {
+                // A vanished root is nothing to clean, not a fence violation —
+                // a native cleaner may have removed the directory outright.
+                if errno != ENOENT { result.failed += 1 }
+                continue
+            }
+            guard passesFence(root, allowedRoot: allowedRoot) else {
                 result.refused += 1
                 continue
             }
@@ -188,9 +209,18 @@ enum CleanupEngine {
                 continue
             }
             for child in children {
+                let childPath = root + "/" + child
+                // A volume mounted inside a cache is not the cache's data: skip
+                // it like the sizing walk does. Same family as fence refusals.
+                var st = stat()
+                if lstat(childPath, &st) == 0, (st.st_mode & S_IFMT) == S_IFDIR,
+                   st.st_dev != rootStat.st_dev {
+                    result.refused += 1
+                    continue
+                }
                 // removeItem on a symlink deletes the link, not its target.
                 do {
-                    try fm.removeItem(atPath: root + "/" + child)
+                    try fm.removeItem(atPath: childPath)
                     result.removed += 1
                 } catch {
                     result.failed += 1
@@ -198,6 +228,35 @@ enum CleanupEngine {
             }
         }
         return result
+    }
+
+    /// The full fence, shared by `detect` and `clean` so both always agree:
+    /// textual prefix (cheap, fail-closed), a real non-symlink directory, and a
+    /// fully-resolved form still strictly inside the resolved fence.
+    private static func passesFence(_ root: String, allowedRoot: String) -> Bool {
+        let fence = allowedRoot.hasSuffix("/") ? allowedRoot : allowedRoot + "/"
+        return root.hasPrefix(fence) && root != fence && isRealDirectory(root)
+            && staysInsideFence(root, allowedRoot: allowedRoot)
+    }
+
+    /// uv `link-mode = symlink` makes every virtualenv point INTO the cache:
+    /// cleaning it would break all installed packages — uv's own docs say the
+    /// same of `uv cache clean`. Checked from the environment and uv's
+    /// user-level config; when true, the uv target must not be offered.
+    static func uvSymlinkMode(home: String = NSHomeDirectory(),
+                              environment: [String: String] = ProcessInfo.processInfo.environment) -> Bool {
+        if environment["UV_LINK_MODE"] == "symlink" { return true }
+        let configDir = environment["XDG_CONFIG_HOME"] ?? (home + "/.config")
+        guard let text = try? String(contentsOfFile: configDir + "/uv/uv.toml", encoding: .utf8) else {
+            return false
+        }
+        for line in text.split(separator: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if !trimmed.hasPrefix("#"), trimmed.hasPrefix("link-mode"), trimmed.contains("symlink") {
+                return true
+            }
+        }
+        return false
     }
 
     /// True only for a directory that is not itself a symlink (`lstat`, so the

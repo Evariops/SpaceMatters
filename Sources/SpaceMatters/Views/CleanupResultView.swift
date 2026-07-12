@@ -10,6 +10,9 @@ struct CleanupResultView: View {
     @Environment(\.theme) private var theme
 
     @State private var confirmClean = false
+    /// Tools found running for the selected targets when Clean was pressed —
+    /// named in the confirmation so "my build failed" is never a surprise.
+    @State private var activeWarnings: [String: Set<String>] = [:]
 
     var body: some View {
         VStack(spacing: 0) {
@@ -42,12 +45,30 @@ struct CleanupResultView: View {
         } message: {
             Text(confirmMessage)
         }
+        .alert("A cleaner reported a problem", isPresented: Binding(
+            get: { !controller.lastNativeIssues.isEmpty },
+            set: { if !$0 { controller.dismissNativeIssues() } })) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(controller.lastNativeIssues.joined(separator: "\n"))
+        }
     }
 
     private var confirmMessage: String {
         let names = controller.selectedRows.map(\.item.name).joined(separator: ", ")
-        return "\(names) — about \(Format.bytes(controller.totalSelected)) will be reclaimed. "
-            + "Caches are re-downloaded or rebuilt on demand; emptying the Trash is permanent."
+        var message = "\(names) — about \(Format.bytes(controller.totalSelected)) will be reclaimed. "
+            + "Caches are re-downloaded or rebuilt on demand."
+        // The Trash is the one selected target that is user data, not a cache —
+        // its warning appears exactly when it applies, so it is never diluted.
+        if controller.selectedRows.contains(where: { $0.id == "trash" }) {
+            message += "\n\n⚠️ The Trash is not a cache: emptying it permanently deletes those files."
+        }
+        let tools = activeWarnings.values.reduce(into: Set<String>()) { $0.formUnion($1) }
+        if !tools.isEmpty {
+            message += "\n\n⚠️ Running right now: \(tools.sorted().joined(separator: ", ")) — "
+                + "their in-progress builds or installs may fail."
+        }
+        return message
     }
 
     // MARK: Toolbar
@@ -89,17 +110,25 @@ struct CleanupResultView: View {
                         subtitle: controller.state == .sizing ? "still measuring…" : "\(controller.rows.count) locations")
             summaryCard("Selected", value: Format.bytes(controller.totalSelected),
                         subtitle: "\(controller.selectedRows.count) of \(controller.rows.count)")
-            if controller.lastFreed > 0 {
+            // Shown as soon as a clean ran — a batch where everything failed
+            // must not hide its failures behind the absent card.
+            if controller.lastFreed > 0 || controller.lastFailures > 0 || controller.lastRefused > 0 {
                 summaryCard("Freed", value: Format.bytes(controller.lastFreed),
-                            subtitle: controller.lastFailures > 0
-                                ? "\(controller.lastFailures) items couldn't be removed"
-                                : "measured after cleaning",
-                            accent: true)
+                            subtitle: freedSubtitle, accent: true)
             }
             Spacer()
         }
         .padding(.horizontal, 14).padding(.vertical, 8)
         .background(theme.panelBackground)
+    }
+
+    /// Failures (in use, locked) and fence refusals (a bug indicator) are
+    /// different stories — never fold one into the other.
+    private var freedSubtitle: String {
+        var parts: [String] = []
+        if controller.lastFailures > 0 { parts.append("\(controller.lastFailures) in use or locked") }
+        if controller.lastRefused > 0 { parts.append("\(controller.lastRefused) skipped by the safety fence") }
+        return parts.isEmpty ? "measured after cleaning" : parts.joined(separator: " · ")
     }
 
     private func summaryCard(_ title: String, value: String, subtitle: String, accent: Bool = false) -> some View {
@@ -200,7 +229,11 @@ struct CleanupResultView: View {
                     .font(.system(size: 11)).foregroundStyle(theme.textSecondary)
             }
             Spacer()
-            Button { confirmClean = true } label: {
+            Button {
+                activeWarnings = ToolActivity.activeTools(
+                    for: Set(controller.selectedRows.map(\.id)))
+                confirmClean = true
+            } label: {
                 Text(controller.totalSelected > 0
                      ? "Clean \(Format.bytes(controller.totalSelected))"
                      : "Clean")
@@ -277,6 +310,15 @@ private struct CleanupRowView: View {
                 .lineLimit(1)
                 .layoutPriority(1)
 
+            if let native = row.nativeLabel {
+                Text("via \(native)")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(theme.accent.opacity(0.85))
+                    .padding(.horizontal, 5).padding(.vertical, 1)
+                    .background(Capsule().fill(theme.accent.opacity(0.12)))
+                    .layoutPriority(1)
+            }
+
             Spacer(minLength: 8)
 
             Text(row.item.paths.map(abbreviate).joined(separator: " · "))
@@ -312,6 +354,11 @@ private struct CleanupRowView: View {
             }
             .buttonStyle(.plain)
             .help("Grant Full Disk Access to measure and clean this location")
+        case .blocked(let reason):
+            Label("Protected", systemImage: "exclamationmark.shield.fill")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(Color(hex: 0xE0915A))
+                .help(reason)
         }
     }
 
@@ -320,6 +367,7 @@ private struct CleanupRowView: View {
         case .pending: return "measuring"
         case .sized(let bytes): return Format.bytes(bytes)
         case .denied: return "needs Full Disk Access"
+        case .blocked(let reason): return "protected: \(reason)"
         }
     }
 

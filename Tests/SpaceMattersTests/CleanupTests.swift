@@ -33,6 +33,13 @@ import Foundation
         }
     }
 
+    static func waitForCleaning(_ c: CleanupController, timeout: TimeInterval = 5) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while c.state != .cleaning && Date() < deadline {
+            await Task.yield()
+        }
+    }
+
     // MARK: Catalog
 
     @Test func catalogStaysInsideHome() {
@@ -167,7 +174,8 @@ import Foundation
     @Test func controllerSizesSelectsAndCleans() async throws {
         let (root, cache) = try Self.makeFixture()
         defer { try? FileManager.default.removeItem(at: root) }
-        let c = CleanupController(catalog: [Self.cleanable([cache.path])], allowedRoot: root.path)
+        let c = CleanupController(catalog: [Self.cleanable([cache.path])], allowedRoot: root.path,
+                                  journal: { _ in }) // fixtures must never write the user's journal
         c.load()
         await Self.waitForReady(c)
 
@@ -189,7 +197,8 @@ import Foundation
     @Test func cleanRefusedWhileSizing() async throws {
         let (root, cache) = try Self.makeFixture()
         defer { try? FileManager.default.removeItem(at: root) }
-        let c = CleanupController(catalog: [Self.cleanable([cache.path])], allowedRoot: root.path)
+        let c = CleanupController(catalog: [Self.cleanable([cache.path])], allowedRoot: root.path,
+                                  journal: { _ in }) // fixtures must never write the user's journal
         c.load()
         #expect(c.state == .sizing)
 
@@ -213,7 +222,7 @@ import Foundation
         let second = Cleanable(id: "test-cache-2", name: "Second cache", category: "Test",
                                icon: "shippingbox", note: "fixture", paths: [cache2.path])
         let c = CleanupController(catalog: [Self.cleanable([cache.path]), second],
-                                  allowedRoot: root.path)
+                                  allowedRoot: root.path, journal: { _ in })
         c.load()
         await Self.waitForReady(c)
 
@@ -231,6 +240,232 @@ import Foundation
         #expect(c.selectedRows.isEmpty)
     }
 
+    /// A confirmed batch survives leaving the mode: every deletion runs to
+    /// completion, only the UI writes are dropped, and the controller lands
+    /// back on a terminal state instead of a forever-`.cleaning` brick.
+    @Test func stopMidCleanCompletesBatchAndRestoresState() async throws {
+        let (root, cache) = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let cache2 = root.appendingPathComponent("cache2")
+        try FileManager.default.createDirectory(at: cache2, withIntermediateDirectories: true)
+        try Data(count: 4096).write(to: cache2.appendingPathComponent("c.bin"))
+        let second = Cleanable(id: "test-cache-2", name: "Second cache", category: "Test",
+                               icon: "shippingbox", note: "fixture", paths: [cache2.path])
+        let c = CleanupController(catalog: [Self.cleanable([cache.path]), second],
+                                  allowedRoot: root.path, journal: { _ in })
+        c.load()
+        await Self.waitForReady(c)
+        c.toggleAll()
+
+        let batch = Task { await c.cleanSelected() }
+        await Self.waitForCleaning(c)
+        c.stop() // user leaves the mode right after confirming
+        await batch.value
+
+        #expect(c.state == .ready)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: cache.path).isEmpty)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: cache2.path).isEmpty)
+        #expect(c.lastFreed == 0) // results are never stamped on a session that left
+    }
+
+    /// A reload asked for mid-clean (mode re-entered) is deferred, not dropped:
+    /// the batch is left untouched and fresh rows appear once it lands.
+    @Test func reloadDuringCleanIsDeferredUntilBatchEnds() async throws {
+        let (root, cache) = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let c = CleanupController(catalog: [Self.cleanable([cache.path])], allowedRoot: root.path,
+                                  journal: { _ in }) // fixtures must never write the user's journal
+        c.load()
+        await Self.waitForReady(c)
+        c.toggle("test-cache")
+
+        let batch = Task { await c.cleanSelected() }
+        await Self.waitForCleaning(c)
+        c.load() // re-entering the mode mid-batch
+        #expect(c.state == .cleaning) // rows/state untouched under the operation
+
+        await batch.value
+        await Self.waitForReady(c)
+        // The deferred reload ran as a *fresh* load: the cache the batch just
+        // emptied re-measures at 0 B and is dropped by the empty-row rule.
+        #expect(c.rows.isEmpty)
+        #expect(c.totalFound == 0)
+    }
+
+    /// When a native cleaner is available the vendor's tool runs and the file
+    /// engine never touches the cache; a non-zero exit is surfaced, not
+    /// silently retried as file removal (the failure may be the vendor's lock
+    /// doing its job).
+    @Test func nativeCleanerReplacesFileRemovalAndSurfacesFailure() async throws {
+        let (root, cache) = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fake = NativeCleaner(binary: "/usr/bin/false", arguments: [],
+                                 environment: [:], timeout: 5, label: "fake prune")
+        let calls = CallCounter()
+        let c = CleanupController(
+            catalog: [Self.cleanable([cache.path])], allowedRoot: root.path,
+            nativeLookup: { id, _ in id == "test-cache" ? fake : nil },
+            nativeRunner: { _ in
+                await calls.bump()
+                return ProcessResult(stdout: Data(), stderr: Data("store is busy".utf8),
+                                     exitCode: 1, timedOut: false)
+            },
+            journal: { _ in })
+        c.load()
+        await Self.waitForReady(c)
+        #expect(c.rows.first?.nativeLabel == "fake prune")
+
+        c.toggle("test-cache")
+        await c.cleanSelected()
+
+        #expect(await calls.count == 1)
+        #expect(FileManager.default.fileExists(atPath: cache.appendingPathComponent("a.bin").path))
+        #expect(c.lastNativeIssues == ["Test cache — fake prune: store is busy"])
+        #expect(c.state == .ready)
+    }
+
+    /// The Trash is user data, not a cache: the select-all header ignores it in
+    /// both directions — it is only ever selected row by row.
+    @Test func selectAllNeverTouchesTheTrash() async throws {
+        let (root, cache) = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let trashDir = root.appendingPathComponent(".Trash")
+        try FileManager.default.createDirectory(at: trashDir, withIntermediateDirectories: true)
+        try Data(count: 4096).write(to: trashDir.appendingPathComponent("t.bin"))
+        let trash = Cleanable(id: "trash", name: "Trash", category: "System",
+                              icon: "trash.fill", note: "fixture", paths: [trashDir.path])
+        let c = CleanupController(catalog: [Self.cleanable([cache.path]), trash],
+                                  allowedRoot: root.path, journal: { _ in })
+        c.load()
+        await Self.waitForReady(c)
+
+        c.toggleAll()
+        #expect(c.selectAllState == .all) // all *cache* rows selected…
+        #expect(c.selectedRows.map(\.id) == ["test-cache"]) // …Trash left alone
+
+        c.toggle("trash") // explicit per-row opt-in still works
+        #expect(c.selectedRows.count == 2)
+        c.toggleAll() // all → none clears caches, not the hand-picked Trash
+        #expect(c.selectedRows.map(\.id) == ["trash"])
+    }
+
+    /// A blocked target (uv in link-mode=symlink) is shown but never sized,
+    /// never selectable — and a stale selection doesn't survive into it.
+    @Test func blockedRowIsVisibleButInert() async throws {
+        let (root, cache) = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let c = CleanupController(
+            catalog: [Self.cleanable([cache.path])], allowedRoot: root.path,
+            blockedReason: { id, _ in id == "test-cache" ? "would break venvs" : nil },
+            journal: { _ in })
+        c.load()
+        await Self.waitForReady(c)
+
+        #expect(c.rows.first?.size == .blocked("would break venvs"))
+        c.toggle("test-cache") // the model refuses, not just the disabled checkbox
+        c.toggleAll()
+        #expect(c.selectedRows.isEmpty)
+        #expect(c.state == .ready) // an all-blocked catalog still settles
+
+        await c.cleanSelected()
+        #expect(FileManager.default.fileExists(atPath: cache.appendingPathComponent("a.bin").path))
+    }
+
+    /// The uv guard reads the environment and uv's user-level config.
+    @Test func uvSymlinkModeDetection() throws {
+        #expect(CleanupEngine.uvSymlinkMode(home: "/nonexistent", environment: [:]) == false)
+        #expect(CleanupEngine.uvSymlinkMode(home: "/nonexistent",
+                                            environment: ["UV_LINK_MODE": "symlink"]))
+        #expect(CleanupEngine.uvSymlinkMode(home: "/nonexistent",
+                                            environment: ["UV_LINK_MODE": "hardlink"]) == false)
+
+        let fm = FileManager.default
+        let home = fm.temporaryDirectory.appendingPathComponent("sm-uv-\(UUID().uuidString)")
+        defer { try? fm.removeItem(at: home) }
+        let configDir = home.appendingPathComponent(".config/uv")
+        try fm.createDirectory(at: configDir, withIntermediateDirectories: true)
+        try #"link-mode = "symlink""#.write(
+            to: configDir.appendingPathComponent("uv.toml"), atomically: true, encoding: .utf8)
+        #expect(CleanupEngine.uvSymlinkMode(home: home.path, environment: [:]))
+
+        try #"# link-mode = "symlink""#.write(
+            to: configDir.appendingPathComponent("uv.toml"), atomically: true, encoding: .utf8)
+        #expect(CleanupEngine.uvSymlinkMode(home: home.path, environment: [:]) == false)
+    }
+
+    /// Every cleaned target leaves a journal entry: engine, sizes before and
+    /// after, and per-child outcome — the forensic trail for field reports.
+    @Test func cleanJournalsEachTarget() async throws {
+        let (root, cache) = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let box = JournalBox()
+        let c = CleanupController(catalog: [Self.cleanable([cache.path])],
+                                  allowedRoot: root.path,
+                                  journal: { box.entries.append($0) })
+        c.load()
+        await Self.waitForReady(c)
+        c.toggle("test-cache")
+        await c.cleanSelected()
+
+        #expect(box.entries.count == 1)
+        let entry = try #require(box.entries.first)
+        #expect(entry.targetID == "test-cache")
+        #expect(entry.engine == "file")
+        #expect(entry.paths == [cache.path])
+        #expect(entry.bytesBefore >= 150_000)
+        #expect(entry.bytesAfter == 0)
+        #expect(entry.removed == 2 && entry.failed == 0 && entry.refused == 0)
+    }
+
+    /// The journal file is append-only JSONL, one decodable entry per line.
+    @Test func journalAppendsDecodableLines() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("sm-journal-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let entry = CleanupJournal.Entry(targetID: "npm", engine: "file",
+                                         paths: ["/x"], bytesBefore: 42)
+        CleanupJournal.append(entry, directory: dir)
+        CleanupJournal.append(entry, directory: dir)
+
+        let text = try String(contentsOf: dir.appendingPathComponent("cleanup.jsonl"),
+                              encoding: .utf8)
+        let lines = text.split(separator: "\n")
+        #expect(lines.count == 2)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let decoded = try decoder.decode(CleanupJournal.Entry.self, from: Data(lines[0].utf8))
+        #expect(decoded.targetID == "npm")
+        #expect(decoded.bytesBefore == 42)
+    }
+
+    /// An empty cache on the initial sizing pass is dropped — nothing to
+    /// reclaim, the row is noise (the file engine keeps cache roots alive, so
+    /// empties are common after a past clean). A row cleaned to 0 B in-session
+    /// stays visible: that 0 is the result the user just paid for.
+    @Test func emptyRowsAreDroppedOnLoadButKeptAfterCleaning() async throws {
+        let (root, cache) = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let empty = root.appendingPathComponent("empty-cache")
+        try FileManager.default.createDirectory(at: empty, withIntermediateDirectories: true)
+        let emptyItem = Cleanable(id: "empty-cache", name: "Empty", category: "Test",
+                                  icon: "shippingbox", note: "fixture", paths: [empty.path])
+        let c = CleanupController(catalog: [Self.cleanable([cache.path]), emptyItem],
+                                  allowedRoot: root.path, journal: { _ in })
+        c.load()
+        await Self.waitForReady(c)
+        #expect(c.rows.map(\.id) == ["test-cache"]) // the empty row never appears
+
+        c.toggle("test-cache")
+        await c.cleanSelected()
+        #expect(c.rows.map(\.id) == ["test-cache"]) // still there, showing its result…
+        #expect(c.rows.first?.size == .sized(0))    // …which is 0 B
+
+        c.refresh() // next reload applies the fresh-load rule again
+        await Self.waitForReady(c)
+        #expect(c.rows.isEmpty)
+        #expect(c.state == .ready)
+    }
+
     /// Entries whose paths don't exist disappear; existing ones keep only their
     /// existing paths.
     @Test func detectFiltersMissingPaths() throws {
@@ -241,8 +476,109 @@ import Foundation
             Self.cleanable([cache.path, ghost]),
             Cleanable(id: "ghost", name: "Ghost", category: "Test",
                       icon: "shippingbox", note: "", paths: [ghost]),
-        ])
+        ], allowedRoot: root.path)
         #expect(detected.count == 1)
         #expect(detected[0].paths == [cache.path])
     }
+
+    /// A symlinked cache root is excluded at detection time — the row never
+    /// appears, instead of being sized through the link and refused at cleaning
+    /// time with gigabytes left on screen.
+    @Test func detectRefusesSymlinkedRoot() throws {
+        let (root, _) = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let outside = FileManager.default.temporaryDirectory
+            .appendingPathComponent("sm-detect-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: outside) }
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        let link = root.appendingPathComponent("linked-cache")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: outside)
+
+        let detected = CleanupEngine.detect([Self.cleanable([link.path])], allowedRoot: root.path)
+        #expect(detected.isEmpty)
+    }
+
+    /// detect applies the same resolved-fence rule as clean: a path that passes
+    /// the textual prefix but resolves outside the fence is never offered.
+    @Test func detectRefusesRelocatedIntermediateComponent() throws {
+        let fm = FileManager.default
+        let base = fm.temporaryDirectory.appendingPathComponent("sm-detect-fence-\(UUID().uuidString)")
+        let home = base.appendingPathComponent("home")
+        let external = base.appendingPathComponent("external/gradle")
+        try fm.createDirectory(at: home, withIntermediateDirectories: true)
+        try fm.createDirectory(at: external.appendingPathComponent("caches"), withIntermediateDirectories: true)
+        try fm.createSymbolicLink(at: home.appendingPathComponent(".gradle"), withDestinationURL: external)
+        defer { try? fm.removeItem(at: base) }
+
+        let target = home.appendingPathComponent(".gradle/caches").path
+        let detected = CleanupEngine.detect([Self.cleanable([target])], allowedRoot: home.path)
+        #expect(detected.isEmpty)
+    }
+
+    /// A cache root removed by its native cleaner (dotnet deletes its folders
+    /// outright) is *empty*, not "Needs access": ENOENT and EACCES are
+    /// different stories. First field catch of the operation journal.
+    @Test func vanishedRootSizesAsZeroNotDenied() throws {
+        let (root, cache) = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let gone = root.appendingPathComponent("vanished").path
+        #expect(CleanupEngine.size(of: Self.cleanable([gone])) == .sized(0))
+
+        // Mixed: the existing path still measures, the vanished one adds nothing.
+        guard case .sized(let bytes) = CleanupEngine.size(of: Self.cleanable([cache.path, gone])) else {
+            Issue.record("expected .sized for a mixed existing+vanished item")
+            return
+        }
+        #expect(bytes >= 150_000)
+    }
+
+    /// An unreadable root (permissions) still reads as denied — that is the
+    /// case the "Needs access" row is for.
+    @Test func unreadableRootStaysDenied() throws {
+        let (root, cache) = try Self.makeFixture()
+        defer {
+            chmod(cache.path, 0o755)
+            try? FileManager.default.removeItem(at: root)
+        }
+        chmod(cache.path, 0o000)
+        #expect(CleanupEngine.size(of: Self.cleanable([cache.path])) == .denied)
+    }
+
+    /// clean() on a vanished root reports nothing at all — neither a failure
+    /// nor a fence refusal; there is simply nothing to do.
+    @Test func cleanTreatsVanishedRootAsNoop() throws {
+        let (root, _) = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let gone = root.appendingPathComponent("vanished").path
+        let result = CleanupEngine.clean(Self.cleanable([gone]), allowedRoot: root.path)
+        #expect(result == CleanupEngine.CleanResult())
+    }
+
+    /// size never measures through a symlinked root (ELOOP under O_NOFOLLOW).
+    /// detect excludes it anyway; a direct call answers "nothing cleanable
+    /// here" (0 B) — not "needs access", which would send the user to grant
+    /// Full Disk Access for a relocated cache.
+    @Test func sizeNeverMeasuresThroughSymlinkedRoot() throws {
+        let (root, _) = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let victim = root.appendingPathComponent("victim")
+        try FileManager.default.createDirectory(at: victim, withIntermediateDirectories: true)
+        try Data(count: 4096).write(to: victim.appendingPathComponent("keep.bin"))
+        let link = root.appendingPathComponent("linked-cache")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: victim)
+
+        #expect(CleanupEngine.size(of: Self.cleanable([link.path])) == .sized(0))
+    }
+}
+
+/// Serialized call counter usable from `@Sendable` closures in tests.
+private actor CallCounter {
+    private(set) var count = 0
+    func bump() { count += 1 }
+}
+
+/// Journal collector — the controller calls it on the main actor.
+@MainActor
+private final class JournalBox {
+    var entries: [CleanupJournal.Entry] = []
 }
