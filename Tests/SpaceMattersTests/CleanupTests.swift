@@ -286,8 +286,10 @@ import Foundation
 
         await batch.value
         await Self.waitForReady(c)
-        #expect(c.rows.count == 1) // deferred reload ran: fresh detection…
-        #expect(c.totalFound == 0) // …and the emptied cache re-measured at zero
+        // The deferred reload ran as a *fresh* load: the cache the batch just
+        // emptied re-measures at 0 B and is dropped by the empty-row rule.
+        #expect(c.rows.isEmpty)
+        #expect(c.totalFound == 0)
     }
 
     /// When a native cleaner is available the vendor's tool runs and the file
@@ -434,6 +436,34 @@ import Foundation
         let decoded = try decoder.decode(CleanupJournal.Entry.self, from: Data(lines[0].utf8))
         #expect(decoded.targetID == "npm")
         #expect(decoded.bytesBefore == 42)
+    }
+
+    /// An empty cache on the initial sizing pass is dropped — nothing to
+    /// reclaim, the row is noise (the file engine keeps cache roots alive, so
+    /// empties are common after a past clean). A row cleaned to 0 B in-session
+    /// stays visible: that 0 is the result the user just paid for.
+    @Test func emptyRowsAreDroppedOnLoadButKeptAfterCleaning() async throws {
+        let (root, cache) = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let empty = root.appendingPathComponent("empty-cache")
+        try FileManager.default.createDirectory(at: empty, withIntermediateDirectories: true)
+        let emptyItem = Cleanable(id: "empty-cache", name: "Empty", category: "Test",
+                                  icon: "shippingbox", note: "fixture", paths: [empty.path])
+        let c = CleanupController(catalog: [Self.cleanable([cache.path]), emptyItem],
+                                  allowedRoot: root.path, journal: { _ in })
+        c.load()
+        await Self.waitForReady(c)
+        #expect(c.rows.map(\.id) == ["test-cache"]) // the empty row never appears
+
+        c.toggle("test-cache")
+        await c.cleanSelected()
+        #expect(c.rows.map(\.id) == ["test-cache"]) // still there, showing its result…
+        #expect(c.rows.first?.size == .sized(0))    // …which is 0 B
+
+        c.refresh() // next reload applies the fresh-load rule again
+        await Self.waitForReady(c)
+        #expect(c.rows.isEmpty)
+        #expect(c.state == .ready)
     }
 
     /// Entries whose paths don't exist disappear; existing ones keep only their

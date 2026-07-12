@@ -259,7 +259,17 @@ final class CleanupController {
     private func apply(_ measure: CleanupEngine.Measure, to id: String) {
         guard let idx = rows.firstIndex(where: { $0.id == id }) else { return }
         switch measure {
-        case .sized(let bytes): rows[idx].size = .sized(bytes)
+        case .sized(let bytes):
+            // An empty target on the initial sizing pass is noise — nothing to
+            // reclaim, the row doesn't earn its place (the file engine keeps
+            // cache roots alive by design, so empties are common after a past
+            // clean). The same 0 B arriving during `.cleaning` is the *result*
+            // of this clean: the row stays as feedback until the next reload.
+            if bytes == 0, state == .sizing {
+                rows.remove(at: idx)
+            } else {
+                rows[idx].size = .sized(bytes)
+            }
         case .denied: rows[idx].size = .denied
         }
         if state == .sizing, !rows.contains(where: { $0.size == .pending }) {
