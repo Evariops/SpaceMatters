@@ -1,19 +1,34 @@
 import Foundation
 import CoreServices
 
+/// One coalesced FSEvents change: the directory whose *direct* contents changed,
+/// plus the event flags. At directory granularity the per-item flags
+/// (`ItemRenamed`, `ItemCreated`…) are never delivered — the ones that carry
+/// signal are `MustScanSubDirs` (the kernel coalesced events away: the whole
+/// subtree must be re-scanned) and `RootChanged` (the watched root itself moved
+/// or disappeared).
+struct FSChange {
+    let path: String
+    let flags: FSEventStreamEventFlags
+
+    var mustScanSubDirs: Bool { flags & FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs) != 0 }
+    var rootChanged: Bool { flags & FSEventStreamEventFlags(kFSEventStreamEventFlagRootChanged) != 0 }
+}
+
 /// Watches a set of directory trees with FSEvents and reports coalesced changed
 /// paths. Directory-level granularity (no `FileEvents` flag) with a debounce
-/// latency, so a busy tree can't flood us — enough to mark a subtree dirty and
-/// offer a targeted re-scan (SPEC-04). Delivered on a private dispatch queue.
+/// latency, so a busy tree can't flood us — an event means "this directory's
+/// direct contents changed", precise enough to re-stat just that directory
+/// (SPEC-11). Delivered on a private dispatch queue.
 final class FSWatcher {
     private var stream: FSEventStreamRef?
     private let queue = DispatchQueue(label: "com.spacematters.fswatcher", qos: .utility)
     private let paths: [String]
     private let latency: CFTimeInterval
-    private let handler: ([String]) -> Void
+    private let handler: ([FSChange]) -> Void
 
-    /// `handler` is invoked on the private queue with the batch of changed paths.
-    init(paths: [String], latency: CFTimeInterval = 1.0, handler: @escaping ([String]) -> Void) {
+    /// `handler` is invoked on the private queue with the batch of changes.
+    init(paths: [String], latency: CFTimeInterval = 1.0, handler: @escaping ([FSChange]) -> Void) {
         self.paths = paths
         self.latency = latency
         self.handler = handler
@@ -40,7 +55,10 @@ final class FSWatcher {
             },
             copyDescription: nil
         )
-        let flags = UInt32(kFSEventStreamCreateFlagUseCFTypes | kFSEventStreamCreateFlagNoDefer)
+        // WatchRoot: get told when the watched root itself is renamed/deleted
+        // (`RootChanged`) — deltas can't reconcile that; the UI offers a Rescan.
+        let flags = UInt32(kFSEventStreamCreateFlagUseCFTypes | kFSEventStreamCreateFlagNoDefer
+            | kFSEventStreamCreateFlagWatchRoot)
         guard let stream = FSEventStreamCreate(
             kCFAllocatorDefault,
             fsWatcherCallback,
@@ -65,21 +83,23 @@ final class FSWatcher {
 
     deinit { stop() }
 
-    fileprivate func deliver(_ paths: [String]) { handler(paths) }
+    fileprivate func deliver(_ changes: [FSChange]) { handler(changes) }
 }
 
 /// C callback trampoline: recover the `FSWatcher` from `info` and forward the
-/// changed paths (delivered as a `CFArray` of `CFString` thanks to `UseCFTypes`).
-private let fsWatcherCallback: FSEventStreamCallback = { _, info, count, eventPaths, _, _ in
+/// changed paths (delivered as a `CFArray` of `CFString` thanks to `UseCFTypes`)
+/// paired with their event flags.
+private let fsWatcherCallback: FSEventStreamCallback = { _, info, count, eventPaths, eventFlags, _ in
     guard let info else { return }
     let watcher = Unmanaged<FSWatcher>.fromOpaque(info).takeUnretainedValue()
     let cfArray = unsafeBitCast(eventPaths, to: CFArray.self)
-    var paths: [String] = []
-    paths.reserveCapacity(count)
+    var changes: [FSChange] = []
+    changes.reserveCapacity(count)
     for i in 0..<count {
         if let raw = CFArrayGetValueAtIndex(cfArray, i) {
-            paths.append(unsafeBitCast(raw, to: CFString.self) as String)
+            let path = unsafeBitCast(raw, to: CFString.self) as String
+            changes.append(FSChange(path: path, flags: eventFlags[i]))
         }
     }
-    watcher.deliver(paths)
+    watcher.deliver(changes)
 }
