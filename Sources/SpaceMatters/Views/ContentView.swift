@@ -114,8 +114,10 @@ private struct ErrorBanner: View {
     }
 }
 
-/// Live-dashboard banner (SPEC-04): FSEvents saw the disk change under the
-/// current result. Refresh re-scans only the touched subtrees (`invalidate`).
+/// Last-resort banner (SPEC-11): ordinary disk changes reconcile silently — the
+/// map just updates. This appears only when something needs the user: a catch-up
+/// too big to run without consent, the watched root gone, or an unexplained
+/// used-space drift (no matching events — something escaped the watcher).
 private struct DiskChangedBanner: View {
     let controller: ScanController
     @Environment(\.theme) private var theme
@@ -125,8 +127,21 @@ private struct DiskChangedBanner: View {
     private static func message(for delta: Int64) -> String {
         let amount = Format.bytes(abs(delta))
         return delta >= 0
-            ? "The disk grew by ~\(amount) since this scan."
-            : "The disk freed ~\(amount) since this scan."
+            ? "The disk grew by ~\(amount) outside the mapped folders."
+            : "The disk freed ~\(amount) outside the mapped folders."
+    }
+
+    private var message: String {
+        if controller.isRefreshing { return "Refreshing the changed folders…" }
+        if controller.watchRootChanged { return "The scanned folder was moved or deleted." }
+        let consent = controller.pendingConsentPaths.count
+        if consent > 0 {
+            let files = Format.count(controller.pendingConsentFiles)
+            return consent == 1
+                ? "A big change needs a re-scan of ~\(files) files."
+                : "Big changes in \(consent) folders need a re-scan of ~\(files) files."
+        }
+        return Self.message(for: controller.driftBytes)
     }
 
     var body: some View {
@@ -134,21 +149,22 @@ private struct DiskChangedBanner: View {
         // `diskChanged` flips (a local @State would reset mid-refresh), and the
         // refresh itself can take a while on a big dirty subtree.
         let refreshing = controller.isRefreshing
+        let rootGone = controller.watchRootChanged
         HStack(spacing: 10) {
-            Image(systemName: "arrow.triangle.2.circlepath")
+            Image(systemName: rootGone ? "exclamationmark.triangle" : "arrow.triangle.2.circlepath")
                 .font(.system(size: 13))
                 .foregroundStyle(theme.accent)
-            Text(refreshing ? "Refreshing the changed folders…"
-                            : Self.message(for: controller.changedBytes))
+            Text(message)
                 .font(.system(size: 11))
                 .foregroundStyle(theme.textPrimary)
             Spacer(minLength: 8)
             Button {
-                Task { await controller.refreshDirty() }
+                if rootGone { controller.rescan() }
+                else { Task { await controller.refreshDirty() } }
             } label: {
                 HStack(spacing: 5) {
                     if refreshing { ProgressView().controlSize(.mini) }
-                    Text(refreshing ? "Refreshing…" : "Refresh")
+                    Text(refreshing ? "Refreshing…" : (rootGone ? "Rescan" : "Refresh"))
                 }
             }
             .buttonStyle(PrimaryButtonStyle())
@@ -449,6 +465,19 @@ private struct StatsStrip: View {
                     TimelineView(.periodic(from: .now, by: 30)) { _ in
                         Stat(value: Self.ago(date), label: "scanned", theme: theme)
                     }
+                }
+                // SPEC-11: the map is live — this is the exact sum of the deltas
+                // it absorbed since the scan, not a statfs guess.
+                if controller.changedBytes != 0 {
+                    Stat(value: (controller.changedBytes > 0 ? "+" : "−")
+                            + Format.bytes(abs(controller.changedBytes)),
+                         label: "live", theme: theme, accent: true)
+                }
+                if controller.typesDrifted || controller.exactDrifted {
+                    Stat(value: "≈", label: "types", theme: theme)
+                        .help(controller.exactDrifted
+                            ? "Hardlinked files changed — exact dedup can't be re-verified incrementally. File types and counts may drift until the next Rescan."
+                            : "Some changes were applied without their old per-type breakdown. File types may drift until the next Rescan.")
                 }
             }
             if controller.errorCount > 0 {

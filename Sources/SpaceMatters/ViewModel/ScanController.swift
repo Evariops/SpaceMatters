@@ -183,24 +183,102 @@ final class ScanController {
     /// now — the banner shows progress instead of vanishing, and incoming
     /// FSEvents keep marking paths without touching the (stale) banner state.
     private(set) var isRefreshing = false
-    /// Signed net change in the scanned volume's used space since the current
-    /// result finished — positive means it grew, negative means space was freed.
-    /// Shown in the banner and compared against `diskChangeBudget` to gate it.
+    /// Signed sum of the physical deltas the tree actually absorbed since the
+    /// scan (or the last consented refresh) — **exact**, not a statfs guess:
+    /// positive means the mapped folders grew. Shown live in the stats strip.
     private(set) var changedBytes: Int64 = 0
     /// Free bytes on the scanned volume when the result was captured — the
-    /// baseline `changedBytes` is measured against.
+    /// baseline the drift guard measures statfs movement against.
     @ObservationIgnored private var baselineFreeBytes: Int64?
-    /// Last `changedBytes` we repainted for, to avoid needless bumps each batch.
-    @ObservationIgnored private var shownBytes: Int64 = 0
-    /// Minimum absolute net swing before the "disk changed" banner appears.
+    /// Minimum unexplained used-space swing before the drift banner appears.
     private let diskChangeBudget: Int64 = 128 * 1024 * 1024 // 128 MB
     /// When the current result finished scanning (for "scanned N ago", J5.2).
     private(set) var scanDate: Date?
     /// Paths of the nearest existing nodes touched since the scan — tracked by
     /// path (not identity), because `invalidate` rebuilds nodes as fresh objects.
     @ObservationIgnored private(set) var dirtyPaths: Set<String> = []
+    /// What reconciliation each dirty path needs (SPEC-11). `.restat` — the
+    /// event was precise: one non-recursive pass of that directory rebuilds its
+    /// truth. `.subtree` — FSEvents admitted losing detail (`MustScanSubDirs`):
+    /// only a re-scan of the whole subtree can. `.subtree` wins on merge.
+    enum DirtyNeed { case restat, subtree }
+    @ObservationIgnored private(set) var dirtyNeeds: [String: DirtyNeed] = [:]
+    /// The watched root itself was renamed or deleted (`RootChanged`) — deltas
+    /// can't reconcile that; the banner offers a full Rescan.
+    private(set) var watchRootChanged = false
     @ObservationIgnored private var watcher: FSWatcher?
     @ObservationIgnored private var watchPaths: [String] = []
+
+    // SPEC-11 §3.3 knobs — instance-level so tests can tighten them.
+    /// A run of at least this many dirty directories under one ancestor is
+    /// cheaper to re-scan as one parallel subtree pass than one by one.
+    @ObservationIgnored var clusterMinRun = 16
+    /// Ceiling for a *silent* auto subtree re-scan (~1 s of parallel I/O).
+    @ObservationIgnored var subtreeAutoMaxFiles: Int64 = 100_000
+    /// Above this, a catch-up costs several seconds of full-tilt CPU — ask
+    /// first (the banner's one remaining job).
+    @ObservationIgnored var consentMaxFiles: Int64 = 500_000
+    /// Precise re-stats per reconcile cycle; the excess stays dirty for the next.
+    @ObservationIgnored var restatCapPerCycle = 256
+    /// Minimum spacing between two auto re-scans of the same subtree — sustained
+    /// churn (a build loop) marks dirty and waits instead of burning CPU.
+    @ObservationIgnored var autoSubtreeCooldown: TimeInterval = 10
+
+    /// Auto catch-ups too big to run without asking (SPEC-11 §3.4) — they stay
+    /// dirty and light the banner; the Refresh button is the consent.
+    private(set) var pendingConsentPaths: Set<String> = []
+    /// Total files under the pending catch-ups, for the banner text.
+    private(set) var pendingConsentFiles: Int64 = 0
+
+    // Reconciler instrumentation (tests assert on these; cheap to keep).
+    @ObservationIgnored private(set) var autoRestatCount = 0
+    @ObservationIgnored private(set) var autoSubtreeScanCount = 0
+
+    // SPEC-11 M4 — exact File-types diffs and the honest drift guard.
+
+    /// Per-directory extension tables from past re-stats: the "old" side of an
+    /// exact File-types diff. Keyed by path (survives node rebuilds), bounded
+    /// FIFO. A directory is exact from its second delta on; the first one (no
+    /// stored table, no complete `fileCache` listing) marks `typesDrifted`.
+    @ObservationIgnored private var extSnapshots: [String: [ExtKey: ExtStat]] = [:]
+    @ObservationIgnored private var extSnapshotOrder: [String] = []
+    private static let extSnapshotCap = 4096
+
+    /// The File-types panel absorbed a delta without its old per-extension
+    /// table — it drifts by that delta until the next full Rescan.
+    private(set) var typesDrifted = false
+    /// Exact counting mode: a reconciled directory contained hardlinked files.
+    /// Their dedup can't be re-verified incrementally (the scan's inode set is
+    /// gone) — sizes were attributed locally; Rescan re-syncs.
+    private(set) var exactDrifted = false
+
+    /// Physical bytes the tree has absorbed since the statfs baseline — the
+    /// *explained* side of the drift guard, and the exact `changedBytes`.
+    @ObservationIgnored private var appliedPhysicalDelta: Int64 = 0
+    /// Used-space movement statfs reports that no applied delta explains —
+    /// something changed that the watcher didn't see (another user, an
+    /// unscannable area…). Above the budget, the banner proposes a Refresh.
+    private(set) var driftBytes: Int64 = 0
+
+    /// Record a physical-bytes change the tree now reflects (either sign).
+    private func noteAppliedPhysical(_ delta: Int64) {
+        appliedPhysicalDelta += delta
+        changedBytes = appliedPhysicalDelta
+    }
+
+    /// Restart the drift accounting from the disk's current state (scan end,
+    /// consented refresh) — everything before it is considered reconciled.
+    private func rebaselineDrift() {
+        baselineFreeBytes = volumeFreeBytes()
+        appliedPhysicalDelta = 0
+        changedBytes = 0
+        driftBytes = 0
+    }
+
+    @ObservationIgnored private var reconcileRunning = false
+    @ObservationIgnored private var reconcileAgain = false
+    @ObservationIgnored private var reconcileRetryScheduled = false
+    @ObservationIgnored private var lastAutoSubtreeScan: [String: Date] = [:]
 
     /// Whether a node sits on a changed path (drives the per-row "dirty" dot).
     func isDirty(_ node: FSNode) -> Bool {
@@ -869,6 +947,7 @@ final class ScanController {
             a.fileCount.wrappingAdd(-count, ordering: .relaxed)
             p = a.parent
         }
+        noteAppliedPhysical(-physical)
 
         // Lift any navigation state that points into the subtree we're about to
         // free onto the surviving parent, and drop expanded/reveal references to
@@ -935,6 +1014,7 @@ final class ScanController {
             a.fileCount.wrappingAdd(-1, ordering: .relaxed)
             p = a.parent
         }
+        noteAppliedPhysical(-file.physical)
         // A6 (single file): drop this file's bytes from the File-types table too.
         var d = ExtStat()
         d.add(logical: file.logical, physical: file.physical)
@@ -1049,7 +1129,14 @@ final class ScanController {
         if reconcileExt, let ds = scanner as? DirectoryScanner {
             ds.subtractExtensions(oldExt)
             ds.mergeExtensions(sub.snapshotRawExtensions())
+        } else if !reconcileExt {
+            typesDrifted = true // the accepted PR #26 bound, now surfaced
         }
+        // The subtree's booking was re-derived: per-directory snapshots under
+        // it no longer describe the table's "old" — drop them. And the tree now
+        // reflects this subtree's new physical total (drift guard honesty).
+        pruneExtSnapshots(under: path)
+        noteAppliedPhysical(node.aggPhysical.load(ordering: .relaxed) - oldP)
 
         // Folder count delta (A7 stays honest across the swap).
         dirCount += (Self.subtreeDirCount(node) - oldDirs)
@@ -1076,8 +1163,8 @@ final class ScanController {
     private func startWatching() {
         stopWatching()
         guard isHostScan, !watchPaths.isEmpty else { return }
-        let w = FSWatcher(paths: watchPaths) { [weak self] changed in
-            Task { @MainActor in self?.handleDiskChanges(changed) }
+        let w = FSWatcher(paths: watchPaths) { [weak self] changes in
+            Task { @MainActor in self?.handleDiskChanges(changes) }
         }
         w.start()
         watcher = w
@@ -1087,9 +1174,19 @@ final class ScanController {
         watcher?.stop()
         watcher = nil
         dirtyPaths.removeAll()
+        dirtyNeeds.removeAll()
+        watchRootChanged = false
+        pendingConsentPaths.removeAll()
+        pendingConsentFiles = 0
+        lastAutoSubtreeScan.removeAll()
+        extSnapshots.removeAll()
+        extSnapshotOrder.removeAll()
+        typesDrifted = false
+        exactDrifted = false
         diskChanged = false
         changedBytes = 0
-        shownBytes = 0
+        driftBytes = 0
+        appliedPhysicalDelta = 0
         baselineFreeBytes = nil
     }
 
@@ -1104,72 +1201,541 @@ final class ScanController {
         return Int64(s.f_bavail) * Int64(s.f_bsize)
     }
 
-    /// FSEvents batch → mark the nearest existing node on each changed path dirty,
-    /// then decide whether the change is big enough to raise the banner.
-    private func handleDiskChanges(_ paths: [String]) {
+    /// FSEvents batch → mark the nearest existing node on each changed path dirty
+    /// (remembering how precise the event was — SPEC-11), then decide whether the
+    /// change is big enough to raise the banner. Internal so tests can forge
+    /// events (flags included) without waiting on real FSEvents latency.
+    func handleDiskChanges(_ changes: [FSChange]) {
         guard isHostScan, phase == .finished else { return }
         var touched = false
-        for p in paths {
-            guard let node = nearestNode(toPath: p), let np = path(for: node) else { continue }
+        for c in changes {
+            if c.rootChanged { watchRootChanged = true; touched = true; continue }
+            guard let node = nearestNode(toPath: c.path), let np = path(for: node) else { continue }
             if dirtyPaths.insert(np).inserted { touched = true }
+            // `.subtree` is sticky: a later precise event must not downgrade it.
+            if c.mustScanSubDirs { dirtyNeeds[np] = .subtree }
+            else if dirtyNeeds[np] == nil { dirtyNeeds[np] = .restat }
         }
-        // Mid-refresh: keep collecting dirty paths, but leave the banner alone —
+        // Mid-refresh: keep collecting dirty paths, but reconcile only after —
         // the free-space baseline is stale until the refresh re-bases it, and a
         // bump here would repaint the treemap over half-reconciled aggregates
         // (the transient wrong totals seen while a big subtree re-scans).
         guard !isRefreshing else { return }
-        // Gate the banner on net used-space movement so ordinary per-second churn
-        // (logs, caches ticking over) doesn't keep it lit (issue #14). The dirty
-        // dots still track every touched subtree for the targeted Refresh.
-        if let base = baselineFreeBytes, let free = volumeFreeBytes() {
-            changedBytes = base - free
-        }
-        let show = !dirtyPaths.isEmpty && abs(changedBytes) >= diskChangeBudget
-        let repaint = touched || show != diskChanged || (show && changedBytes != shownBytes)
-        diskChanged = show
-        if repaint {
-            shownBytes = changedBytes
-            bump() // repaint the dirty dots + banner
+        refreshDriftBytes()
+        if touched { bump() } // repaint the dirty dots
+        updateBannerState()
+        // Live by default (SPEC-11): apply what just changed, silently.
+        scheduleReconcile()
+    }
+
+    /// Coherence guard: used-space movement statfs reports minus what the tree
+    /// already absorbed. What's left is change the watcher didn't see.
+    private func refreshDriftBytes() {
+        guard let base = baselineFreeBytes, let free = volumeFreeBytes() else { return }
+        driftBytes = (base - free) - appliedPhysicalDelta
+    }
+
+    /// Post-M3 the banner is a *last resort*: it appears only when the watched
+    /// root is gone, an auto catch-up is big enough to need consent, or the
+    /// drift guard trips (used space moved beyond the budget with nothing
+    /// pending to explain it). Ordinary changes reconcile silently — the map
+    /// just breathes.
+    private func updateBannerState() {
+        let unexplained = dirtyNeeds.isEmpty && abs(driftBytes) >= diskChangeBudget
+        let show = watchRootChanged || !pendingConsentPaths.isEmpty || unexplained
+        if show != diskChanged {
+            diskChanged = show
+            bump()
         }
     }
 
-    /// Re-scan the dirty subtrees (SPEC-02 `invalidate`) and clear the badge.
-    /// Ancestors subsume descendants, so a change deep in an already-dirty parent
-    /// is covered by a single re-scan.
+    // MARK: Live reconciliation (SPEC-11 M3 — the default)
+
+    /// What one reconcile cycle decided to do with the dirty set. Pure output of
+    /// `planReconciliation` so the clustering/consent/cooldown policy is testable
+    /// without a filesystem.
+    struct ReconcilePlan: Equatable {
+        /// Precise single-directory re-stats (milliseconds each).
+        var restats: [String] = []
+        /// Auto subtree re-scans: `MustScanSubDirs` targets and dense clusters.
+        var subtrees: [String] = []
+        /// Too big to run silently — stay dirty, light the banner, wait for the
+        /// user's Refresh (SPEC-11 §3.4).
+        var consent: [String] = []
+        /// Cooldown or cap spill — stay dirty, retried on a later cycle.
+        var deferred: [String] = []
+    }
+
+    /// Decide how to reconcile the dirty set. Bursts coalesce by *common-prefix
+    /// clustering*, never to the global common ancestor: a run of ≥
+    /// `clusterMinRun` dirty directories under one ancestor becomes a single
+    /// parallel subtree pass **iff** that ancestor is small enough to re-scan
+    /// silently (`subtreeAutoMaxFiles`); scattered paths stay individual
+    /// re-stats, capped per cycle. `fileCount` resolves a path to its subtree
+    /// file count (`nil` = not in the tree, e.g. above the seed).
+    static func planReconciliation(
+        needs: [String: DirtyNeed],
+        fileCount: (String) -> Int64?,
+        underCooldown: (String) -> Bool,
+        clusterMinRun: Int,
+        subtreeAutoMaxFiles: Int64,
+        consentMaxFiles: Int64,
+        restatCap: Int
+    ) -> ReconcilePlan {
+        func isUnder(_ p: String, _ ancestor: String) -> Bool {
+            p == ancestor || p.hasPrefix(ancestor == "/" ? "/" : ancestor + "/")
+        }
+
+        // Subsumption: a `.subtree` ancestor covers everything below it.
+        var subtreeTargets: [String] = []
+        var precise: [String] = []
+        for p in needs.keys.sorted(by: { $0.count < $1.count }) {
+            guard !subtreeTargets.contains(where: { isUnder(p, $0) }) else { continue }
+            if needs[p] == .subtree { subtreeTargets.append(p) } else { precise.append(p) }
+        }
+
+        // Cluster dense runs of precise paths. Every proper ancestor prefix of a
+        // dirty path is an existing node's path (dirty paths are node paths), so
+        // counting per-prefix is exact. Deepest qualifying ancestors win —
+        // tight clusters (node_modules) beat broad ones (the repo).
+        if precise.count >= clusterMinRun {
+            var counts: [String: Int] = [:]
+            for p in precise {
+                var prefix = Substring(p)
+                while let cut = prefix.lastIndex(of: "/"), cut != prefix.startIndex {
+                    prefix = prefix[..<cut]
+                    counts[String(prefix), default: 0] += 1
+                }
+            }
+            let candidates = counts.filter { $0.value >= clusterMinRun }.keys
+                .sorted { a, b in a.count != b.count ? a.count > b.count : a < b }
+            var chosen: [String] = []
+            for cand in candidates {
+                guard !chosen.contains(where: { isUnder(cand, $0) || isUnder($0, cand) }),
+                      !subtreeTargets.contains(where: { isUnder(cand, $0) }),
+                      let fc = fileCount(cand), fc <= subtreeAutoMaxFiles
+                else { continue }
+                chosen.append(cand)
+            }
+            if !chosen.isEmpty {
+                precise.removeAll { p in chosen.contains { isUnder(p, $0) } }
+                subtreeTargets += chosen
+            }
+        }
+
+        var plan = ReconcilePlan()
+        for t in subtreeTargets {
+            let fc = fileCount(t)
+            if let fc, fc > consentMaxFiles { plan.consent.append(t) }
+            else if underCooldown(t) { plan.deferred.append(t) }
+            else { plan.subtrees.append(t) }
+        }
+        plan.restats = Array(precise.prefix(restatCap))
+        plan.deferred += precise.dropFirst(restatCap)
+        return plan
+    }
+
+    /// Kick (or re-kick) the reconciler. Coalesces re-entrant pokes: one runner
+    /// at a time; a poke while running queues exactly one follow-up cycle.
+    private func scheduleReconcile() {
+        guard !dirtyNeeds.isEmpty else { return }
+        guard !reconcileRunning else { reconcileAgain = true; return }
+        reconcileRunning = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.reconcileRunning = false }
+            repeat {
+                self.reconcileAgain = false
+                await self.reconcileNow()
+            } while self.reconcileAgain
+            self.scheduleDeferredRetry()
+        }
+    }
+
+    /// Deferred paths (cooldown, cap spill, a refused op) stay dirty with no
+    /// event to re-poke us — retry on a one-shot timer instead of spinning.
+    private func scheduleDeferredRetry() {
+        guard !dirtyNeeds.isEmpty, !reconcileRetryScheduled else { return }
+        reconcileRetryScheduled = true
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(2))
+            guard let self else { return }
+            self.reconcileRetryScheduled = false
+            self.scheduleReconcile()
+        }
+    }
+
+    /// One reconcile cycle: plan against the current dirty set, execute, keep
+    /// the leftovers dirty. Runs silently — no banner, no spinner; the treemap
+    /// morphs on each applied delta (SPEC-10 absorbs the bumps).
+    private func reconcileNow() async {
+        guard isHostScan, phase == .finished, !isRefreshing, !dirtyNeeds.isEmpty else { return }
+        let now = Date()
+        let plan = Self.planReconciliation(
+            needs: dirtyNeeds,
+            fileCount: { [weak self] p in
+                guard let self, let n = self.node(at: p) else { return nil }
+                return n.fileCount.load(ordering: .relaxed)
+            },
+            underCooldown: { [weak self] p in
+                guard let self, let last = self.lastAutoSubtreeScan[p] else { return false }
+                return now.timeIntervalSince(last) < self.autoSubtreeCooldown
+            },
+            clusterMinRun: clusterMinRun,
+            subtreeAutoMaxFiles: subtreeAutoMaxFiles,
+            consentMaxFiles: consentMaxFiles,
+            restatCap: restatCapPerCycle
+        )
+
+        // Everything this cycle executes leaves the dirty set now; failures
+        // re-enter it. Consent + deferred paths stay dirty (and keep their dot).
+        func consume(_ target: String) {
+            dirtyNeeds = dirtyNeeds.filter { p, _ in
+                !(p == target || p.hasPrefix(target == "/" ? "/" : target + "/"))
+            }
+            dirtyPaths = dirtyPaths.filter { p in
+                !(p == target || p.hasPrefix(target == "/" ? "/" : target + "/"))
+            }
+        }
+
+        let epoch = treeEpoch
+        for p in plan.restats {
+            guard epoch == treeEpoch, !isRefreshing else { return }
+            consume(p)
+            guard let node = nearestNode(toPath: p) else { continue }
+            autoRestatCount += 1
+            if !(await restatDirectory(node)) {
+                dirtyPaths.insert(p); dirtyNeeds[p] = .restat
+            }
+        }
+        for p in plan.subtrees {
+            guard epoch == treeEpoch, !isRefreshing else { return }
+            consume(p)
+            guard let node = nearestNode(toPath: p) else { continue }
+            lastAutoSubtreeScan[p] = Date()
+            autoSubtreeScanCount += 1
+            if !(await invalidate(subtree: node)) {
+                dirtyPaths.insert(p); dirtyNeeds[p] = .subtree
+            }
+        }
+
+        // Re-measure the drift with everything just applied accounted for.
+        if !plan.restats.isEmpty || !plan.subtrees.isEmpty {
+            refreshDriftBytes()
+        }
+
+        pendingConsentPaths = Set(plan.consent)
+        pendingConsentFiles = plan.consent.reduce(0) { total, p in
+            guard let n = node(at: p) else { return total }
+            return total + n.fileCount.load(ordering: .relaxed)
+        }
+        updateBannerState()
+    }
+
+    /// Reconcile the dirty directories and clear the badge. Precise events get a
+    /// per-directory re-stat (`restatDirectory`, SPEC-11 — milliseconds); paths
+    /// where FSEvents lost detail get the subtree re-scan (SPEC-02 `invalidate`).
+    /// A `.subtree` ancestor subsumes everything below it; `.restat` subsumes
+    /// nothing (it's non-recursive), so precise descendants keep their own pass.
+    /// Post-M3 this is the *consent* path: the silent reconciler parks anything
+    /// above `consentMaxFiles` and lights the banner; pressing Refresh runs it.
     func refreshDirty() async {
+        pendingConsentPaths.removeAll()
+        pendingConsentFiles = 0
         guard !dirtyPaths.isEmpty else {
-            diskChanged = false; changedBytes = 0; shownBytes = 0
-            baselineFreeBytes = volumeFreeBytes()
+            diskChanged = false
+            rebaselineDrift()
             return
         }
-        // Keep only the topmost dirty paths (drop any that sit under another).
+        // Shortest-first so subsuming subtree ancestors are seen before children.
         let sorted = dirtyPaths.sorted { $0.count < $1.count }
-        var roots: [String] = []
-        for p in sorted where !roots.contains(where: { p == $0 || p.hasPrefix($0 == "/" ? "/" : $0 + "/") }) {
-            roots.append(p)
+        var subtreeRoots: [String] = []
+        var work: [(path: String, need: DirtyNeed)] = []
+        for p in sorted {
+            guard !subtreeRoots.contains(where: { p == $0 || p.hasPrefix($0 == "/" ? "/" : $0 + "/") })
+            else { continue }
+            let need = dirtyNeeds[p] ?? .restat
+            if need == .subtree { subtreeRoots.append(p) }
+            work.append((p, need))
         }
         dirtyPaths.removeAll()
+        dirtyNeeds.removeAll()
         diskChanged = false
         isRefreshing = true
         defer { isRefreshing = false }
         let epoch = treeEpoch
-        for p in roots {
+        for (p, need) in work {
             guard epoch == treeEpoch else { return } // Rescan/Home mid-refresh
-            if let node = nearestNode(toPath: p), !(await invalidate(subtree: node)) {
+            // Re-resolve at execution time: an earlier op in this loop may have
+            // rebuilt the node (fresh identity, same path).
+            guard let node = nearestNode(toPath: p) else { continue }
+            let ok = switch need {
+            case .restat: await restatDirectory(node)
+            case .subtree: await invalidate(subtree: node)
+            }
+            if !ok {
                 // Refused (e.g. a delete is in flight) — keep the path dirty so
                 // the next Refresh retries instead of silently forgetting it.
                 dirtyPaths.insert(p)
+                dirtyNeeds[p] = need
             }
         }
         scanDate = Date()
         // Re-baseline the budget so the banner measures drift from *this*
         // refresh; events collected mid-refresh re-evaluate from here (dirty
         // dots stay, banner off until real drift crosses the budget again).
-        baselineFreeBytes = volumeFreeBytes()
-        changedBytes = 0
-        shownBytes = 0
+        rebaselineDrift()
         diskChanged = false
         bump()   // repaint the dots for any trailing dirty paths
+        // Trailing events collected mid-refresh: hand them to the reconciler
+        // (it runs after `isRefreshing` drops on return).
+        scheduleReconcile()
+    }
+
+    // MARK: Per-directory re-stat (SPEC-11)
+
+    /// Absolute truth of one directory's direct contents, read in a single
+    /// non-recursive `getattrlistbulk` pass. Absolute — never a delta: the delta
+    /// is computed against the node *at apply time* on the main actor, so two
+    /// re-stats in flight on the same directory converge last-writer-wins
+    /// instead of applying a stale difference.
+    private struct DirSnapshot {
+        var filesLogical: Int64 = 0
+        var filesPhysical: Int64 = 0
+        var fileCount: Int64 = 0
+        var dominantExt: ExtKey = .none
+        /// Direct child directories, after the same skip rules as the scanner
+        /// (skip paths, foreign mount points) — so a structural diff against the
+        /// node's children compares like with like.
+        var subdirNames: Set<String> = []
+        /// Direct files — refreshes `fileCache` for free (the outline follows
+        /// without extra I/O) and feeds the File-types diff (M4).
+        var items: [FileItem] = []
+        var ext: [ExtKey: ExtStat] = [:]
+        /// Exact mode only: a direct file has `linkCount > 1`. Its bytes were
+        /// attributed locally (full size) — the scan's dedup can't be replayed —
+        /// so the node's counts may drift until Rescan (SPEC-11 §3.3, acté).
+        var sawHardlinks = false
+        /// `open()` failed: the directory vanished (its parent's re-stat handles
+        /// the removal) or turned unreadable — nothing to apply either way.
+        var failed = false
+    }
+
+    /// Blocking single-directory read — runs on a detached task. Mirrors the
+    /// scanner's child rules (`DirectoryScanner.process`): skipped paths and
+    /// foreign mount points are not counted as children, or the diff would keep
+    /// "discovering" subtrees the scan deliberately excluded (Data firmlink…).
+    nonisolated private static func snapshotDirectory(
+        path: String, skipPaths: Set<String>, seedPaths: Set<String>, hardlinkAware: Bool
+    ) -> DirSnapshot {
+        var snap = DirSnapshot()
+        let fd = open(path, O_RDONLY | O_DIRECTORY)
+        guard fd >= 0 else { snap.failed = true; return snap }
+        defer { close(fd) }
+        let bufSize = 256 * 1024
+        let buf = UnsafeMutableRawPointer.allocate(byteCount: bufSize, alignment: 16)
+        defer { buf.deallocate() }
+        let prefix = path == "/" ? "/" : path + "/"
+        enumerateDirectory(fd: fd, buffer: buf, bufferSize: bufSize, hardlinkAware: hardlinkAware) { entry in
+            let name = String(
+                decoding: UnsafeRawBufferPointer(start: entry.name, count: entry.nameLength),
+                as: UTF8.self)
+            if entry.isDirectory {
+                let childPath = prefix + name
+                if skipPaths.contains(childPath) { return }
+                if entry.isMountPoint && !seedPaths.contains(childPath) { return }
+                snap.subdirNames.insert(name)
+            } else {
+                snap.filesLogical += entry.logicalSize
+                snap.filesPhysical += entry.physicalSize
+                snap.fileCount += 1
+                if entry.linkCount > 1 { snap.sawHardlinks = true }
+                snap.items.append(FileItem(name: name, logical: entry.logicalSize, physical: entry.physicalSize))
+                let key = ExtKey(name: entry.name, length: entry.nameLength)
+                snap.ext[key, default: ExtStat()].add(logical: entry.logicalSize, physical: entry.physicalSize)
+            }
+        }
+        var domKey: ExtKey = .none
+        var domBytes: Int64 = -1
+        for (k, s) in snap.ext {
+            let bytes = max(s.physical, s.logical)
+            if bytes > domBytes { domBytes = bytes; domKey = k }
+        }
+        snap.dominantExt = domKey
+        return snap
+    }
+
+    /// Reconcile one directory whose *direct* contents changed (a precise
+    /// FSEvents report): non-recursive re-stat off the main thread, then exact
+    /// deltas propagated up the ancestor chain — milliseconds, no subtree walk.
+    /// Subdirectories that appeared are attached and mini-scanned (only the new
+    /// content is read); ones that disappeared are subtracted and detached. A
+    /// rename lands as one disappearance + one appearance, possibly in two
+    /// different parents.
+    @discardableResult
+    func restatDirectory(_ node: FSNode) async -> Bool {
+        await restatDirectContents(of: node) == .applied
+    }
+
+    private enum RestatOutcome { case applied, refused }
+
+    private func restatDirectContents(of node: FSNode) async -> RestatOutcome {
+        guard isHostScan, phase != .scanning, !drainingCancelledScan, !structuralOpActive,
+              root != nil, node.isDirectory, let path = path(for: node) else { return .refused }
+        structuralOpActive = true
+        defer { structuralOpActive = false }
+        // Same epoch/ancestor discipline as `invalidate`: hold the (unowned)
+        // parent chain strongly across the suspension, abort if the tree moved.
+        let epoch = treeEpoch
+        let ancestors = Self.retainedAncestors(of: node)
+        defer { withExtendedLifetime(ancestors) {} }
+
+        let seedPaths = Set(nodePaths.values)
+        let skip = DirectoryScanner.recommendedSkipPaths(seedPaths: Array(seedPaths))
+        let exact = countingMode == .exact
+        let snap = await Task.detached(priority: .userInitiated) {
+            Self.snapshotDirectory(path: path, skipPaths: skip, seedPaths: seedPaths,
+                                   hardlinkAware: exact)
+        }.value
+        guard epoch == treeEpoch else { return .refused }
+        // Vanished or unreadable: the parent's own event reconciles a removal;
+        // nothing to apply here (and nothing to retry against).
+        guard !snap.failed else { return .applied }
+
+        // The "old" side of the File-types diff must be captured before the
+        // structural pass (it clears `fileCache`) and before the file deltas
+        // (they move `directFileCount`, the listing's validity tag).
+        let oldExt = extSnapshots[path] ?? cachedExtTable(of: node)
+
+        // Structural diff first (against the node *now*, post-suspension).
+        // Disappeared: subtract the subtree's aggregates and detach — the same
+        // brick as user deletion, so navigation state is lifted to a survivor.
+        // File-types: content gone from disk can't be re-walked, but a *leaf*
+        // directory a past re-stat snapshotted is fully known — subtract its
+        // table exactly (the QA case: a watched download vanishing). Anything
+        // deeper or never-snapshotted stays a marked drift.
+        let prefix = path == "/" ? "/" : path + "/"
+        let currentDirs = node.children
+        let currentNames = Set(currentDirs.map(\.name))
+        for child in currentDirs where !snap.subdirNames.contains(child.name) {
+            let childPath = prefix + child.name
+            if let known = extSnapshots[childPath], child.childCount == 0,
+               let ds = scanner as? DirectoryScanner {
+                ds.subtractExtensions(known)
+                extRows = ds.snapshotExtensions(metric: metric, limit: 250)
+            } else if child.fileCount.load(ordering: .relaxed) > 0 {
+                typesDrifted = true
+            }
+            pruneExtSnapshots(under: childPath)
+            applyDirectoryRemoval(child)
+        }
+        // Appeared: attach fresh nodes and scan *only that new content*, all
+        // under one parallel sub-scanner (multi-seed). Their extensions merge
+        // exactly — nothing of it was ever booked before.
+        let appeared = snap.subdirNames.subtracting(currentNames).sorted()
+        if !appeared.isEmpty {
+            var seeds: [DirectoryScanner.Seed] = []
+            for name in appeared {
+                let child = FSNode(name: name, parent: node, isDirectory: true)
+                node.appendChild(child)
+                seeds.append(.init(path: prefix + name, node: child))
+            }
+            let sub = DirectoryScanner(
+                root: node, seeds: seeds, skipPaths: skip, exact: countingMode == .exact)
+            activeSubScan = sub
+            sub.start()
+            await Task.detached(priority: .userInitiated) { sub.waitUntilFinished() }.value
+            activeSubScan = nil
+            guard epoch == treeEpoch else { return .refused } // torn down mid-scan
+            dirCount += sub.directoryCount
+            var addedPhysical: Int64 = 0
+            for seed in seeds { addedPhysical += seed.node.aggPhysical.load(ordering: .relaxed) }
+            noteAppliedPhysical(addedPhysical)
+            if let ds = scanner as? DirectoryScanner {
+                ds.mergeExtensions(sub.snapshotRawExtensions())
+                extRows = ds.snapshotExtensions(metric: metric, limit: 250)
+            }
+        }
+
+        // Exact file deltas.
+        let dLogical = snap.filesLogical - node.directFilesLogical
+        let dPhysical = snap.filesPhysical - node.directFilesPhysical
+        let dCount = snap.fileCount - node.directFileCount
+        if dLogical != 0 || dPhysical != 0 || dCount != 0 {
+            node.adjustDirectFiles(logical: dLogical, physical: dPhysical, count: dCount)
+            var n: FSNode? = node
+            while let a = n {
+                a.aggLogical.wrappingAdd(dLogical, ordering: .relaxed)
+                a.aggPhysical.wrappingAdd(dPhysical, ordering: .relaxed)
+                a.fileCount.wrappingAdd(dCount, ordering: .relaxed)
+                n = a.parent
+            }
+            noteAppliedPhysical(dPhysical)
+            sortCache.removeAll() // sibling order may have changed
+        }
+        if node.dominantExt != snap.dominantExt { node.updateDominantExt(snap.dominantExt) }
+
+        // File-types: exact diff when we hold this directory's old table
+        // (stored by a previous re-stat, or derivable from a complete cached
+        // listing); otherwise leave the panel untouched and mark the drift.
+        if let oldExt {
+            if oldExt != snap.ext, let ds = scanner as? DirectoryScanner {
+                ds.subtractExtensions(oldExt)
+                ds.mergeExtensions(snap.ext)
+                extRows = ds.snapshotExtensions(metric: metric, limit: 250)
+            }
+        } else if dLogical != 0 || dPhysical != 0 || dCount != 0 {
+            typesDrifted = true
+        }
+        storeExtSnapshot(snap.ext, for: path)
+        if exact, snap.sawHardlinks { exactDrifted = true }
+
+        // The snapshot *is* the fresh listing — the outline follows for free.
+        var items = snap.items
+        if items.count > Self.maxFilesPerFolder {
+            items.sort { $0.physical > $1.physical }
+            items.removeLast(items.count - Self.maxFilesPerFolder)
+        }
+        items.sort { $0.size(metric) > $1.size(metric) }
+        fileCache[ObjectIdentifier(node)] = FileListing(count: snap.fileCount, metric: metric, items: items)
+
+        refreshTotals()
+        bump()
+        return .applied
+    }
+
+    /// Complete listing from `fileCache` → per-extension table, or nil when the
+    /// cache is missing, stale, or capped (a capped one would under-subtract).
+    private func cachedExtTable(of node: FSNode) -> [ExtKey: ExtStat]? {
+        guard let cached = fileCache[ObjectIdentifier(node)],
+              cached.count == node.directFileCount,
+              cached.items.count == Int(cached.count) else { return nil }
+        var table: [ExtKey: ExtStat] = [:]
+        for item in cached.items {
+            table[ExtKey(fileName: item.name), default: ExtStat()]
+                .add(logical: item.logical, physical: item.physical)
+        }
+        return table
+    }
+
+    private func storeExtSnapshot(_ table: [ExtKey: ExtStat], for path: String) {
+        if extSnapshots.updateValue(table, forKey: path) == nil {
+            extSnapshotOrder.append(path)
+            if extSnapshotOrder.count > Self.extSnapshotCap {
+                extSnapshots[extSnapshotOrder.removeFirst()] = nil
+            }
+        }
+    }
+
+    /// Drop stored tables under a re-scanned subtree — the global table was
+    /// re-derived for that area, so the old snapshots no longer describe what
+    /// it booked and a later diff would subtract the wrong "old".
+    private func pruneExtSnapshots(under path: String) {
+        let prefix = path == "/" ? "/" : path + "/"
+        let doomed = extSnapshots.keys.filter { $0 == path || $0.hasPrefix(prefix) }
+        guard !doomed.isEmpty else { return }
+        for key in doomed { extSnapshots[key] = nil }
+        extSnapshotOrder.removeAll { extSnapshots[$0] == nil }
     }
 
     private func refreshTotals() {
@@ -1298,9 +1864,7 @@ final class ScanController {
                 startWatching() // begin watching the disk for changes (SPEC-04)
                 // Capture the budget baseline *after* startWatching — it resets
                 // watch state (including the baseline) on entry (issue #14).
-                baselineFreeBytes = volumeFreeBytes()
-                changedBytes = 0
-                shownBytes = 0
+                rebaselineDrift()
             }
             filesPerSecond = 0
             stopTimer()

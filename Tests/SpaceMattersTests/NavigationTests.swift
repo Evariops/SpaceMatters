@@ -217,12 +217,11 @@ import Foundation
         #expect(c.path(for: c.zoomRoot!) == inner.path)
     }
 
-    /// SPEC-04 end-to-end: after a scan finishes the disk is watched; an external
-    /// write marks the touched subtree dirty, and `refreshDirty` re-scans it so the
-    /// totals catch up. A small write stays under the banner's size budget, so it
-    /// doesn't raise `diskChanged` (issue #14) — the reliable signal here is
-    /// `dirtyPaths`. (FSEvents has ~1 s latency, hence the polling.)
-    @Test func fsEventsMarkDirtyAndRefreshCatchesUp() async throws {
+    /// SPEC-04 → SPEC-11 end-to-end, on *real* FSEvents: after a scan finishes
+    /// the disk is watched, and an external write reconciles into the totals
+    /// automatically — no click, no banner. (FSEvents has ~1 s latency, hence
+    /// the polling; the run loop must pump for the MainActor reconciler.)
+    @Test func fsEventsReconcileAutomatically() async throws {
         let fm = FileManager.default
         let root = fm.temporaryDirectory.appendingPathComponent("mds-fse-\(UUID().uuidString)")
         try fm.createDirectory(at: root.appendingPathComponent("sub"), withIntermediateDirectories: true)
@@ -237,20 +236,19 @@ import Foundation
         #expect(c.dirtyPaths.isEmpty)
         let physBefore = c.root!.aggPhysical.load(ordering: .relaxed)
 
-        // External change: a new file appears under `sub`.
+        // External change: a new file appears under `sub`. SPEC-11: it lands in
+        // the map by itself, silently.
         try Data(count: 200_000).write(to: root.appendingPathComponent("sub/big.new"))
-
-        // Wait (polling, yielding) for FSEvents to mark the subtree dirty.
         let deadline = Date().addingTimeInterval(10)
-        while c.dirtyPaths.isEmpty && Date() < deadline {
-            try await Task.sleep(for: .milliseconds(200))
+        while c.root!.aggPhysical.load(ordering: .relaxed) <= physBefore + 200_000
+            && Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+            await Task.yield()
         }
-        #expect(!c.dirtyPaths.isEmpty, "FSEvents should have marked the subtree dirty")
-
-        await c.refreshDirty()
-        #expect(!c.diskChanged)                 // badge cleared
-        #expect(c.dirtyPaths.isEmpty)
-        #expect(c.root!.aggPhysical.load(ordering: .relaxed) > physBefore + 200_000)
+        #expect(c.root!.aggPhysical.load(ordering: .relaxed) > physBefore + 200_000,
+                "the external write should reconcile without any user action")
+        #expect(!c.diskChanged)   // and without the banner
+        #expect(!c.isRefreshing)
     }
 
     // Zero-size files (in the current metric) are noise for a space tool — macOS
