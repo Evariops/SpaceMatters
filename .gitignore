@@ -15,4 +15,6 @@ SpaceMatters.app/
 
 # Release artifacts
 *.dmg
+SpaceMatters-*.zip
+appcast.xml
 docs/audit/

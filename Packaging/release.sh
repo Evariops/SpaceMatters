@@ -34,7 +34,15 @@ echo "▸ Building & bundling ${VERSION} with ${DEVELOPER_ID}"
 CODESIGN_ID="$DEVELOPER_ID" ./Packaging/bundle.sh release
 codesign --verify --strict --verbose=2 "$APP"
 
-echo "▸ Building DMG"
+echo "▸ Update archive (Sparkle): notarize app via zip, staple, re-zip"
+ZIP="SpaceMatters-${VERSION}.zip"
+ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
+xcrun notarytool submit "$ZIP" --keychain-profile "$NOTARY_PROFILE" --wait
+xcrun stapler staple "$APP"
+rm "$ZIP"
+ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
+
+echo "▸ Building DMG (from the stapled app)"
 ./Packaging/make-dmg.sh "$APP" "$DMG"
 
 echo "▸ Signing, notarizing & stapling DMG (this can take a few minutes)"
@@ -44,8 +52,12 @@ xcrun stapler staple "$DMG"
 spctl -a -vv -t open --context context:primary-signature "$DMG" || true
 
 echo "▸ Publishing GitHub Release v${VERSION}"
-gh release create "v${VERSION}" "$DMG" \
+gh release create "v${VERSION}" "$DMG" "$ZIP" \
   --title "SpaceMatters ${VERSION}" \
   --notes "Signed & notarized build. Download the .dmg, open it, and drag SpaceMatters into Applications. macOS opens it without a Gatekeeper warning."
 
-echo "✓ Released v${VERSION} → ${DMG}"
+echo "▸ Sparkle appcast (cumulative, EdDSA-signed)"
+./Packaging/make-appcast.sh "$VERSION" "$ZIP"
+gh release upload "v${VERSION}" appcast.xml --clobber
+
+echo "✓ Released v${VERSION} → ${DMG} + ${ZIP} + appcast.xml"

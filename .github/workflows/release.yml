@@ -1,17 +1,24 @@
 name: Release
 
 # Fires when a draft (from Release Drafter) is published: builds the app at
-# the release tag, packages SpaceMatters-<version>.dmg, and attaches it to the
-# release with a SHA-256 checksum.
+# the release tag, packages SpaceMatters-<version>.dmg (first install) and
+# SpaceMatters-<version>.zip (Sparkle update), refreshes the cumulative
+# appcast.xml, and attaches everything to the release (SPEC-07 + SPEC-12).
 #
-# Signing is opportunistic (SPEC-07: Developer ID is an external prerequisite):
-#   - With the secrets below set, the DMG is Developer ID-signed, notarized
-#     and stapled — it opens without a Gatekeeper warning.
-#   - Without them, the build falls back to ad-hoc signing and the step
-#     summary says so (users must right-click ▸ Open on first launch).
+# Signing is tiered (SPEC-12 §3.7):
+#   - MACOS_CERT_P12 may hold a *self-signed* "SpaceMatters" cert (piste A:
+#     stable identity → FDA persists across updates; Gatekeeper still warns
+#     on first install) or a "Developer ID Application" cert (piste B).
+#   - Hardened runtime + timestamp are applied by bundle.sh only for
+#     Developer ID (no Team ID → library validation would kill the app).
+#   - Notarization/stapling only run with the APPLE_* secrets (piste B).
+#   - With no cert at all, the build falls back to ad-hoc and the step
+#     summary says so.
 #
-# Optional repository secrets:
-#   MACOS_CERT_P12                base64 of the "Developer ID Application" .p12
+# Repository secrets:
+#   SPARKLE_ED_PRIVATE_KEY        EdDSA seed signing Sparkle updates (required
+#                                 for the appcast; independent of Apple)
+#   MACOS_CERT_P12                base64 of the signing cert .p12 (see above)
 #   MACOS_CERT_PASSWORD           password protecting the .p12
 #   APPLE_ID                      Apple ID that owns the certificate
 #   APPLE_TEAM_ID                 10-char team identifier
@@ -64,19 +71,42 @@ jobs:
           rm -f "$RUNNER_TEMP/cert.p12"
           security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
           security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
-          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" \
-            | sed -n 's/.*"\(Developer ID Application: .*\)"/\1/p' | head -n 1)"
-          [ -n "$IDENTITY" ] || { echo "error: no Developer ID Application identity in the imported .p12" >&2; exit 1; }
+          # No -v: a self-signed cert (piste A) shows as CSSMERR_TP_NOT_TRUSTED
+          # and the -v filter would hide it, although codesign signs fine with
+          # it (SPEC-12 §3.7). bundle.sh keys hardened runtime off the name.
+          IDENTITY="$(security find-identity -p codesigning "$KEYCHAIN" \
+            | sed -n 's/.*[0-9A-F]\{40\} "\(.*\)".*/\1/p' | head -n 1)"
+          [ -n "$IDENTITY" ] || { echo "error: no code signing identity in the imported .p12" >&2; exit 1; }
           echo "CODESIGN_ID=$IDENTITY" >> "$GITHUB_ENV"
 
       - name: Build app bundle
         run: VERSION="${TAG_NAME#v}" ./Packaging/bundle.sh release
 
-      - name: Hardened-runtime sign + verify
+      # bundle.sh signs everything inner→outer (Sparkle helpers, framework,
+      # app) with $CODESIGN_ID; this step only re-checks the result.
+      - name: Verify signature
         if: env.HAS_SIGNING == 'true'
+        run: codesign --verify --strict --verbose=2 SpaceMatters.app
+
+      - name: Build update archive (Sparkle)
         run: |
-          codesign --force --deep --options runtime --timestamp --sign "$CODESIGN_ID" SpaceMatters.app
-          codesign --verify --strict --verbose=2 SpaceMatters.app
+          echo "ZIP=SpaceMatters-${TAG_NAME#v}.zip" >> "$GITHUB_ENV"
+          ditto -c -k --sequesterRsrc --keepParent SpaceMatters.app "SpaceMatters-${TAG_NAME#v}.zip"
+
+      # Piste B only: notarize the app (via the zip), staple it, re-zip, so
+      # both the update archive and the DMG below carry the stapled app.
+      - name: Notarize & staple app
+        if: env.HAS_SIGNING == 'true' && env.HAS_NOTARY == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          xcrun notarytool submit "$ZIP" --wait \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD"
+          xcrun stapler staple SpaceMatters.app
+          rm "$ZIP"
+          ditto -c -k --sequesterRsrc --keepParent SpaceMatters.app "$ZIP"
 
       - name: Build DMG
         run: |
@@ -96,27 +126,41 @@ jobs:
           xcrun stapler staple "$DMG"
           spctl -a -vv -t open --context context:primary-signature "$DMG"
 
-      - name: Checksum
-        run: shasum -a 256 "$DMG" | tee "$DMG.sha256"
+      - name: Checksums
+        run: |
+          shasum -a 256 "$DMG" | tee "$DMG.sha256"
+          shasum -a 256 "$ZIP" | tee "$ZIP.sha256"
+
+      # Cumulative Sparkle feed: extends the previous release's appcast.xml,
+      # embeds the release body as markdown notes, signs with the EdDSA key.
+      - name: Generate appcast
+        env:
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: ./Packaging/make-appcast.sh "${TAG_NAME#v}" "$ZIP"
 
       - name: Upload to release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$TAG_NAME" "$DMG" "$DMG.sha256" --clobber
+        run: |
+          gh release upload "$TAG_NAME" \
+            "$DMG" "$DMG.sha256" "$ZIP" "$ZIP.sha256" appcast.xml --clobber
 
       - name: Summary
         run: |
           {
-            echo "## $DMG"
+            echo "## $DMG + $ZIP"
             if [ "$HAS_SIGNING" = "true" ] && [ "$HAS_NOTARY" = "true" ]; then
-              echo "✅ Developer ID-signed, notarized and stapled."
+              echo "✅ Signed with \`$CODESIGN_ID\`, notarized and stapled (piste B)."
             elif [ "$HAS_SIGNING" = "true" ]; then
-              echo "⚠️ Developer ID-signed but **not notarized** (Apple ID secrets missing)."
+              echo "⚠️ Signed with \`$CODESIGN_ID\`, **not notarized** — stable identity, FDA persists across updates; Gatekeeper warns on first install (piste A)."
             else
-              echo "⚠️ **Ad-hoc signature** (no signing secrets configured): Gatekeeper will warn; right-click ▸ Open."
+              echo "⚠️ **Ad-hoc signature** (no signing secrets configured): Gatekeeper warns AND Full Disk Access is re-asked after each update."
             fi
             echo
-            cat "$DMG.sha256"
+            echo "Sparkle appcast refreshed: \`releases/latest/download/appcast.xml\`."
+            echo
+            cat "$DMG.sha256" "$ZIP.sha256"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Remove temporary keychain

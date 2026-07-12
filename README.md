@@ -40,6 +40,12 @@ The app isn't notarized (that needs a paid Apple Developer account), so Gatekeep
 xattr -d com.apple.quarantine /Applications/SpaceMatters.app
 ```
 
+## Updates
+
+SpaceMatters updates itself in place via [Sparkle](https://sparkle-project.org) — that first-launch dance never comes back: updates are verified by a signature pinned inside the app and released from quarantine by the updater, and the Full Disk Access grant survives them.
+
+Nothing runs before you opt in. On the second launch the app asks whether it may check for updates automatically; decline and it never checks on its own. "Check for Updates…" in the app menu works on demand either way. The only network request the app ever makes is fetching the update feed and archive from this repository's Releases — no telemetry, nothing is sent.
+
 ## Good to know
 
 - This project is vibe-coded.
