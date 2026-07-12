@@ -4,7 +4,7 @@
 > **Ce qu'on n'exploite pas** : la sémantique précise de FSEvents en granularité répertoire — un événement sans `MustScanSubDirs` signifie « **le contenu direct de CE répertoire** a changé ». Une passe `getattrlistbulk` non récursive sur ce seul répertoire (millisecondes) suffit à calculer le delta exact et à le propager.
 > **Décision (actée)** : le **live est le mode par défaut**. Les changements s'appliquent automatiquement — deltas **par répertoire, propagés** pour les événements précis ; re-scan de sous-arbre **auto-déclenché** (coalescé à l'ancêtre commun) quand FSEvents avoue une perte de détail. Il n'y a **pas de fallback dormant** : les deux mécanismes sont nominaux, chacun sur son régime. Le bandeau + bouton Refresh ne subsistent qu'en **dernier recours** — un rattrapage automatique qui serait assez gros pour mériter le consentement de l'utilisateur. La carte devient un tableau de bord *vivant* qui respire par morphs (SPEC-10).
 > **Dépendances** : PR #26 (bandeau honnête pendant refresh), SPEC-10 mergée (ε-revalidation locale + morphs — le treemap absorbe déjà des updates incrémentaux avec grâce).
-> **Statut** : 📋 **PROPOSÉ**.
+> **Statut** : 🚧 **EN IMPLÉMENTATION** (branche `spec/11-incremental-refresh`).
 
 ## 1. Objectif
 
@@ -22,33 +22,37 @@ Qu'un changement ponctuel du disque (fichier créé/supprimé/retaillé, dossier
 ## 3. Conception
 
 ### 3.1 FSWatcher : transmettre les flags
-Le handler reçoit `[(path, flags)]`. Flags exploités : `kFSEventStreamEventFlagMustScanSubDirs` (perte de détail — fallback sous-arbre), `…Renamed` (traité comme paire disparition/apparition au niveau du parent), `…RootChanged`. Latence 1 s conservée (c'est notre coalescence naturelle).
+Le handler reçoit `[(path, flags)]`. En granularité répertoire (pas de `FileEvents` — c'est notre anti-flood), les flags par item (`ItemRenamed`, `ItemCreated`…) **ne sont jamais livrés** ; les seuls exploitables sont `kFSEventStreamEventFlagMustScanSubDirs` (perte de détail → rattrapage sous-arbre) et `…RootChanged` — qui exige `kFSEventStreamCreateFlagWatchRoot` à la création (à ajouter ; racine déplacée/supprimée → bandeau proposant un Rescan). Les renames se détectent **structurellement** : le diff des sous-dossiers au re-stat du/des parent(s) voit une disparition + une apparition. `IgnoreSelf` volontairement absent : l'écho de nos propres suppressions produit un re-stat convergent no-op, et rattrape tout écart. Latence 1 s conservée (c'est notre coalescence naturelle).
 
 ### 3.2 Application d'un événement répertoire `P` (chemin nominal)
-1. **Re-stat non récursif** de `P` : une passe du primitif existant ([FSAttr.enumerateDirectory](../Sources/SpaceMatters/Scanner/FSAttr.swift)) → nouveaux `directFilesSize/directFileCount/dominantExt` + **set des sous-dossiers directs**.
-2. **Delta fichiers directs** = nouveau − ancien (les agrégats du nœud suffisent — pas besoin d'inventaire par fichier pour tailles/comptes) → propagation `wrappingAdd` jusqu'à la racine. Le treemap voit le bump et morphe.
-3. **Diff des sous-dossiers** : apparu → mini-scan `DirectoryScanner` du seul nouveau sous-arbre, rattaché à `P` (c'est le sous-scan d'`invalidate`, à échelle d'un dossier neuf, généralement minuscule) ; disparu → soustraction de ses agrégats + détachement (plomberie `applyDirectoryRemoval`).
-4. **File-types** : diff **exact** par extension quand `fileCache` détient l'ancien listing de `P` (et le re-stat devient l'occasion de le rafraîchir) ; sinon best-effort — la même classe de compromis, déjà documentée, que PR #26. Plus de walk récursif nulle part sur ce chemin.
-5. **Invariants de sûreté** inchangés : epoch, `structuralOpActive` (un delta ne s'applique jamais pendant une suppression/un rescan), ancêtres retenus pendant toute suspension.
+Tous les événements convergent vers une **file de réconciliation sérialisée** (un seul consommateur, sur le MainActor entre les suspensions) : à tout instant au plus une opération structurelle mutile l'arbre — même discipline que `remove`/`invalidate`, avec lesquels elle partage `structuralOpActive` (op refusée → re-queue, jamais oubliée).
+
+1. **Re-stat non récursif** de `P` hors main thread : une passe du primitif existant ([enumerateDirectory](../Sources/SpaceMatters/Scanner/FSAttr.swift#L62)) → **totaux absolus** (`directFilesSize/directFileCount/dominantExt` + set des sous-dossiers directs + listing fichiers). Buffer réutilisé, µs–ms par dossier.
+2. **Delta = absolu − état du nœud, calculé au moment de l'apply** sur le MainActor — jamais un delta pré-calculé (deux re-stats en vol sur le même dossier convergent en last-writer-wins au lieu d'appliquer un delta périmé) → propagation `wrappingAdd` jusqu'à la racine. Le treemap voit le bump et morphe.
+3. **Diff des sous-dossiers** (diff de noms, à l'apply) : apparu → mini-scan `DirectoryScanner` du seul nouveau sous-arbre rattaché à `P` — en respectant `skipPaths`/mount-points **comme le scan initial** (sinon double-comptage firmlink Data) ; disparu → soustraction des agrégats + détachement (plomberie `applyDirectoryRemoval`, qui relève déjà zoom/sélection/expansion vers le survivant).
+4. **File-types** : diff **exact** par extension via un **snapshot par-dossier** (LRU borné, ~4096 dossiers) alimenté par chaque re-stat — exact dès le second delta sur un dossier ; amorcé par `fileCache` quand il détient le listing complet (< 2000 items, sa borne). Sans ancien snapshot : on ne touche pas la table (dérive marquée, même classe de compromis que PR #26). Plus de walk récursif nulle part sur ce chemin.
+5. **Caches** : le listing obtenu en 1 rafraîchit `fileCache` (l'outline suit sans I/O) ; `sortCache` purgé (l'ordre par taille a pu changer) ; un **seul bump de version par cycle** de réconciliation, pas par delta — l'ε-revalidation SPEC-10 ne tourne qu'une fois.
+6. **Invariants de sûreté** inchangés : epoch re-vérifié après chaque suspension, ancêtres retenus, `structuralOpActive` exclusif.
 
 ### 3.3 Rattrapage automatique (pas un fallback dormant — un second régime nominal)
 Quand FSEvents **avoue une perte de détail**, le détail ne peut pas être reconstruit par deltas — le re-scan de sous-arbre existant ([invalidate(subtree:)](../Sources/SpaceMatters/ViewModel/ScanController.swift#L970), éprouvé) prend le relais **automatiquement**, sans bandeau ni clic :
 - `MustScanSubDirs` → re-scan auto du sous-arbre signalé ;
-- **rafale d'événements** (> N≈64 répertoires distincts par tick — churn de build, checkout, rsync) → les chemins sales sont **coalescés à leur ancêtre commun** (la déduplication topmost de `refreshDirty` existe déjà) et ce sous-arbre est re-scanné en une passe parallèle — au-delà d'un seuil de rafale, c'est *plus rapide* que N re-stats unitaires, pas seulement plus sûr.
+- **rafale d'événements** → coalescence par **clustering de préfixe commun**, pas à l'ancêtre commun global (100 dossiers épars ont pour ancêtre commun la racine — on re-scannerait 3,9 M fichiers là où 100 re-stats coûtent ~100 ms) : les groupes **denses** (≥ K≈16 chemins sales sous un même ancêtre proche — churn de build, checkout, rsync) coalescent chacun vers *son* ancêtre en une passe parallèle ; les épars restent des re-stats unitaires, plafonnés (~256/cycle, l'excédent reste en file) ;
+- **cooldown par sous-arbre** (~10 s) entre deux rattrapages auto du même nœud — une boucle de build qui churne en continu marque sale et attend la fenêtre suivante, au lieu de re-scanner le même sous-arbre toutes les 2 s.
 
 Les cas que la version initiale de cette spec traitait en fallback et qui **se dissolvent dans le chemin nominal** :
 - chemin non mappable (dossier inconnu, course avec un rename) → re-stat du **parent** connu le plus proche (récursion d'un niveau) ;
 - **mode Exact** (acté) : delta en **attribution locale + marqueur de dérive** sur le nœud (tooltip « dédup hardlinks à re-vérifier ») — pas de re-scan systématique ; le Rescan complet reste le point de re-synchronisation exacte, comme aujourd'hui.
 
 ### 3.4 Le bandeau : dernier recours uniquement
-Un seul cas le fait apparaître : un rattrapage automatique (§3.3) dont le sous-arbre coalescé dépasse un **seuil de consentement** (> ~500 k fichiers, soit plusieurs secondes de re-scan) — là, on demande avant de brûler le CPU, avec le spinner persistant de PR #26 pendant l'exécution. En dessous du seuil, tout est silencieux et vivant. `changedBytes` devient la somme des deltas réellement appliqués (exact) ; le statfs global est rétrogradé en garde-fou de cohérence (drift > budget sans événement correspondant → proposer un Refresh — le signe que quelque chose nous a échappé).
+Un seul cas le fait apparaître : un rattrapage automatique (§3.3) dont le sous-arbre cible dépasse un **seuil de consentement** (`fileCount` > ~500 k, soit plusieurs secondes de re-scan) — là, on demande avant de brûler le CPU, avec le spinner persistant de PR #26 pendant l'exécution. En dessous du seuil, tout est silencieux et vivant. `changedBytes` devient la somme des deltas réellement appliqués (exact) ; le statfs global est rétrogradé en garde-fou de cohérence : `|drift statfs − deltas physiques appliqués| > budget` → proposer un Refresh — le signe que quelque chose nous a échappé (écritures hors du sous-arbre observé sur le même volume restent le faux positif connu, budget 128 MB inchangé).
 
 ## 4. Plan d'implémentation — jalons
 
 **M1 (~1,5 j)** — Flags dans FSWatcher ; re-stat single-dir + deltas propagés, encore déclenché par le Refresh existant (le bouton devient instantané pour les cas nominaux — étape d'observation avant d'ôter la ceinture).
 **M2 (~1,5 j)** — Sous-dossiers créés/supprimés, renames (paire disparition/apparition), chemins non mappables via re-stat du parent, garde-fous epoch/structuralOp sous tests.
 **M3 (~1 j)** — **Bascule live par défaut** : auto-application des deltas, rattrapage sous-arbre auto-coalescé (`MustScanSubDirs` + rafales), bandeau réduit au seuil de consentement.
-**M4 (~1 j)** — File-types via fileCache ; attribution locale + marqueur de dérive en mode Exact ; `changedBytes` exact.
+**M4 (~1 j)** — File-types via snapshots par-dossier (LRU, amorcé par `fileCache`) ; attribution locale + marqueur de dérive en mode Exact ; `changedBytes` exact + garde-fou statfs.
 
 ## 5. Vérification
 
@@ -59,11 +63,12 @@ Un seul cas le fait apparaître : un rattrapage automatique (§3.3) dont le sous
 
 ## 6. Risques & hypothèses (🔬)
 
-- 🔬 **Sémantique fine des flags FSEvents** sous coalescence agressive (latence 1 s) — à caractériser tôt (M1) sur événements forgés et réels.
-- 🔬 **Renames de gros dossiers** : FSEvents signale les deux parents ; la paire doit re-attacher le sous-arbre existant (déplacement) plutôt que soustraire+re-scanner — optimisation possible, fallback correct en attendant.
+- 🔬 **Sémantique fine des flags FSEvents** sous coalescence agressive (latence 1 s) — à caractériser tôt (M1) sur événements forgés et réels. Validé empiriquement le 2026-07-12 : un stream sur `/` livre bien les chemins Data en **forme firmlink** (`/Users/…`), que `nearestNode` canonicalise déjà.
+- **Renames de gros dossiers** : détectés structurellement (disparition + apparition au(x) parent(s)) → soustraire + re-scanner : correct mais coûteux pour un gros dossier renommé. Le vrai re-attach demanderait l'inode du dossier persisté par `FSNode` (+8 o/nœud) pour reconnaître le sous-arbre — levier identifié, différé.
 - 🔬 **APFS** : clones/sparse — le re-stat mesure ce que `getattrlistbulk` rapporte, comme le scan initial (cohérent par construction) ; à vérifier sur fichiers clonés.
 - **Exact mode** : attribution locale + marqueur de dérive (acté §3.3) — la dédup hardlinks n'est re-garantie qu'au Rescan ; à documenter dans l'UI du marqueur.
-- 🔬 **Rattrapages auto en cascade** : un `MustScanSubDirs` pendant qu'un re-scan auto tourne déjà — la sérialisation par `structuralOpActive` + la file de chemins sales doivent absorber sans tempête de re-scans (test dédié).
+- 🔬 **Rattrapages auto en cascade** : un `MustScanSubDirs` pendant qu'un re-scan auto tourne déjà — la file de réconciliation sérialisée + `structuralOpActive` + le cooldown par sous-arbre doivent absorber sans tempête de re-scans (test dédié).
+- 🔬 **Deux re-stats en vol sur le même dossier** : neutralisé par construction (totaux absolus, delta calculé à l'apply, file sérialisée) — test dédié quand même.
 - **dominantExt** local : recalculé sur le seul dossier touché — la couleur d'un ancêtre agrégé peut dériver marginalement jusqu'au Rescan (acceptable, cosmétique).
 
 ## 7. Effort & périmètre
