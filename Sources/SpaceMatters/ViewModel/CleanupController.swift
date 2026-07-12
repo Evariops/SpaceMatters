@@ -57,6 +57,9 @@ final class CleanupController {
     private let nativeLookup: @Sendable (String, String) -> NativeCleaner?
     private let nativeRunner: @Sendable (NativeCleaner) async -> ProcessResult
     private let blockedReason: @Sendable (String, String) -> String?
+    /// Called on the main actor with one entry per cleaned target — the
+    /// forensic trail behind field reports. Injectable so tests can collect.
+    private let journal: (CleanupJournal.Entry) -> Void
 
     /// `catalog`/`allowedRoot` are injectable so tests can run against fixtures;
     /// the app uses the built-in catalog fenced to the user's home.
@@ -72,12 +75,14 @@ final class CleanupController {
             id == "uv" && CleanupEngine.uvSymlinkMode(home: home)
                 ? "uv link-mode is \"symlink\" — cleaning would break your virtualenvs"
                 : nil
-         }) {
+         },
+         journal: @escaping (CleanupJournal.Entry) -> Void = { CleanupJournal.append($0) }) {
         self.catalog = catalog
         self.allowedRoot = allowedRoot
         self.nativeLookup = nativeLookup
         self.nativeRunner = nativeRunner
         self.blockedReason = blockedReason
+        self.journal = journal
     }
 
     func load() {
@@ -200,22 +205,36 @@ final class CleanupController {
         var failures = 0
         var refused = 0
         var issues: [String] = []
+        let active = ToolActivity.activeTools(for: Set(targets.map(\.id)))
         for item in targets {
+            var entry = CleanupJournal.Entry(
+                targetID: item.id, engine: "file", paths: item.paths,
+                bytesBefore: rows.first(where: { $0.id == item.id })?.size.bytes ?? 0)
+            entry.activeTools = active[item.id]?.sorted() ?? []
             // Availability is resolved at clean time, not load time: the label
             // shown is a promise, the decision here is the truth.
             if let native = nativeLookup(item.id, root) {
+                entry.engine = native.label
                 let result = await nativeRunner(native)
-                if !result.ok { issues.append("\(item.name) — \(native.label): \(result.diagnostic)") }
+                if !result.ok {
+                    entry.diagnostic = result.diagnostic
+                    issues.append("\(item.name) — \(native.label): \(result.diagnostic)")
+                }
             } else {
                 let result = await Task.detached(priority: .userInitiated) {
                     CleanupEngine.clean(item, allowedRoot: root)
                 }.value
+                entry.removed = result.removed
+                entry.failed = result.failed
+                entry.refused = result.refused
                 failures += result.failed
                 refused += result.refused
             }
             let measure = await Task.detached(priority: .userInitiated) {
                 CleanupEngine.size(of: item)
             }.value
+            if case .sized(let bytes) = measure { entry.bytesAfter = bytes }
+            journal(entry)
             if id == loadID { apply(measure, to: item.id) } // UI only — the batch continues
         }
 

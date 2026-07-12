@@ -386,6 +386,51 @@ import Foundation
         #expect(CleanupEngine.uvSymlinkMode(home: home.path, environment: [:]) == false)
     }
 
+    /// Every cleaned target leaves a journal entry: engine, sizes before and
+    /// after, and per-child outcome — the forensic trail for field reports.
+    @Test func cleanJournalsEachTarget() async throws {
+        let (root, cache) = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let box = JournalBox()
+        let c = CleanupController(catalog: [Self.cleanable([cache.path])],
+                                  allowedRoot: root.path,
+                                  journal: { box.entries.append($0) })
+        c.load()
+        await Self.waitForReady(c)
+        c.toggle("test-cache")
+        await c.cleanSelected()
+
+        #expect(box.entries.count == 1)
+        let entry = try #require(box.entries.first)
+        #expect(entry.targetID == "test-cache")
+        #expect(entry.engine == "file")
+        #expect(entry.paths == [cache.path])
+        #expect(entry.bytesBefore >= 150_000)
+        #expect(entry.bytesAfter == 0)
+        #expect(entry.removed == 2 && entry.failed == 0 && entry.refused == 0)
+    }
+
+    /// The journal file is append-only JSONL, one decodable entry per line.
+    @Test func journalAppendsDecodableLines() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("sm-journal-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let entry = CleanupJournal.Entry(targetID: "npm", engine: "file",
+                                         paths: ["/x"], bytesBefore: 42)
+        CleanupJournal.append(entry, directory: dir)
+        CleanupJournal.append(entry, directory: dir)
+
+        let text = try String(contentsOf: dir.appendingPathComponent("cleanup.jsonl"),
+                              encoding: .utf8)
+        let lines = text.split(separator: "\n")
+        #expect(lines.count == 2)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let decoded = try decoder.decode(CleanupJournal.Entry.self, from: Data(lines[0].utf8))
+        #expect(decoded.targetID == "npm")
+        #expect(decoded.bytesBefore == 42)
+    }
+
     /// Entries whose paths don't exist disappear; existing ones keep only their
     /// existing paths.
     @Test func detectFiltersMissingPaths() throws {
@@ -454,4 +499,10 @@ import Foundation
 private actor CallCounter {
     private(set) var count = 0
     func bump() { count += 1 }
+}
+
+/// Journal collector — the controller calls it on the main actor.
+@MainActor
+private final class JournalBox {
+    var entries: [CleanupJournal.Entry] = []
 }
