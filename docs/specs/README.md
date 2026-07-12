@@ -1,6 +1,6 @@
 # Specifications by workstream — MacDirStats
 
-Each `SPEC-*.md` is a self-contained requirements document for a deferred workstream from the [action plan](../../PLAN-ACTION.md), written to be picked up in a dedicated session. Common format:
+Each `SPEC-*.md` is a self-contained requirements document for a deferred workstream from the action plan, written to be picked up in a dedicated session. Common format:
 
 1. **Objective & findings covered** — the why, with references to the audits.
 2. **Current state of the code (verified)** — what exists, cited `file:line`.

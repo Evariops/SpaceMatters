@@ -23,7 +23,7 @@ Replace the **manual surgery** of the aggregates in `remove()` with a **targeted
 
 ## 3. The crux of the problem (A6)
 
-`extStats: [ExtKey: ExtStat]` is **global to the scan**, built by accumulation during the scan. After deletion of a sub-tree, it still contains the bytes/■counts of the deleted files. Three ways out:
+`extStats: [ExtKey: ExtStat]` is **global to the scan**, built by accumulation during the scan. After deletion of a sub-tree, it still contains the bytes/counts of the deleted files. Three ways out:
 
 - **Store the extensions table per node**: unbounded memory cost (the opposite of the "1 node/directory, low-RAM" stance). ❌
 - **Re-scan the deleted sub-tree *before* deletion to know its contributions and subtract them**: possible but fragile (double work, race with the scan). ⚠️
