@@ -205,8 +205,16 @@ final class TreemapNSView: NSView, CALayerDelegate {
     /// camera can roam inside without a rebuild.
     private var builtRect = CGRect.zero
     private var builtScale: (sx: CGFloat, sy: CGFloat) = (1, 1)
-    /// World rects of the previous build, keyed by tile identity — morph pairing.
-    private var lastRects: [TreemapWorld.TileKey: CGRect] = [:]
+    /// Morph pairing state, keyed by tile identity, in world coordinates.
+    /// `lastTargets` is where the previous build put each tile; `lastPrevs` is what
+    /// that build was morphing *from* — so a rebuild landing mid-morph can start
+    /// from the state actually displayed (lerp of the two at `morphT`), not snap.
+    private struct TileState {
+        var rect: CGRect
+        var color: SIMD4<Float>
+    }
+    private var lastTargets: [TreemapWorld.TileKey: TileState] = [:]
+    private var lastPrevs: [TreemapWorld.TileKey: TileState] = [:]
     private var hovered: TreemapWorld.Tile?
 
     // Morph clock (structural transitions) + camera animation (navigation fits).
@@ -499,6 +507,7 @@ final class TreemapNSView: NSView, CALayerDelegate {
         guard let controller, let root = scanRoot, bounds.width > 1, bounds.height > 1,
               camera.rect.width > 0, camera.rect.height > 0 else {
             tiles = []; instances = []; regions = [:]; regionsBuilt = false
+            lastTargets = [:]; lastPrevs = [:]
             renderer.upload(instances: [], previous: nil)
             return
         }
@@ -517,45 +526,65 @@ final class TreemapNSView: NSView, CALayerDelegate {
         builtScale = scale
         if result.pendingFiles { scheduleFileRetry() }
 
-        // Morph pairing: previous world rect per tile key, falling back to the
-        // nearest ancestor's previous rect (a newly expanded child grows out of
-        // its parent — the map's "tile split").
-        var previous: [TileInstance]? = nil
-        let doMorph = morph && !lastRects.isEmpty && !inLiveResize
+        // Morph pairing: a tile that existed in the previous build slides from
+        // the state it was *actually displaying* (mid-morph aware) and cross-fades
+        // its colour (the brightness renormalisation stops popping). A tile that
+        // didn't exist appears at its final place — no geometric "growth", which
+        // overlapped neighbours and read as giant squares during a zoom.
+        let doMorph = morph && !lastTargets.isEmpty && !inLiveResize
         packInstances()
+        var previous: [TileInstance]? = nil
         if doMorph {
+            let t = morphT
             var prev = instances
             for i in tiles.indices {
-                let key = TreemapWorld.TileKey(tiles[i])
-                let prevRect = lastRects[key] ?? ancestorRect(for: tiles[i].node)
-                if let prevRect {
-                    prev[i].origin.x = Float(prevRect.minX - rebaseOrigin.x)
-                    prev[i].origin.z = Float(prevRect.minY - rebaseOrigin.y)
-                    prev[i].size.x = Float(prevRect.width)
-                    prev[i].size.z = Float(prevRect.height)
+                guard let target = lastTargets[TreemapWorld.TileKey(tiles[i])] else { continue }
+                var from = target
+                if t < 1, let p = lastPrevs[TreemapWorld.TileKey(tiles[i])] {
+                    from.rect = lerp(p.rect, target.rect, CGFloat(t))
+                    from.color = p.color + (target.color - p.color) * t
                 }
+                prev[i].origin.x = Float(from.rect.minX - rebaseOrigin.x)
+                prev[i].origin.z = Float(from.rect.minY - rebaseOrigin.y)
+                prev[i].size.x = Float(from.rect.width)
+                prev[i].size.z = Float(from.rect.height)
+                prev[i].color = from.color
             }
             previous = prev
         }
-        var rects: [TreemapWorld.TileKey: CGRect] = [:]
-        rects.reserveCapacity(tiles.count)
-        for tile in tiles { rects[TreemapWorld.TileKey(tile)] = tile.rect }
-        lastRects = rects
+        recordMorphState(previous: previous)
 
         renderer.upload(instances: instances, previous: previous)
         if previous != nil { startMorph() } else { morphT = 1 }
     }
 
-    /// Nearest ancestor of `node` that had a rect in the previous build.
-    private func ancestorRect(for node: FSNode) -> CGRect? {
-        var cur: FSNode? = node
-        while let n = cur {
-            if let r = lastRects[TreemapWorld.TileKey(id: ObjectIdentifier(n), isFileBlock: false, fileName: nil)] {
-                return r
+    /// Snapshot the pairing dictionaries for the *next* rebuild.
+    private func recordMorphState(previous: [TileInstance]?) {
+        var targets: [TreemapWorld.TileKey: TileState] = [:]
+        targets.reserveCapacity(tiles.count)
+        var prevs: [TreemapWorld.TileKey: TileState] = [:]
+        if previous != nil { prevs.reserveCapacity(tiles.count) }
+        for i in tiles.indices {
+            let key = TreemapWorld.TileKey(tiles[i])
+            targets[key] = TileState(rect: tiles[i].rect, color: instances[i].color)
+            if let previous {
+                let p = previous[i]
+                prevs[key] = TileState(
+                    rect: CGRect(x: CGFloat(p.origin.x) + rebaseOrigin.x,
+                                 y: CGFloat(p.origin.z) + rebaseOrigin.y,
+                                 width: CGFloat(p.size.x), height: CGFloat(p.size.z)),
+                    color: p.color)
             }
-            cur = n.parent
         }
-        return nil
+        lastTargets = targets
+        lastPrevs = prevs
+    }
+
+    private func lerp(_ a: CGRect, _ b: CGRect, _ t: CGFloat) -> CGRect {
+        CGRect(x: a.minX + (b.minX - a.minX) * t,
+               y: a.minY + (b.minY - a.minY) * t,
+               width: a.width + (b.width - a.width) * t,
+               height: a.height + (b.height - a.height) * t)
     }
 
     /// Rebuild the camera-dependent parts only when the camera leaves the built
@@ -624,6 +653,7 @@ final class TreemapNSView: NSView, CALayerDelegate {
         packInstances()
         renderer.upload(instances: instances, previous: nil)
         morphT = 1
+        recordMorphState(previous: nil)   // future morphs fade from the new colours
     }
 
     private func tileSize(_ tile: TreemapWorld.Tile) -> Int64 {
