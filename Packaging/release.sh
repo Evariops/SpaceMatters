@@ -28,12 +28,10 @@ VERSION="$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//')"
 DMG="SpaceMatters-${VERSION}.dmg"
 
 echo "▸ Building & bundling ${VERSION} with ${DEVELOPER_ID}"
-# Bundle (icon, plist, git version) signed with the Developer ID — the stable
-# cdhash is what makes the Full Disk Access grant persist across builds.
+# bundle.sh signs everything inner→outer (Sparkle helpers, framework, app) and
+# turns on hardened runtime + timestamp for Developer ID identities itself —
+# the stable identity is what makes the Full Disk Access grant persist.
 CODESIGN_ID="$DEVELOPER_ID" ./Packaging/bundle.sh release
-
-echo "▸ Hardened-runtime sign + verify"
-codesign --force --deep --options runtime --timestamp --sign "$DEVELOPER_ID" "$APP"
 codesign --verify --strict --verbose=2 "$APP"
 
 echo "▸ Building DMG"

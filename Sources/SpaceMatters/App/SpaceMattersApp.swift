@@ -40,6 +40,7 @@ enum Entry {
 struct SpaceMattersApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var app = AppModel()
+    @StateObject private var updater = UpdaterModel()
 
     var body: some Scene {
         WindowGroup {
@@ -50,6 +51,9 @@ struct SpaceMattersApp: App {
             CommandGroup(replacing: .newItem) {
                 Button("Open Folder…") { app.openFolder() }
                     .keyboardShortcut("o", modifiers: .command)
+            }
+            CommandGroup(after: .appInfo) {
+                CheckForUpdatesCommand(updater: updater)
             }
         }
     }
