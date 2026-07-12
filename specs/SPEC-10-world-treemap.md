@@ -96,3 +96,15 @@ L'invalidation `version` cesse d'être globale : le scanner/FSEvents connaissent
 
 **Fait** : le paradigme monde (layout = données), caméra continue pan/zoom, LOD hiérarchique projeté (dossiers **et** fichiers), morphs sur tout changement, streaming sous scan, stabilité spatiale garantie et testée.
 **Ne fait PAS** : la 3D (hauteurs, perspective, orbite) — mais ce modèle en est le **prérequis propre** : SPEC-09 §9 s'active ensuite par caméra + hauteur sur un monde inchangé, le LOD et le morph s'appliquant tels quels aux boîtes. Pas de minimap (nice-to-have, à cadrer après M2). Pas de refonte du chrome SwiftUI (les 78 % du profil resize-fenêtre — chantier séparé). Le look des tuiles (palette, cushion, gouttières) ne change pas.
+
+## 9. Addendum post-implémentation (PR #25 — QA visuelle du 2026-07-12)
+
+Amendements actés pendant l'implémentation, après quatre passes de QA visuelle sur un scan réel (4 M fichiers) :
+
+- **§3.6 pooling du drawable : abandonné.** Le 🔬 s'est confirmé — le crop `contentsRect` produit des bandes noires pendant le drag. Le repli documenté s'applique : `drawableSize` exact par frame ; le resize étant devenu caméra-only, la réallocation d'IOSurface est le seul coût résiduel, assumé.
+- **§3.4 morph de subdivision : « appear-in-place », pas grow-from-parent.** La croissance géométrique depuis le rect parent superpose les enfants entre eux et sur leurs voisins pendant la transition (gros carrés fantômes au zoom). Les tuiles nouvelles apparaissent à leur place finale ; seules les tuiles présentes dans les deux builds glissent, et leurs **couleurs cross-fadent** (la renormalisation de luminosité fond au lieu de sauter). Un rebuild en plein morph repart de l'état affiché (lerp à t), pas de la cible précédente.
+- **§3.4 scan vivant : téléportation, pas morph.** À 10 Hz de restructurations violentes, des glissades de 220 ms n'atterrissent jamais — la carte se délite en carrés épars sur la sous-couche. Un scan actif rebuild instantanément (chaque frame est un pavage cohérent) ; les morphs s'appliquent à la vie calme post-scan (FSEvents, suppressions, métrique, re-bake d'aspect, LOD).
+- **§3.5 ε ancré aux parts de décision + garde de qualité.** La dérive mesurée contre la dernière revalidation (baseline glissante) laissait les décisions dériver sans borne par petits pas (lamelles 10:1). L'ε se mesure contre les parts **au moment de la décision**, la dérive d'aspect du rect du nœud (±25 %) re-décide aussi, et une garde auto-réparante re-décide localement au-delà d'un pire ratio de 5:1.
+- **Sous-couche parent** : chaque dossier développé (et bloc fichiers subdivisé) est peint sous ses enfants — les enfants cullés (< 0,5 px) montrent la couleur du dossier au lieu de percer un trou vers le fond ; hover/clic y tombent sur le dossier.
+- **Molette normalisée** : deltas précis ÷12, facteur borné à [0.5, 2] par événement (×1.15/cran, aligné sur le pincement).
+- Les tuiles disparues sont retirées sans fondu (le fondu à zéro impliquerait du blending — pipeline opaque conservé).
