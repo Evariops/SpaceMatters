@@ -179,6 +179,10 @@ final class ScanController {
     /// Gated by `diskChangeBudget` so ordinary per-second churn doesn't keep it
     /// lit (issue #14).
     private(set) var diskChanged = false
+    /// A targeted refresh (`refreshDirty`) is re-scanning dirty subtrees right
+    /// now — the banner shows progress instead of vanishing, and incoming
+    /// FSEvents keep marking paths without touching the (stale) banner state.
+    private(set) var isRefreshing = false
     /// Signed net change in the scanned volume's used space since the current
     /// result finished — positive means it grew, negative means space was freed.
     /// Shown in the banner and compared against `diskChangeBudget` to gate it.
@@ -500,6 +504,9 @@ final class ScanController {
     @ObservationIgnored private var layoutCache = TreemapLayout.Cache()
 
     private static let maxFilesPerFolder = 2000
+    /// Above this subtree file count, a targeted refresh skips the (single-
+    /// threaded) old-extensions disk walk — see `invalidate(subtree:)`.
+    private static let extReconcileMaxFiles: Int64 = 100_000
 
     func isExpanded(_ node: FSNode) -> Bool { expanded.contains(node) }
 
@@ -733,7 +740,12 @@ final class ScanController {
             guard isOpen else { return }
 
             let kids = sortedChildren(node)
-            let files = filesIn(node) // pre-sorted by the current metric (cached)
+            // Pre-sorted by the current metric (cached). Files at zero size *in the
+            // current metric* are dropped — a space tool has nothing to say about
+            // them (macOS marker files like `.localized`, empty locks…), and a 0 B
+            // on-disk file that still has logical bytes reappears in Logical mode.
+            // Sorted descending → the zero tail is a prefix cut, not a filter pass.
+            let files = filesIn(node).prefix(while: { $0.size(metric) > 0 })
             let childMax = max(kids.first?.size(metric) ?? 0, files.first?.size(metric) ?? 0, 1)
 
             // Merge folders + files by size, biggest first.
@@ -973,10 +985,23 @@ final class ScanController {
         let oldP = node.aggPhysical.load(ordering: .relaxed)
         let oldC = node.fileCount.load(ordering: .relaxed)
         let oldDirs = Self.subtreeDirCount(node)
-        let oldExt = await Task.detached(priority: .userInitiated) {
-            DirectoryScanner.subtreeExtensions(path: path)
-        }.value
-        guard epoch == treeEpoch else { return false }
+        // The File-types reconciliation needs a *single-threaded* disk walk of
+        // the subtree's old per-extension bytes. On a refresh rooted near the
+        // home folder (millions of files) that walk dominates the refresh by
+        // minutes — the parallel re-scan itself takes seconds. Above a bound,
+        // skip it: sizes, counts and the tree stay exact; the extensions panel
+        // drifts by this subtree's delta until the next full Rescan (the same
+        // accepted best-effort class as shared-extension changes below).
+        let reconcileExt = oldC <= Self.extReconcileMaxFiles
+        let oldExt: [ExtKey: ExtStat]
+        if reconcileExt {
+            oldExt = await Task.detached(priority: .userInitiated) {
+                DirectoryScanner.subtreeExtensions(path: path)
+            }.value
+            guard epoch == treeEpoch else { return false }
+        } else {
+            oldExt = [:]
+        }
 
         // Capture navigation state that points *into* the subtree — its descendant
         // nodes are about to be replaced by fresh objects — then drop the strong
@@ -1021,7 +1046,7 @@ final class ScanController {
         // sub-contribution isn't stored per node (the low-RAM design), so the
         // panel may be off by the change delta until the next full rescan. Sizes,
         // counts and folder count above are always exact.
-        if let ds = scanner as? DirectoryScanner {
+        if reconcileExt, let ds = scanner as? DirectoryScanner {
             ds.subtractExtensions(oldExt)
             ds.mergeExtensions(sub.snapshotRawExtensions())
         }
@@ -1088,6 +1113,11 @@ final class ScanController {
             guard let node = nearestNode(toPath: p), let np = path(for: node) else { continue }
             if dirtyPaths.insert(np).inserted { touched = true }
         }
+        // Mid-refresh: keep collecting dirty paths, but leave the banner alone —
+        // the free-space baseline is stale until the refresh re-bases it, and a
+        // bump here would repaint the treemap over half-reconciled aggregates
+        // (the transient wrong totals seen while a big subtree re-scans).
+        guard !isRefreshing else { return }
         // Gate the banner on net used-space movement so ordinary per-second churn
         // (logs, caches ticking over) doesn't keep it lit (issue #14). The dirty
         // dots still track every touched subtree for the targeted Refresh.
@@ -1120,6 +1150,8 @@ final class ScanController {
         }
         dirtyPaths.removeAll()
         diskChanged = false
+        isRefreshing = true
+        defer { isRefreshing = false }
         let epoch = treeEpoch
         for p in roots {
             guard epoch == treeEpoch else { return } // Rescan/Home mid-refresh
@@ -1130,10 +1162,14 @@ final class ScanController {
             }
         }
         scanDate = Date()
-        // Re-baseline the budget so the banner measures drift from *this* refresh.
+        // Re-baseline the budget so the banner measures drift from *this*
+        // refresh; events collected mid-refresh re-evaluate from here (dirty
+        // dots stay, banner off until real drift crosses the budget again).
         baselineFreeBytes = volumeFreeBytes()
         changedBytes = 0
         shownBytes = 0
+        diskChanged = false
+        bump()   // repaint the dots for any trailing dirty paths
     }
 
     private func refreshTotals() {

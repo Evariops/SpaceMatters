@@ -253,6 +253,36 @@ import Foundation
         #expect(c.root!.aggPhysical.load(ordering: .relaxed) > physBefore + 200_000)
     }
 
+    // Zero-size files (in the current metric) are noise for a space tool — macOS
+    // marker files like `.localized` must not surface as outline rows, while
+    // sibling files with real bytes do.
+    @Test func zeroByteFilesAreHiddenFromOutlineRows() async throws {
+        let root = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Data().write(to: root.appendingPathComponent("sibling/.localized"))
+        let c = ScanController()
+        c.scan(url: root)
+        await Self.waitForScan(c)
+
+        let sibling = try #require(Self.child(c.root!, "sibling"))
+        c.expanded.insert(c.root!)
+        c.expanded.insert(sibling)
+        // File listings load off the main actor: poll until the listing lands.
+        var files = c.filesIn(sibling)
+        let deadline = Date().addingTimeInterval(5)
+        while files.isEmpty && Date() < deadline {
+            await Task.yield()
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+            files = c.filesIn(sibling)
+        }
+        #expect(files.contains { $0.name == ".localized" })   // listed on disk…
+
+        let rows = c.visibleRows()
+        let siblingID = ObjectIdentifier(sibling)
+        #expect(rows.contains { $0.id == .file(siblingID, "s.bin") })
+        #expect(!rows.contains { $0.id == .file(siblingID, ".localized") }) // …but not shown
+    }
+
     @Test func deletingFileUpdatesAggregatesAndCount() async throws {
         let root = try Self.makeFixture()
         defer { try? FileManager.default.removeItem(at: root) }
