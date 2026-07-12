@@ -1276,18 +1276,16 @@ final class ScanController {
     /// Reconcile one directory whose *direct* contents changed (a precise
     /// FSEvents report): non-recursive re-stat off the main thread, then exact
     /// deltas propagated up the ancestor chain — milliseconds, no subtree walk.
-    /// A structural change (subdirectory appeared/disappeared) is handed to
-    /// `invalidate(subtree:)` for now (M2 makes it additive).
+    /// Subdirectories that appeared are attached and mini-scanned (only the new
+    /// content is read); ones that disappeared are subtracted and detached. A
+    /// rename lands as one disappearance + one appearance, possibly in two
+    /// different parents.
     @discardableResult
     func restatDirectory(_ node: FSNode) async -> Bool {
-        switch await restatDirectContents(of: node) {
-        case .applied: return true
-        case .refused: return false
-        case .structuralChange: return await invalidate(subtree: node)
-        }
+        await restatDirectContents(of: node) == .applied
     }
 
-    private enum RestatOutcome { case applied, refused, structuralChange }
+    private enum RestatOutcome { case applied, refused }
 
     private func restatDirectContents(of node: FSNode) async -> RestatOutcome {
         guard isHostScan, phase != .scanning, !drainingCancelledScan, !structuralOpActive,
@@ -1310,10 +1308,44 @@ final class ScanController {
         // nothing to apply here (and nothing to retry against).
         guard !snap.failed else { return .applied }
 
-        // Subdirectory set changed → structural work, not a file delta.
-        if snap.subdirNames != Set(node.children.map(\.name)) { return .structuralChange }
+        // Structural diff first (against the node *now*, post-suspension).
+        // Disappeared: subtract the subtree's aggregates and detach — the same
+        // brick as user deletion, so navigation state is lifted to a survivor.
+        // The File-types table can't be reconciled for content that no longer
+        // exists on disk (no per-node inventory, by design) — accepted drift,
+        // surfaced by the M4 marker.
+        let currentDirs = node.children
+        let currentNames = Set(currentDirs.map(\.name))
+        for child in currentDirs where !snap.subdirNames.contains(child.name) {
+            applyDirectoryRemoval(child)
+        }
+        // Appeared: attach fresh nodes and scan *only that new content*, all
+        // under one parallel sub-scanner (multi-seed). Their extensions merge
+        // exactly — nothing of it was ever booked before.
+        let appeared = snap.subdirNames.subtracting(currentNames).sorted()
+        if !appeared.isEmpty {
+            let prefix = path == "/" ? "/" : path + "/"
+            var seeds: [DirectoryScanner.Seed] = []
+            for name in appeared {
+                let child = FSNode(name: name, parent: node, isDirectory: true)
+                node.appendChild(child)
+                seeds.append(.init(path: prefix + name, node: child))
+            }
+            let sub = DirectoryScanner(
+                root: node, seeds: seeds, skipPaths: skip, exact: countingMode == .exact)
+            activeSubScan = sub
+            sub.start()
+            await Task.detached(priority: .userInitiated) { sub.waitUntilFinished() }.value
+            activeSubScan = nil
+            guard epoch == treeEpoch else { return .refused } // torn down mid-scan
+            dirCount += sub.directoryCount
+            if let ds = scanner as? DirectoryScanner {
+                ds.mergeExtensions(sub.snapshotRawExtensions())
+                extRows = ds.snapshotExtensions(metric: metric, limit: 250)
+            }
+        }
 
-        // Exact file deltas, computed against the node *now* (post-suspension).
+        // Exact file deltas.
         let dLogical = snap.filesLogical - node.directFilesLogical
         let dPhysical = snap.filesPhysical - node.directFilesPhysical
         let dCount = snap.fileCount - node.directFileCount

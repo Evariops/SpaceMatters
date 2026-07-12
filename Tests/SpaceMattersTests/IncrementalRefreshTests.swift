@@ -147,9 +147,82 @@ import Foundation
             == 4096 + 8192 + 65536)
     }
 
+    // MARK: Structural diffs (M2 — additive attach/detach)
+
+    /// A new subdirectory (with nested content) is attached by mini-scanning
+    /// only the new content: existing children keep their identity, totals and
+    /// folder count reconcile exactly, and the brand-new extension shows up in
+    /// File-types (exact merge — nothing of it was booked before).
+    @Test func appearedSubdirectoryIsAttachedAdditively() async throws {
+        let root = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let c = await Self.scanned(root)
+        let beta = try #require(NavigationTests.child(c.root!, "beta"))
+        let alpha = try #require(NavigationTests.child(c.root!, "alpha"))
+        let rootLogBefore = c.root!.aggLogical.load(ordering: .relaxed)
+        let dirsBefore = c.dirCount
+        #expect(c.extRows.first { $0.name == ".zzz" } == nil)
+
+        let nest = root.appendingPathComponent("beta/fresh/nested")
+        try FileManager.default.createDirectory(at: nest, withIntermediateDirectories: true)
+        try Data(count: 32768).write(to: nest.appendingPathComponent("n.zzz"))
+        try Data(count: 4096).write(to: root.appendingPathComponent("beta/fresh/f.zzz"))
+
+        #expect(await c.restatDirectory(beta))
+
+        #expect(NavigationTests.child(c.root!, "beta") === beta)   // no rebuild
+        #expect(NavigationTests.child(c.root!, "alpha") === alpha)
+        let fresh = try #require(NavigationTests.child(beta, "fresh"))
+        #expect(fresh.aggLogical.load(ordering: .relaxed) == 32768 + 4096)
+        #expect(c.root!.aggLogical.load(ordering: .relaxed) == rootLogBefore + 32768 + 4096)
+        #expect(c.dirCount == dirsBefore + 2)                      // fresh + nested
+        #expect(c.extRows.first { $0.name == ".zzz" }?.count == 2)
+    }
+
+    /// A subdirectory deleted on disk is subtracted and detached — and any
+    /// navigation state pointing into it is lifted to the surviving parent.
+    @Test func disappearedSubdirectoryIsDetached() async throws {
+        let root = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let c = await Self.scanned(root)
+        let alpha = try #require(NavigationTests.child(c.root!, "alpha"))
+        let deep = try #require(NavigationTests.child(alpha, "deep"))
+        c.zoom(into: deep)
+        let rootLogBefore = c.root!.aggLogical.load(ordering: .relaxed)
+        let dirsBefore = c.dirCount
+
+        try FileManager.default.removeItem(at: root.appendingPathComponent("alpha/deep"))
+        #expect(await c.restatDirectory(alpha))
+
+        #expect(NavigationTests.child(alpha, "deep") == nil)
+        #expect(c.root!.aggLogical.load(ordering: .relaxed) == rootLogBefore - 8192)
+        #expect(c.dirCount == dirsBefore - 1)
+        #expect(c.zoomRoot === alpha)   // lifted out of the freed subtree
+        #expect(NavigationTests.child(c.root!, "alpha") === alpha)
+    }
+
+    /// A rename is one disappearance + one appearance under the same parent:
+    /// the totals are conserved, the new name carries the old content.
+    @Test func renameLandsAsDisappearPlusAppear() async throws {
+        let root = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let c = await Self.scanned(root)
+        let rootLogBefore = c.root!.aggLogical.load(ordering: .relaxed)
+
+        try FileManager.default.moveItem(
+            at: root.appendingPathComponent("beta"),
+            to: root.appendingPathComponent("gamma"))
+        #expect(await c.restatDirectory(c.root!))
+
+        #expect(NavigationTests.child(c.root!, "beta") == nil)
+        let gamma = try #require(NavigationTests.child(c.root!, "gamma"))
+        #expect(gamma.aggLogical.load(ordering: .relaxed) == 4096)
+        #expect(c.root!.aggLogical.load(ordering: .relaxed) == rootLogBefore)
+    }
+
     /// A change in a directory created *after* the scan maps to the nearest
-    /// existing ancestor; its re-stat discovers the appeared chain and the
-    /// totals converge (M1 routes structural diffs through the subtree pass).
+    /// existing ancestor; its re-stat discovers the appeared chain (a direct
+    /// child, by construction) and the mini-scan covers the rest of the depth.
     @Test func unknownDeepPathConvergesViaNearestAncestor() async throws {
         let root = try Self.makeFixture()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -167,8 +240,8 @@ import Foundation
 
         await c.refreshDirty()
         #expect(c.root!.aggLogical.load(ordering: .relaxed) == rootLogBefore + 16384)
-        let betaAfter = try #require(NavigationTests.child(c.root!, "beta"))
-        let new1 = try #require(NavigationTests.child(betaAfter, "new1"))
+        #expect(NavigationTests.child(c.root!, "beta") === beta) // additive, no rebuild
+        let new1 = try #require(NavigationTests.child(beta, "new1"))
         #expect(NavigationTests.child(new1, "new2") != nil)
     }
 
