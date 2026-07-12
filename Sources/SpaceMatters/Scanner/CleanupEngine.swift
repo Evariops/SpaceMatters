@@ -98,10 +98,14 @@ enum CleanupEngine {
         ]
     }
 
-    /// The catalog restricted to entries with at least one existing path.
-    static func detect(_ catalog: [Cleanable]) -> [Cleanable] {
+    /// The catalog restricted to entries with at least one path that passes the
+    /// same fence as `clean` (existing real directory, no symlinked root, still
+    /// inside `allowedRoot` once resolved). Deciding at detection time keeps the
+    /// UI honest: a relocated cache is never shown, sized through its link, and
+    /// then refused at cleaning time with gigabytes left on screen.
+    static func detect(_ catalog: [Cleanable], allowedRoot: String = NSHomeDirectory()) -> [Cleanable] {
         catalog.compactMap { item in
-            let existing = item.paths.filter { FileManager.default.fileExists(atPath: $0) }
+            let existing = item.paths.filter { passesFence($0, allowedRoot: allowedRoot) }
             guard !existing.isEmpty else { return nil }
             return Cleanable(id: item.id, name: item.name, category: item.category,
                              icon: item.icon, note: item.note, paths: existing)
@@ -129,7 +133,10 @@ enum CleanupEngine {
         for root in item.paths {
             var stack = [root]
             while let dir = stack.popLast() {
-                let fd = open(dir, O_RDONLY | O_DIRECTORY)
+                // O_NOFOLLOW: a symlinked root must not be measured through its
+                // target (detect refuses it; clean would too), and a directory
+                // swapped for a link between enumeration and open is not chased.
+                let fd = open(dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
                 guard fd >= 0 else { continue }
                 if dir == root { openedAny = true }
                 let prefix = dir + "/"
@@ -175,22 +182,31 @@ enum CleanupEngine {
     static func clean(_ item: Cleanable, allowedRoot: String = NSHomeDirectory()) -> CleanResult {
         var result = CleanResult()
         let fm = FileManager.default
-        let fence = allowedRoot.hasSuffix("/") ? allowedRoot : allowedRoot + "/"
 
         for root in item.paths {
-            guard root.hasPrefix(fence), root != fence, isRealDirectory(root),
-                  staysInsideFence(root, allowedRoot: allowedRoot) else {
+            guard passesFence(root, allowedRoot: allowedRoot) else {
                 result.refused += 1
                 continue
             }
-            guard let children = try? fm.contentsOfDirectory(atPath: root) else {
+            var rootStat = stat()
+            guard lstat(root, &rootStat) == 0,
+                  let children = try? fm.contentsOfDirectory(atPath: root) else {
                 result.failed += 1
                 continue
             }
             for child in children {
+                let childPath = root + "/" + child
+                // A volume mounted inside a cache is not the cache's data: skip
+                // it like the sizing walk does. Same family as fence refusals.
+                var st = stat()
+                if lstat(childPath, &st) == 0, (st.st_mode & S_IFMT) == S_IFDIR,
+                   st.st_dev != rootStat.st_dev {
+                    result.refused += 1
+                    continue
+                }
                 // removeItem on a symlink deletes the link, not its target.
                 do {
-                    try fm.removeItem(atPath: root + "/" + child)
+                    try fm.removeItem(atPath: childPath)
                     result.removed += 1
                 } catch {
                     result.failed += 1
@@ -198,6 +214,15 @@ enum CleanupEngine {
             }
         }
         return result
+    }
+
+    /// The full fence, shared by `detect` and `clean` so both always agree:
+    /// textual prefix (cheap, fail-closed), a real non-symlink directory, and a
+    /// fully-resolved form still strictly inside the resolved fence.
+    private static func passesFence(_ root: String, allowedRoot: String) -> Bool {
+        let fence = allowedRoot.hasSuffix("/") ? allowedRoot : allowedRoot + "/"
+        return root.hasPrefix(fence) && root != fence && isRealDirectory(root)
+            && staysInsideFence(root, allowedRoot: allowedRoot)
     }
 
     /// True only for a directory that is not itself a symlink (`lstat`, so the

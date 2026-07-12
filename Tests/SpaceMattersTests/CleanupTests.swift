@@ -241,8 +241,56 @@ import Foundation
             Self.cleanable([cache.path, ghost]),
             Cleanable(id: "ghost", name: "Ghost", category: "Test",
                       icon: "shippingbox", note: "", paths: [ghost]),
-        ])
+        ], allowedRoot: root.path)
         #expect(detected.count == 1)
         #expect(detected[0].paths == [cache.path])
+    }
+
+    /// A symlinked cache root is excluded at detection time — the row never
+    /// appears, instead of being sized through the link and refused at cleaning
+    /// time with gigabytes left on screen.
+    @Test func detectRefusesSymlinkedRoot() throws {
+        let (root, _) = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let outside = FileManager.default.temporaryDirectory
+            .appendingPathComponent("sm-detect-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: outside) }
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        let link = root.appendingPathComponent("linked-cache")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: outside)
+
+        let detected = CleanupEngine.detect([Self.cleanable([link.path])], allowedRoot: root.path)
+        #expect(detected.isEmpty)
+    }
+
+    /// detect applies the same resolved-fence rule as clean: a path that passes
+    /// the textual prefix but resolves outside the fence is never offered.
+    @Test func detectRefusesRelocatedIntermediateComponent() throws {
+        let fm = FileManager.default
+        let base = fm.temporaryDirectory.appendingPathComponent("sm-detect-fence-\(UUID().uuidString)")
+        let home = base.appendingPathComponent("home")
+        let external = base.appendingPathComponent("external/gradle")
+        try fm.createDirectory(at: home, withIntermediateDirectories: true)
+        try fm.createDirectory(at: external.appendingPathComponent("caches"), withIntermediateDirectories: true)
+        try fm.createSymbolicLink(at: home.appendingPathComponent(".gradle"), withDestinationURL: external)
+        defer { try? fm.removeItem(at: base) }
+
+        let target = home.appendingPathComponent(".gradle/caches").path
+        let detected = CleanupEngine.detect([Self.cleanable([target])], allowedRoot: home.path)
+        #expect(detected.isEmpty)
+    }
+
+    /// size never measures through a symlinked root — denied, consistently with
+    /// what detect and clean decide, even when called directly.
+    @Test func sizeIsDeniedOnSymlinkedRoot() throws {
+        let (root, _) = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let victim = root.appendingPathComponent("victim")
+        try FileManager.default.createDirectory(at: victim, withIntermediateDirectories: true)
+        try Data(count: 4096).write(to: victim.appendingPathComponent("keep.bin"))
+        let link = root.appendingPathComponent("linked-cache")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: victim)
+
+        #expect(CleanupEngine.size(of: Self.cleanable([link.path])) == .denied)
     }
 }

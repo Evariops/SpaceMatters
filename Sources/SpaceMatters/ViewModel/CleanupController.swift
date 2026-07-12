@@ -51,7 +51,7 @@ final class CleanupController {
         let id = loadID
         lastFreed = 0
         lastFailures = 0
-        let detected = CleanupEngine.detect(catalog)
+        let detected = CleanupEngine.detect(catalog, allowedRoot: allowedRoot)
         // Keep existing selections across a refresh; drop ones that vanished.
         let previouslySelected = Set(rows.filter(\.selected).map(\.id))
         rows = detected.map { Row(item: $0, selected: previouslySelected.contains($0.id)) }
