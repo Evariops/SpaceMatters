@@ -183,16 +183,14 @@ final class ScanController {
     /// now — the banner shows progress instead of vanishing, and incoming
     /// FSEvents keep marking paths without touching the (stale) banner state.
     private(set) var isRefreshing = false
-    /// Signed net change in the scanned volume's used space since the current
-    /// result finished — positive means it grew, negative means space was freed.
-    /// Shown in the banner and compared against `diskChangeBudget` to gate it.
+    /// Signed sum of the physical deltas the tree actually absorbed since the
+    /// scan (or the last consented refresh) — **exact**, not a statfs guess:
+    /// positive means the mapped folders grew. Shown live in the stats strip.
     private(set) var changedBytes: Int64 = 0
     /// Free bytes on the scanned volume when the result was captured — the
-    /// baseline `changedBytes` is measured against.
+    /// baseline the drift guard measures statfs movement against.
     @ObservationIgnored private var baselineFreeBytes: Int64?
-    /// Last `changedBytes` we repainted for, to avoid needless bumps each batch.
-    @ObservationIgnored private var shownBytes: Int64 = 0
-    /// Minimum absolute net swing before the "disk changed" banner appears.
+    /// Minimum unexplained used-space swing before the drift banner appears.
     private let diskChangeBudget: Int64 = 128 * 1024 * 1024 // 128 MB
     /// When the current result finished scanning (for "scanned N ago", J5.2).
     private(set) var scanDate: Date?
@@ -235,6 +233,47 @@ final class ScanController {
     // Reconciler instrumentation (tests assert on these; cheap to keep).
     @ObservationIgnored private(set) var autoRestatCount = 0
     @ObservationIgnored private(set) var autoSubtreeScanCount = 0
+
+    // SPEC-11 M4 — exact File-types diffs and the honest drift guard.
+
+    /// Per-directory extension tables from past re-stats: the "old" side of an
+    /// exact File-types diff. Keyed by path (survives node rebuilds), bounded
+    /// FIFO. A directory is exact from its second delta on; the first one (no
+    /// stored table, no complete `fileCache` listing) marks `typesDrifted`.
+    @ObservationIgnored private var extSnapshots: [String: [ExtKey: ExtStat]] = [:]
+    @ObservationIgnored private var extSnapshotOrder: [String] = []
+    private static let extSnapshotCap = 4096
+
+    /// The File-types panel absorbed a delta without its old per-extension
+    /// table — it drifts by that delta until the next full Rescan.
+    private(set) var typesDrifted = false
+    /// Exact counting mode: a reconciled directory contained hardlinked files.
+    /// Their dedup can't be re-verified incrementally (the scan's inode set is
+    /// gone) — sizes were attributed locally; Rescan re-syncs.
+    private(set) var exactDrifted = false
+
+    /// Physical bytes the tree has absorbed since the statfs baseline — the
+    /// *explained* side of the drift guard, and the exact `changedBytes`.
+    @ObservationIgnored private var appliedPhysicalDelta: Int64 = 0
+    /// Used-space movement statfs reports that no applied delta explains —
+    /// something changed that the watcher didn't see (another user, an
+    /// unscannable area…). Above the budget, the banner proposes a Refresh.
+    private(set) var driftBytes: Int64 = 0
+
+    /// Record a physical-bytes change the tree now reflects (either sign).
+    private func noteAppliedPhysical(_ delta: Int64) {
+        appliedPhysicalDelta += delta
+        changedBytes = appliedPhysicalDelta
+    }
+
+    /// Restart the drift accounting from the disk's current state (scan end,
+    /// consented refresh) — everything before it is considered reconciled.
+    private func rebaselineDrift() {
+        baselineFreeBytes = volumeFreeBytes()
+        appliedPhysicalDelta = 0
+        changedBytes = 0
+        driftBytes = 0
+    }
 
     @ObservationIgnored private var reconcileRunning = false
     @ObservationIgnored private var reconcileAgain = false
@@ -908,6 +947,7 @@ final class ScanController {
             a.fileCount.wrappingAdd(-count, ordering: .relaxed)
             p = a.parent
         }
+        noteAppliedPhysical(-physical)
 
         // Lift any navigation state that points into the subtree we're about to
         // free onto the surviving parent, and drop expanded/reveal references to
@@ -974,6 +1014,7 @@ final class ScanController {
             a.fileCount.wrappingAdd(-1, ordering: .relaxed)
             p = a.parent
         }
+        noteAppliedPhysical(-file.physical)
         // A6 (single file): drop this file's bytes from the File-types table too.
         var d = ExtStat()
         d.add(logical: file.logical, physical: file.physical)
@@ -1088,7 +1129,14 @@ final class ScanController {
         if reconcileExt, let ds = scanner as? DirectoryScanner {
             ds.subtractExtensions(oldExt)
             ds.mergeExtensions(sub.snapshotRawExtensions())
+        } else if !reconcileExt {
+            typesDrifted = true // the accepted PR #26 bound, now surfaced
         }
+        // The subtree's booking was re-derived: per-directory snapshots under
+        // it no longer describe the table's "old" — drop them. And the tree now
+        // reflects this subtree's new physical total (drift guard honesty).
+        pruneExtSnapshots(under: path)
+        noteAppliedPhysical(node.aggPhysical.load(ordering: .relaxed) - oldP)
 
         // Folder count delta (A7 stays honest across the swap).
         dirCount += (Self.subtreeDirCount(node) - oldDirs)
@@ -1131,9 +1179,14 @@ final class ScanController {
         pendingConsentPaths.removeAll()
         pendingConsentFiles = 0
         lastAutoSubtreeScan.removeAll()
+        extSnapshots.removeAll()
+        extSnapshotOrder.removeAll()
+        typesDrifted = false
+        exactDrifted = false
         diskChanged = false
         changedBytes = 0
-        shownBytes = 0
+        driftBytes = 0
+        appliedPhysicalDelta = 0
         baselineFreeBytes = nil
     }
 
@@ -1168,20 +1221,28 @@ final class ScanController {
         // bump here would repaint the treemap over half-reconciled aggregates
         // (the transient wrong totals seen while a big subtree re-scans).
         guard !isRefreshing else { return }
-        if let base = baselineFreeBytes, let free = volumeFreeBytes() {
-            changedBytes = base - free
-        }
+        refreshDriftBytes()
         if touched { bump() } // repaint the dirty dots
         updateBannerState()
         // Live by default (SPEC-11): apply what just changed, silently.
         scheduleReconcile()
     }
 
+    /// Coherence guard: used-space movement statfs reports minus what the tree
+    /// already absorbed. What's left is change the watcher didn't see.
+    private func refreshDriftBytes() {
+        guard let base = baselineFreeBytes, let free = volumeFreeBytes() else { return }
+        driftBytes = (base - free) - appliedPhysicalDelta
+    }
+
     /// Post-M3 the banner is a *last resort*: it appears only when the watched
-    /// root is gone, or when an auto catch-up is big enough to need consent.
-    /// Ordinary changes reconcile silently — the map just breathes.
+    /// root is gone, an auto catch-up is big enough to need consent, or the
+    /// drift guard trips (used space moved beyond the budget with nothing
+    /// pending to explain it). Ordinary changes reconcile silently — the map
+    /// just breathes.
     private func updateBannerState() {
-        let show = watchRootChanged || !pendingConsentPaths.isEmpty
+        let unexplained = dirtyNeeds.isEmpty && abs(driftBytes) >= diskChangeBudget
+        let show = watchRootChanged || !pendingConsentPaths.isEmpty || unexplained
         if show != diskChanged {
             diskChanged = show
             bump()
@@ -1358,12 +1419,9 @@ final class ScanController {
             }
         }
 
-        // Applied deltas move the honest baseline: re-measure so the statfs
-        // budget keeps gating drift, not what we just reconciled.
+        // Re-measure the drift with everything just applied accounted for.
         if !plan.restats.isEmpty || !plan.subtrees.isEmpty {
-            baselineFreeBytes = volumeFreeBytes()
-            changedBytes = 0
-            shownBytes = 0
+            refreshDriftBytes()
         }
 
         pendingConsentPaths = Set(plan.consent)
@@ -1385,8 +1443,8 @@ final class ScanController {
         pendingConsentPaths.removeAll()
         pendingConsentFiles = 0
         guard !dirtyPaths.isEmpty else {
-            diskChanged = false; changedBytes = 0; shownBytes = 0
-            baselineFreeBytes = volumeFreeBytes()
+            diskChanged = false
+            rebaselineDrift()
             return
         }
         // Shortest-first so subsuming subtree ancestors are seen before children.
@@ -1426,9 +1484,7 @@ final class ScanController {
         // Re-baseline the budget so the banner measures drift from *this*
         // refresh; events collected mid-refresh re-evaluate from here (dirty
         // dots stay, banner off until real drift crosses the budget again).
-        baselineFreeBytes = volumeFreeBytes()
-        changedBytes = 0
-        shownBytes = 0
+        rebaselineDrift()
         diskChanged = false
         bump()   // repaint the dots for any trailing dirty paths
         // Trailing events collected mid-refresh: hand them to the reconciler
@@ -1456,6 +1512,10 @@ final class ScanController {
         /// without extra I/O) and feeds the File-types diff (M4).
         var items: [FileItem] = []
         var ext: [ExtKey: ExtStat] = [:]
+        /// Exact mode only: a direct file has `linkCount > 1`. Its bytes were
+        /// attributed locally (full size) — the scan's dedup can't be replayed —
+        /// so the node's counts may drift until Rescan (SPEC-11 §3.3, acté).
+        var sawHardlinks = false
         /// `open()` failed: the directory vanished (its parent's re-stat handles
         /// the removal) or turned unreadable — nothing to apply either way.
         var failed = false
@@ -1466,7 +1526,7 @@ final class ScanController {
     /// foreign mount points are not counted as children, or the diff would keep
     /// "discovering" subtrees the scan deliberately excluded (Data firmlink…).
     nonisolated private static func snapshotDirectory(
-        path: String, skipPaths: Set<String>, seedPaths: Set<String>
+        path: String, skipPaths: Set<String>, seedPaths: Set<String>, hardlinkAware: Bool
     ) -> DirSnapshot {
         var snap = DirSnapshot()
         let fd = open(path, O_RDONLY | O_DIRECTORY)
@@ -1476,7 +1536,7 @@ final class ScanController {
         let buf = UnsafeMutableRawPointer.allocate(byteCount: bufSize, alignment: 16)
         defer { buf.deallocate() }
         let prefix = path == "/" ? "/" : path + "/"
-        enumerateDirectory(fd: fd, buffer: buf, bufferSize: bufSize) { entry in
+        enumerateDirectory(fd: fd, buffer: buf, bufferSize: bufSize, hardlinkAware: hardlinkAware) { entry in
             let name = String(
                 decoding: UnsafeRawBufferPointer(start: entry.name, count: entry.nameLength),
                 as: UTF8.self)
@@ -1489,6 +1549,7 @@ final class ScanController {
                 snap.filesLogical += entry.logicalSize
                 snap.filesPhysical += entry.physicalSize
                 snap.fileCount += 1
+                if entry.linkCount > 1 { snap.sawHardlinks = true }
                 snap.items.append(FileItem(name: name, logical: entry.logicalSize, physical: entry.physicalSize))
                 let key = ExtKey(name: entry.name, length: entry.nameLength)
                 snap.ext[key, default: ExtStat()].add(logical: entry.logicalSize, physical: entry.physicalSize)
@@ -1531,23 +1592,30 @@ final class ScanController {
 
         let seedPaths = Set(nodePaths.values)
         let skip = DirectoryScanner.recommendedSkipPaths(seedPaths: Array(seedPaths))
+        let exact = countingMode == .exact
         let snap = await Task.detached(priority: .userInitiated) {
-            Self.snapshotDirectory(path: path, skipPaths: skip, seedPaths: seedPaths)
+            Self.snapshotDirectory(path: path, skipPaths: skip, seedPaths: seedPaths,
+                                   hardlinkAware: exact)
         }.value
         guard epoch == treeEpoch else { return .refused }
         // Vanished or unreadable: the parent's own event reconciles a removal;
         // nothing to apply here (and nothing to retry against).
         guard !snap.failed else { return .applied }
 
+        // The "old" side of the File-types diff must be captured before the
+        // structural pass (it clears `fileCache`) and before the file deltas
+        // (they move `directFileCount`, the listing's validity tag).
+        let oldExt = extSnapshots[path] ?? cachedExtTable(of: node)
+
         // Structural diff first (against the node *now*, post-suspension).
         // Disappeared: subtract the subtree's aggregates and detach — the same
         // brick as user deletion, so navigation state is lifted to a survivor.
         // The File-types table can't be reconciled for content that no longer
-        // exists on disk (no per-node inventory, by design) — accepted drift,
-        // surfaced by the M4 marker.
+        // exists on disk (no per-node inventory, by design) — marked drift.
         let currentDirs = node.children
         let currentNames = Set(currentDirs.map(\.name))
         for child in currentDirs where !snap.subdirNames.contains(child.name) {
+            if child.fileCount.load(ordering: .relaxed) > 0 { typesDrifted = true }
             applyDirectoryRemoval(child)
         }
         // Appeared: attach fresh nodes and scan *only that new content*, all
@@ -1570,6 +1638,9 @@ final class ScanController {
             activeSubScan = nil
             guard epoch == treeEpoch else { return .refused } // torn down mid-scan
             dirCount += sub.directoryCount
+            var addedPhysical: Int64 = 0
+            for seed in seeds { addedPhysical += seed.node.aggPhysical.load(ordering: .relaxed) }
+            noteAppliedPhysical(addedPhysical)
             if let ds = scanner as? DirectoryScanner {
                 ds.mergeExtensions(sub.snapshotRawExtensions())
                 extRows = ds.snapshotExtensions(metric: metric, limit: 250)
@@ -1589,9 +1660,25 @@ final class ScanController {
                 a.fileCount.wrappingAdd(dCount, ordering: .relaxed)
                 n = a.parent
             }
+            noteAppliedPhysical(dPhysical)
             sortCache.removeAll() // sibling order may have changed
         }
         if node.dominantExt != snap.dominantExt { node.updateDominantExt(snap.dominantExt) }
+
+        // File-types: exact diff when we hold this directory's old table
+        // (stored by a previous re-stat, or derivable from a complete cached
+        // listing); otherwise leave the panel untouched and mark the drift.
+        if let oldExt {
+            if oldExt != snap.ext, let ds = scanner as? DirectoryScanner {
+                ds.subtractExtensions(oldExt)
+                ds.mergeExtensions(snap.ext)
+                extRows = ds.snapshotExtensions(metric: metric, limit: 250)
+            }
+        } else if dLogical != 0 || dPhysical != 0 || dCount != 0 {
+            typesDrifted = true
+        }
+        storeExtSnapshot(snap.ext, for: path)
+        if exact, snap.sawHardlinks { exactDrifted = true }
 
         // The snapshot *is* the fresh listing — the outline follows for free.
         var items = snap.items
@@ -1605,6 +1692,40 @@ final class ScanController {
         refreshTotals()
         bump()
         return .applied
+    }
+
+    /// Complete listing from `fileCache` → per-extension table, or nil when the
+    /// cache is missing, stale, or capped (a capped one would under-subtract).
+    private func cachedExtTable(of node: FSNode) -> [ExtKey: ExtStat]? {
+        guard let cached = fileCache[ObjectIdentifier(node)],
+              cached.count == node.directFileCount,
+              cached.items.count == Int(cached.count) else { return nil }
+        var table: [ExtKey: ExtStat] = [:]
+        for item in cached.items {
+            table[ExtKey(fileName: item.name), default: ExtStat()]
+                .add(logical: item.logical, physical: item.physical)
+        }
+        return table
+    }
+
+    private func storeExtSnapshot(_ table: [ExtKey: ExtStat], for path: String) {
+        if extSnapshots.updateValue(table, forKey: path) == nil {
+            extSnapshotOrder.append(path)
+            if extSnapshotOrder.count > Self.extSnapshotCap {
+                extSnapshots[extSnapshotOrder.removeFirst()] = nil
+            }
+        }
+    }
+
+    /// Drop stored tables under a re-scanned subtree — the global table was
+    /// re-derived for that area, so the old snapshots no longer describe what
+    /// it booked and a later diff would subtract the wrong "old".
+    private func pruneExtSnapshots(under path: String) {
+        let prefix = path == "/" ? "/" : path + "/"
+        let doomed = extSnapshots.keys.filter { $0 == path || $0.hasPrefix(prefix) }
+        guard !doomed.isEmpty else { return }
+        for key in doomed { extSnapshots[key] = nil }
+        extSnapshotOrder.removeAll { extSnapshots[$0] == nil }
     }
 
     private func refreshTotals() {
@@ -1733,9 +1854,7 @@ final class ScanController {
                 startWatching() // begin watching the disk for changes (SPEC-04)
                 // Capture the budget baseline *after* startWatching — it resets
                 // watch state (including the baseline) on entry (issue #14).
-                baselineFreeBytes = volumeFreeBytes()
-                changedBytes = 0
-                shownBytes = 0
+                rebaselineDrift()
             }
             filesPerSecond = 0
             stopTimer()

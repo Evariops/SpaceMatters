@@ -78,7 +78,7 @@ struct ExtKey: Hashable {
 }
 
 /// Aggregated statistics for one extension.
-struct ExtStat {
+struct ExtStat: Equatable {
     var logical: Int64 = 0
     var physical: Int64 = 0
     var count: Int64 = 0

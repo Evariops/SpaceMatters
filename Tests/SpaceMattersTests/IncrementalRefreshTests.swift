@@ -363,6 +363,92 @@ import Foundation
         #expect(alpha.aggLogical.load(ordering: .relaxed) == 4096 + 8192 + 65536)
     }
 
+    // MARK: File-types & drift accounting (M4)
+
+    /// Without an old per-extension table the first delta marks the drift and
+    /// leaves the panel alone; the re-stat stores the directory's table, so the
+    /// *second* delta diffs exactly — and heals the first one's gap in passing.
+    @Test func fileTypesDiffExactlyFromSecondDeltaOn() async throws {
+        let root = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let c = await Self.scanned(root)
+        let beta = try #require(NavigationTests.child(c.root!, "beta"))
+        #expect(!c.typesDrifted)
+
+        // First delta: no stored table, no cached listing → drift, no panel touch.
+        try Data(count: 4096).write(to: root.appendingPathComponent("beta/one.png"))
+        #expect(await c.restatDirectory(beta))
+        #expect(c.typesDrifted)
+        #expect(c.extRows.first { $0.name == ".png" } == nil)
+
+        // Second delta: diffs against the stored table → exact, including the
+        // .png the first pass couldn't book.
+        try Data(count: 4096).write(to: root.appendingPathComponent("beta/two.png"))
+        #expect(await c.restatDirectory(beta))
+        #expect(c.extRows.first { $0.name == ".png" }?.count == 2)
+        #expect(c.extRows.first { $0.name == ".dat" }?.count == 3) // untouched
+    }
+
+    /// When the outline already holds the directory's complete listing, even
+    /// the first delta diffs exactly — no drift at all.
+    @Test func fileTypesExactWhenListingWasCached() async throws {
+        let root = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let c = await Self.scanned(root)
+        let beta = try #require(NavigationTests.child(c.root!, "beta"))
+
+        _ = c.filesIn(beta) // kicks the async listing
+        await Self.waitUntil { !c.filesIn(beta).isEmpty }
+        #expect(!c.filesIn(beta).isEmpty)
+
+        try Data(count: 4096).write(to: root.appendingPathComponent("beta/first.png"))
+        #expect(await c.restatDirectory(beta))
+        #expect(c.extRows.first { $0.name == ".png" }?.count == 1)
+        #expect(!c.typesDrifted)
+    }
+
+    /// `changedBytes` is the exact sum of applied physical deltas — and the
+    /// consented refresh restarts the accounting.
+    @Test func changedBytesTracksAppliedDeltasExactly() async throws {
+        let root = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let c = await Self.scanned(root)
+        let beta = try #require(NavigationTests.child(c.root!, "beta"))
+        #expect(c.changedBytes == 0)
+        let physBefore = beta.aggPhysical.load(ordering: .relaxed)
+
+        try Data(count: 262_144).write(to: root.appendingPathComponent("beta/blob.bin"))
+        #expect(await c.restatDirectory(beta))
+        let applied = beta.aggPhysical.load(ordering: .relaxed) - physBefore
+        #expect(applied >= 262_144)
+        #expect(c.changedBytes == applied)
+
+        try FileManager.default.removeItem(at: root.appendingPathComponent("beta/blob.bin"))
+        #expect(await c.restatDirectory(beta))
+        #expect(c.changedBytes == 0) // grew then shrank — net zero, exactly
+
+        await c.refreshDirty()
+        #expect(c.changedBytes == 0)
+    }
+
+    /// Exact counting mode: a reconciled directory holding hardlinked files
+    /// raises the dedup-drift marker (their bytes were attributed locally).
+    @Test func exactModeMarksHardlinkDrift() async throws {
+        let root = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let c = await Self.scanned(root)
+        c.countingMode = .exact       // triggers a rescan with dedup semantics
+        await NavigationTests.waitForScan(c)
+        let beta = try #require(NavigationTests.child(c.root!, "beta"))
+        #expect(!c.exactDrifted)
+
+        try FileManager.default.linkItem(
+            at: root.appendingPathComponent("beta/b.dat"),
+            to: root.appendingPathComponent("beta/b-link.dat"))
+        #expect(await c.restatDirectory(beta))
+        #expect(c.exactDrifted)
+    }
+
     // MARK: Planner (pure)
 
     /// Clustering policy on synthetic paths: a dense run coalesces to its own

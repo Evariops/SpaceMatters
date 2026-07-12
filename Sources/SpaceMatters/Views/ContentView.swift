@@ -141,7 +141,7 @@ private struct DiskChangedBanner: View {
                 ? "A big change needs a re-scan of ~\(files) files."
                 : "Big changes in \(consent) folders need a re-scan of ~\(files) files."
         }
-        return Self.message(for: controller.changedBytes)
+        return Self.message(for: controller.driftBytes)
     }
 
     var body: some View {
@@ -465,6 +465,19 @@ private struct StatsStrip: View {
                     TimelineView(.periodic(from: .now, by: 30)) { _ in
                         Stat(value: Self.ago(date), label: "scanned", theme: theme)
                     }
+                }
+                // SPEC-11: the map is live — this is the exact sum of the deltas
+                // it absorbed since the scan, not a statfs guess.
+                if controller.changedBytes != 0 {
+                    Stat(value: (controller.changedBytes > 0 ? "+" : "−")
+                            + Format.bytes(abs(controller.changedBytes)),
+                         label: "live", theme: theme, accent: true)
+                }
+                if controller.typesDrifted || controller.exactDrifted {
+                    Stat(value: "≈", label: "types", theme: theme)
+                        .help(controller.exactDrifted
+                            ? "Hardlinked files changed — exact dedup can't be re-verified incrementally. File types and counts may drift until the next Rescan."
+                            : "Some changes were applied without their old per-type breakdown. File types may drift until the next Rescan.")
                 }
             }
             if controller.errorCount > 0 {
