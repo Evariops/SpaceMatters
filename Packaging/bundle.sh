@@ -1,7 +1,8 @@
 #!/bin/bash
 # Build SpaceMatters and assemble a double-clickable SpaceMatters.app bundle.
+# Lives in Packaging/ but works from the repo root: the bundle is written there.
 set -euo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 CONFIG="${1:-release}"
 APP="SpaceMatters.app"
@@ -16,6 +17,23 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
 mkdir -p "$APP/Contents/Resources"
 cp "$BIN_PATH" "$APP/Contents/MacOS/$BIN_NAME"
+
+# Sparkle auto-update framework (SPEC-12). SwiftPM resolves the XCFramework;
+# the binary links @rpath/Sparkle.framework and carries an rpath pointing at
+# Contents/Frameworks (Package.swift linkerSettings).
+SPARKLE_SRC=".build/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework"
+[ -d "$SPARKLE_SRC" ] || { echo "error: Sparkle.framework not found at $SPARKLE_SRC (run swift build first)" >&2; exit 1; }
+echo "Embedding Sparkle.framework..."
+mkdir -p "$APP/Contents/Frameworks"
+cp -R "$SPARKLE_SRC" "$APP/Contents/Frameworks/"
+FRAMEWORK="$APP/Contents/Frameworks/Sparkle.framework"
+# Not sandboxed → Sparkle's XPC services are never used (they are opt-in via
+# SUEnable*Service plist keys we don't set); headers are build-time only.
+# Both the payloads and their top-level symlinks go, ~650 KB saved.
+rm -rf "$FRAMEWORK/Versions/B/XPCServices"    "$FRAMEWORK/XPCServices" \
+       "$FRAMEWORK/Versions/B/Headers"        "$FRAMEWORK/Headers" \
+       "$FRAMEWORK/Versions/B/PrivateHeaders" "$FRAMEWORK/PrivateHeaders" \
+       "$FRAMEWORK/Versions/B/Modules"        "$FRAMEWORK/Modules"
 
 # App icon (J1.2). Regenerate with ./Packaging/make-icon.sh if the look changes.
 ICON_KEY=""
@@ -53,6 +71,11 @@ ${ICON_KEY}
     <key>NSHighResolutionCapable</key> <true/>
     <key>NSPrincipalClass</key>        <string>NSApplication</string>
     <key>LSApplicationCategoryType</key> <string>public.app-category.utilities</string>
+    <!-- Sparkle auto-update (SPEC-12). CFBundleVersion above (commit count,
+         monotonic) is what Sparkle compares as sparkle:version. The updater
+         never checks before the user accepts Sparkle's second-launch prompt. -->
+    <key>SUFeedURL</key>               <string>https://github.com/Evariops/SpaceMatters/releases/latest/download/appcast.xml</string>
+    <key>SUPublicEDKey</key>           <string>giAqx0Y+CIUuSvv4DDNfJnC/wF16Y71qi03XF3LZx30=</string>
     <!-- TCC usage descriptions (J1.4): shown when macOS prompts for access. -->
     <key>NSDesktopFolderUsageDescription</key>     <string>SpaceMatters measures the size of your Desktop to show what's using disk space.</string>
     <key>NSDocumentsFolderUsageDescription</key>   <string>SpaceMatters measures the size of your Documents to show what's using disk space.</string>
@@ -68,18 +91,31 @@ PLIST
 # Set CODESIGN_ID to a stable self-signed identity to keep those grants:
 #   1) Keychain Access ▸ Certificate Assistant ▸ Create a Certificate…
 #      name "SpaceMatters", type "Code Signing", self-signed.
-#   2) export CODESIGN_ID="SpaceMatters"   (then re-run ./bundle.sh)
+#   2) export CODESIGN_ID="SpaceMatters"   (then re-run ./Packaging/bundle.sh)
 SIGN_ID="${CODESIGN_ID:--}"
-# Prefer a hardened runtime; fall back without it (needed for a debuggable
-# ad-hoc build). Only a *total* signing failure is fatal — don't mask it.
-if codesign --force --deep --options runtime --sign "$SIGN_ID" "$APP" >/dev/null 2>&1; then
-    :
-elif codesign --force --deep --sign "$SIGN_ID" "$APP" >/dev/null 2>&1; then
-    echo "note: signed without hardened runtime"
-else
-    echo "error: codesign failed for identity '${SIGN_ID}'" >&2
-    exit 1
-fi
+# Hardened runtime requires a real Team ID: without one (ad-hoc or self-signed)
+# library validation rejects the embedded Sparkle.framework and dyld kills the
+# app at launch ("different Team IDs" — SPEC-12 §6.1). Developer ID also gets a
+# secure timestamp, which notarization requires.
+RUNTIME_FLAGS=""
+case "$SIGN_ID" in
+    "Developer ID Application:"*) RUNTIME_FLAGS="--options runtime --timestamp" ;;
+esac
+# Nested code first, outer bundle last — Apple deprecates --deep, and the
+# framework's helpers (Autoupdate, Updater.app) must carry their own signature.
+echo "Signing (identity: ${SIGN_ID})..."
+# shellcheck disable=SC2086  # RUNTIME_FLAGS is deliberately word-split
+for TARGET in \
+    "$FRAMEWORK/Versions/B/Autoupdate" \
+    "$FRAMEWORK/Versions/B/Updater.app" \
+    "$FRAMEWORK" \
+    "$APP"; do
+    if ! codesign --force $RUNTIME_FLAGS --sign "$SIGN_ID" "$TARGET" >/dev/null 2>&1; then
+        echo "error: codesign failed for identity '${SIGN_ID}' on ${TARGET}" >&2
+        exit 1
+    fi
+done
+codesign --verify --strict "$APP" || { echo "error: strict verification failed" >&2; exit 1; }
 
 echo "Done → $PWD/$APP  (signed with: ${SIGN_ID})"
 echo "Launch with: open $APP"

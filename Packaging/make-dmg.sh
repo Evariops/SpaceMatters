@@ -4,7 +4,7 @@
 # The window layout ships as a committed asset (Packaging/dmg.DS_Store, built
 # by dmg-assets.swift), so packaging is two headless hdiutil calls —
 # no Finder scripting, no mounting, deterministic.
-# Shared by release.sh (local) and .github/workflows/release.yml (CI).
+# Shared by Packaging/release.sh (local) and .github/workflows/release.yml (CI).
 # Usage: Packaging/make-dmg.sh <App.app> <output.dmg>
 set -euo pipefail
 
