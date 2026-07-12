@@ -10,6 +10,9 @@ struct CleanupResultView: View {
     @Environment(\.theme) private var theme
 
     @State private var confirmClean = false
+    /// Tools found running for the selected targets when Clean was pressed —
+    /// named in the confirmation so "my build failed" is never a surprise.
+    @State private var activeWarnings: [String: Set<String>] = [:]
 
     var body: some View {
         VStack(spacing: 0) {
@@ -46,8 +49,14 @@ struct CleanupResultView: View {
 
     private var confirmMessage: String {
         let names = controller.selectedRows.map(\.item.name).joined(separator: ", ")
-        return "\(names) — about \(Format.bytes(controller.totalSelected)) will be reclaimed. "
+        var message = "\(names) — about \(Format.bytes(controller.totalSelected)) will be reclaimed. "
             + "Caches are re-downloaded or rebuilt on demand; emptying the Trash is permanent."
+        let tools = activeWarnings.values.reduce(into: Set<String>()) { $0.formUnion($1) }
+        if !tools.isEmpty {
+            message += "\n\n⚠️ Running right now: \(tools.sorted().joined(separator: ", ")) — "
+                + "their in-progress builds or installs may fail."
+        }
+        return message
     }
 
     // MARK: Toolbar
@@ -208,7 +217,11 @@ struct CleanupResultView: View {
                     .font(.system(size: 11)).foregroundStyle(theme.textSecondary)
             }
             Spacer()
-            Button { confirmClean = true } label: {
+            Button {
+                activeWarnings = ToolActivity.activeTools(
+                    for: Set(controller.selectedRows.map(\.id)))
+                confirmClean = true
+            } label: {
                 Text(controller.totalSelected > 0
                      ? "Clean \(Format.bytes(controller.totalSelected))"
                      : "Clean")
