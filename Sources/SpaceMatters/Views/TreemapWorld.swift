@@ -147,6 +147,12 @@ final class TreemapWorld {
         var unitRects: [CGRect] = []
         /// Version this entry was last validated against (ε check).
         var stamp: UInt64
+        /// Snapshot at *decision* time: weight shares and the node's rect aspect.
+        /// Drift is measured against these — not the last revalidation — so many
+        /// small steps can't walk the tiling arbitrarily far from the shape it
+        /// was decided for (the cumulative-drift source of sliver tiles).
+        var decisionShares: [Double] = []
+        var decisionAspect: CGFloat = 1
 
         init(items: [TreemapLayout.Item], weights: [Double], stamp: UInt64) {
             self.items = items
@@ -357,31 +363,35 @@ final class TreemapWorld {
         return entry
     }
 
-    /// The version moved under this entry: rebuild its items and compare. Same
-    /// children with weights within ε → keep the discrete decisions, re-flow the
-    /// continuous geometry only (bit-stable structure, exact areas). Otherwise
-    /// re-decide this node alone — a local move, animated by the caller's morph.
+    /// The version moved under this entry: rebuild its items and compare against
+    /// the *decision-time* snapshot. Same children, shares within ε of the decided
+    /// shares, node aspect near the decided aspect, and a placement that still
+    /// looks good → keep the discrete decisions and re-flow the continuous
+    /// geometry only (bit-stable structure, exact areas). Otherwise re-decide
+    /// this node alone — a local move, animated by the caller's morph.
     private func revalidate(_ entry: Entry, node: FSNode, rect: CGRect) {
         let built = TreemapLayout.buildItems(node: node, depth: 1, metric: metric, files: nil)
         defer { entry.stamp = version }
         let sameSet = built.items.count == entry.items.count && zip(built.items, entry.items).allSatisfy {
             $0.node === $1.node && $0.isFileBlock == $1.isFileBlock
         }
-        if sameSet {
+        if sameSet, entry.decisionShares.count == built.weights.count {
             let newTotal = built.weights.reduce(0, +)
-            let oldTotal = entry.weights.reduce(0, +)
-            if newTotal > 0, oldTotal > 0 {
+            if newTotal > 0 {
                 var maxDrift = 0.0
                 for i in built.weights.indices {
-                    let drift = abs(built.weights[i] / newTotal - entry.weights[i] / oldTotal)
+                    let drift = abs(built.weights[i] / newTotal - entry.decisionShares[i])
                     if drift > maxDrift { maxDrift = drift }
                 }
-                if maxDrift <= Self.epsilon {
-                    // Continuous-only refresh: same rows, exact new areas.
+                let aspect = rect.height > 0 ? rect.width / rect.height : 1
+                let aspectDrift = aspect / max(entry.decisionAspect, .leastNormalMagnitude)
+                if maxDrift <= Self.epsilon, aspectDrift > 0.8, aspectDrift < 1.25 {
+                    // Continuous-only refresh: same rows, exact new areas — kept
+                    // only while the result still reads as a squarified map.
                     entry.items = built.items
                     entry.weights = built.weights
                     place(entry, rect: rect)
-                    return
+                    if worstTileAspect(entry, rect: rect) <= Self.aspectQualityLimit { return }
                 }
             }
         }
@@ -390,13 +400,31 @@ final class TreemapWorld {
         decide(entry, rect: rect)
     }
 
-    /// Decide rows at this node's *world aspect* (scale-invariant) and derive the
-    /// parent-relative unit rects.
+    /// Decide rows at this node's *world aspect* (scale-invariant), derive the
+    /// parent-relative unit rects, and snapshot the decision context (ε baseline).
     private func decide(_ entry: Entry, rect: CGRect) {
         let decided = TreemapLayout.decideRows(entry.weights, rect: CGRect(origin: .zero, size: rect.size))
         entry.breaks = decided.breaks
         entry.orientations = decided.orientations
+        let total = entry.weights.reduce(0, +)
+        entry.decisionShares = total > 0 ? entry.weights.map { $0 / total } : []
+        entry.decisionAspect = rect.height > 0 ? rect.width / rect.height : 1
         place(entry, rect: rect)
+    }
+
+    /// Sliver guard: worst width/height ratio the unit rects produce at this
+    /// node's aspect. Above `aspectQualityLimit` the kept decisions are stale
+    /// enough to hurt (long thin tiles — ugly and barely clickable): re-decide.
+    static let aspectQualityLimit: CGFloat = 5
+    private func worstTileAspect(_ entry: Entry, rect: CGRect) -> CGFloat {
+        var worst: CGFloat = 1
+        for u in entry.unitRects {
+            let w = u.width * rect.width
+            let h = u.height * rect.height
+            guard w > 0, h > 0 else { continue }
+            worst = max(worst, max(w / h, h / w))
+        }
+        return worst
     }
 
     private func place(_ entry: Entry, rect: CGRect) {

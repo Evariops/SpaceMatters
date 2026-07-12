@@ -147,6 +147,45 @@ import Foundation
         #expect(pending.tiles.contains { $0.isFileBlock })
     }
 
+    // Cumulative drift can't produce slivers: many small weight steps (each a
+    // few % — under ε per tick against the *last* baseline, which is exactly how
+    // stale decisions used to walk away) end up re-decided, keeping the worst
+    // tile aspect bounded by the quality guard.
+    @Test func cumulativeDriftKeepsTilesSquarish() {
+        let root = FSNode(name: "root", parent: nil)
+        var kids: [FSNode] = []
+        var sizes: [Int64] = [600, 500, 400, 300, 200, 100]
+        for (i, s) in sizes.enumerated() {
+            let k = FSNode(name: "k\(i)", parent: root)
+            k.finishScan(children: [], filesLogical: s, filesPhysical: s, fileCount: 1)
+            k.aggPhysical.store(s, ordering: .relaxed)
+            kids.append(k)
+        }
+        root.finishScan(children: kids, filesLogical: 0, filesPhysical: 0, fileCount: 0)
+        root.aggPhysical.store(sizes.reduce(0, +), ordering: .relaxed)
+
+        let world = TreemapWorld()
+        world.sync(root: root, metric: .physical, version: 1)
+        _ = build(world, root: root, scale: 1)
+
+        // 40 ticks: the biggest child triples gradually (~3 % of total per step,
+        // ranking preserved) — the shares walk far from the decided ones.
+        for step in 1...40 {
+            sizes[0] = 600 + Int64(step) * 30
+            kids[0].aggPhysical.store(sizes[0], ordering: .relaxed)
+            root.aggPhysical.store(sizes.reduce(0, +), ordering: .relaxed)
+            world.sync(root: root, metric: .physical, version: UInt64(1 + step))
+            let result = build(world, root: root, scale: 1)
+            var worst: CGFloat = 1
+            for tile in result.tiles where tile.node !== root {
+                guard tile.rect.width > 0, tile.rect.height > 0 else { continue }
+                worst = max(worst, max(tile.rect.width / tile.rect.height,
+                                       tile.rect.height / tile.rect.width))
+            }
+            #expect(worst <= TreemapWorld.aspectQualityLimit + 0.5, "worst aspect \(worst) at step \(step)")
+        }
+    }
+
     // focusNode derives the deepest folder containing the viewport.
     @Test func focusNodeFollowsTheCamera() {
         let (root, a, _) = makeTree()
