@@ -315,37 +315,20 @@ final class TreemapNSView: NSView, CALayerDelegate {
 
     private func setScale(_ scale: CGFloat) {
         metalLayer.contentsScale = scale
-        updateDrawableSize(pooled: false)
+        updateDrawableSize()
         presentTiles()
         overlayLayer.contentsScale = scale
         overlayLayer.setNeedsDisplay()
     }
 
-    /// Size the drawable. During a live resize the drawable is *pooled*: rounded up
-    /// to 256-px steps and cropped via `contentsRect`, so the CAMetalLayer's
-    /// IOSurface pool survives the drag instead of reallocating per frame
-    /// (SPEC-10 §3.6 — the profiled hitch source). At rest the size is exact.
-    private func updateDrawableSize(pooled: Bool) {
+    /// Size the drawable to the view exactly. (A pooled drawable + `contentsRect`
+    /// crop was tried per SPEC-10 §3.6 to avoid per-frame IOSurface reallocation
+    /// during a drag, but the crop mapping produced black bands — reverted; with
+    /// resize now being camera-only, the realloc is the only remaining cost.)
+    private func updateDrawableSize() {
         let scale = metalLayer.contentsScale
-        let target = CGSize(width: max(bounds.width * scale, 1), height: max(bounds.height * scale, 1))
-        if pooled {
-            let pw = (Int(target.width) + 255) & ~255
-            let ph = (Int(target.height) + 255) & ~255
-            let current = metalLayer.drawableSize
-            let w = max(CGFloat(pw), current.width)
-            let h = max(CGFloat(ph), current.height)
-            metalLayer.drawableSize = CGSize(width: w, height: h)
-            metalLayer.contentsRect = CGRect(x: 0, y: 0, width: target.width / w, height: target.height / h)
-        } else {
-            metalLayer.drawableSize = target
-            metalLayer.contentsRect = CGRect(x: 0, y: 0, width: 1, height: 1)
-        }
-    }
-
-    /// Pixel size actually displayed (≤ drawableSize when pooled).
-    private var contentPixelSize: CGSize {
-        let scale = metalLayer.contentsScale
-        return CGSize(width: bounds.width * scale, height: bounds.height * scale)
+        metalLayer.drawableSize = CGSize(width: max(bounds.width * scale, 1),
+                                         height: max(bounds.height * scale, 1))
     }
 
     // Synchronous presents (`presentsWithTransaction`) only while the window is
@@ -360,7 +343,6 @@ final class TreemapNSView: NSView, CALayerDelegate {
     override func viewDidEndLiveResize() {
         super.viewDidEndLiveResize()
         metalLayer.presentsWithTransaction = false
-        updateDrawableSize(pooled: false)
         // Aspect hysteresis: a drag that left the window/world aspects too far
         // apart re-bakes the world at the new aspect — the one global re-decide
         // allowed, and it morphs (SPEC-10 §3.1).
@@ -488,7 +470,7 @@ final class TreemapNSView: NSView, CALayerDelegate {
         super.setFrameSize(newSize)
         guard changed else { return }
         overlayLayer.frame = bounds
-        updateDrawableSize(pooled: inLiveResize)
+        updateDrawableSize()
         // This frame's present must stay atomic with the bounds change (no
         // band behind a split-divider drag); reverted below unless a window
         // live-resize keeps the synchronous path on.
@@ -713,8 +695,7 @@ final class TreemapNSView: NSView, CALayerDelegate {
                       pointsPerUnit: camera.scale(viewSize: bounds.size),
                       morph: morphT,
                       clearColor: backgroundComps,
-                      borderColor: borderComps,
-                      contentSize: contentPixelSize)
+                      borderColor: borderComps)
     }
 
     // MARK: Camera navigation (SPEC-10 M2 — the map)
@@ -762,10 +743,16 @@ final class TreemapNSView: NSView, CALayerDelegate {
             camera.rect = clampedViewport(camera.rect)
             fitMode = camera.rect == world.worldBounds
         } else {
-            // Mouse wheel: zoom toward the cursor (the Maps convention).
-            let p = topLeftPoint(event)
-            let factor = pow(1.1, event.scrollingDeltaY)
-            zoomCamera(by: factor, anchor: p)
+            // Mouse wheel: zoom toward the cursor (the Maps convention). Precise
+            // devices report pixel deltas (±tens per notch) where a classic wheel
+            // reports lines (±1–3): normalise to "steps" and bound the per-event
+            // factor so one notch is a smooth ×1.15, never a teleport.
+            guard event.scrollingDeltaY != 0 else { return }
+            let steps = event.hasPreciseScrollingDeltas
+                ? event.scrollingDeltaY / 12
+                : event.scrollingDeltaY
+            let factor = min(2.0, max(0.5, pow(1.15, steps)))
+            zoomCamera(by: factor, anchor: topLeftPoint(event))
         }
         cameraMoved()
     }

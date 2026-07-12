@@ -94,11 +94,13 @@ import Foundation
         let world = TreemapWorld()
         world.sync(root: root, metric: .physical, version: 1)
 
-        // Children project far below collapseSide → root renders as its children?
-        // No: the *root* is always expanded, its children aggregate.
+        // Children project far below collapseSide → the root (always expanded)
+        // renders its underlay + aggregated children, nothing deeper.
         let coarse = build(world, root: root, scale: 0.005)
-        #expect(coarse.tiles.count <= 3)
+        #expect(coarse.tiles.count <= 4)
         #expect(coarse.tiles.allSatisfy { $0.file == nil })
+        // The underlay comes first — children paint over it.
+        #expect(coarse.tiles.first?.node === root)
 
         // At scale 1 the children are hundreds of points wide → expanded (here
         // they're leaves, so they stay single tiles — but regions carry them).

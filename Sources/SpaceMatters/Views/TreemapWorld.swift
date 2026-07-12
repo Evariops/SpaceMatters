@@ -262,6 +262,13 @@ final class TreemapWorld {
             return
         }
 
+        // Underlay: the expanded node's own tile, painted *under* its children
+        // (painter's order — children come later in the list). Children culled
+        // below `cullSide` then show the folder's colour instead of punching a
+        // hole to the background — a folder of thousands of sub-pixel children
+        // used to read as a black rectangle.
+        result.tiles.append(Tile(rect: rect, node: node, depth: depth, isFileBlock: false, file: nil))
+
         for i in entry.items.indices {
             let item = entry.items[i]
             let u = entry.unitRects[i]
@@ -293,6 +300,8 @@ final class TreemapWorld {
                                into result: inout BuildResult) {
         let projMin = min(rect.width * scale.sx, rect.height * scale.sy)
         if projMin > lod.filesSide, let layout = fileLayout(for: node, files: files, pending: &result.pendingFiles) {
+            // Underlay (see `walk`): culled tiny files show the block, not a hole.
+            result.tiles.append(Tile(rect: rect, node: node, depth: depth, isFileBlock: true, file: nil))
             for i in layout.files.indices {
                 let u = layout.unitRects[i]
                 let r = CGRect(x: rect.minX + u.minX * rect.width,
