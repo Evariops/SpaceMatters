@@ -466,8 +466,8 @@ final class SunburstWorld {
             else { return nil }
             let f = entry.fractions[i]
             let span = a1 - a0
-            a1 = a0 + f.hi * span
-            a0 = a0 + f.lo * span
+            a1 = a0 + f.hi * span   // must read the old a0 — computed before a0 moves
+            a0 += f.lo * span
             depth += 1
         }
         return SunburstSpan(a0: a0, a1: a1, rInner: depth == 0 ? 0 : Self.ringInner(depth - 1))
