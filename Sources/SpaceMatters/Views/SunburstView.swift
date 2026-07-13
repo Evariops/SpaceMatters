@@ -180,7 +180,7 @@ final class SunburstNSView: NSView, CALayerDelegate {
     // Theme-derived colours for the overlay + Metal uniforms.
     private var backgroundCG = CGColor(gray: 0, alpha: 1)
     private var accentShadowCG = CGColor(gray: 0.3, alpha: 0.9)
-    private var panelCG = CGColor(gray: 0.1, alpha: 1)
+    private var holeCG = CGColor(gray: 0.05, alpha: 1)
     private var separatorCG = CGColor(gray: 1, alpha: 0.1)
     private var textPrimaryCG = CGColor(gray: 1, alpha: 1)
     private var textSecondaryCG = CGColor(gray: 0.7, alpha: 1)
@@ -360,14 +360,17 @@ final class SunburstNSView: NSView, CALayerDelegate {
     }
 
     private func rebuildThemeColors() {
-        backgroundCG = NSColor(theme.treemapBackground).cgColor
+        // The wheel floats on the app's panel colour (the treemap keeps its
+        // dedicated darker canvas — its tiles cover it entirely, the disc
+        // doesn't); the hole digs below it, on the window colour.
+        backgroundCG = NSColor(theme.panelBackground).cgColor
         accentShadowCG = NSColor(theme.accent).withAlphaComponent(0.9).cgColor
-        panelCG = NSColor(theme.panelBackground).cgColor
+        holeCG = NSColor(theme.windowBackground).cgColor
         separatorCG = NSColor(theme.separator).cgColor
         textPrimaryCG = NSColor(theme.textPrimary).cgColor
         textSecondaryCG = NSColor(theme.textSecondary).cgColor
         layer?.backgroundColor = backgroundCG
-        backgroundComps = srgbComps(theme.treemapBackground)
+        backgroundComps = srgbComps(theme.panelBackground)
         borderComps = srgbComps(theme.treemapBorder)
     }
 
@@ -872,13 +875,21 @@ final class SunburstNSView: NSView, CALayerDelegate {
             let c = CGPoint(x: center.x, y: size.height - center.y)
             let holeRect = CGRect(x: c.x - holePts, y: c.y - holePts,
                                   width: holePts * 2, height: holePts * 2)
-            ctx.setFillColor(panelCG)
+            ctx.setFillColor(holeCG)
             ctx.fillEllipse(in: holeRect)
             ctx.setStrokeColor(separatorCG)
             ctx.setLineWidth(1)
             ctx.strokeEllipse(in: holeRect.insetBy(dx: 0.5, dy: 0.5))
-            if holePts > 30, let rootNode = displayRoot {
-                drawCenterLabel(in: ctx, center: c, radius: holePts, node: rootNode)
+            if holePts > 30 {
+                // The hole is the wheel's readout: the selected subtree when one
+                // is active (dotMemory's retained-size centre), the root otherwise.
+                if let sel = selectedInWheel {
+                    drawCenterLabel(in: ctx, center: c, radius: holePts,
+                                    title: hoverPath(sel), bytes: sel.sizeOnDisk)
+                } else if let rootNode = displayRoot {
+                    drawCenterLabel(in: ctx, center: c, radius: holePts,
+                                    title: rootNode.name, bytes: rootNode.sizeOnDisk)
+                }
             }
         }
 
@@ -927,15 +938,25 @@ final class SunburstNSView: NSView, CALayerDelegate {
         }
     }
 
-    /// Name + total in the hole, scaled to its projected size (CoreText, drawn
+    /// Selection currently spotlit in the wheel: the node the centre reads out.
+    /// `nil` when nothing (or the root itself) is selected, or when the
+    /// selection lives outside the current wheel.
+    private var selectedInWheel: FSNode? {
+        guard let selection, let displayRoot, selection !== displayRoot,
+              world.worldSpan(of: selection, root: displayRoot) != nil else { return nil }
+        return selection
+    }
+
+    /// Title + size in the hole, scaled to its projected size (CoreText, drawn
     /// in the context's native y-up space).
-    private func drawCenterLabel(in ctx: CGContext, center: CGPoint, radius: CGFloat, node: FSNode) {
+    private func drawCenterLabel(in ctx: CGContext, center: CGPoint, radius: CGFloat,
+                                 title: String, bytes: Int64) {
         let maxWidth = radius * 1.6
         let sizeFont = NSFont.systemFont(ofSize: min(28, max(11, radius * 0.26)), weight: .semibold)
         let nameFont = NSFont.systemFont(ofSize: min(13, max(9, radius * 0.13)), weight: .medium)
-        let sizeLine = truncatedLine(Format.bytes(node.sizeOnDisk),
+        let sizeLine = truncatedLine(Format.bytes(bytes),
                                      font: sizeFont, color: textPrimaryCG, width: maxWidth)
-        let nameLine = truncatedLine(node.name, font: nameFont, color: textSecondaryCG, width: maxWidth)
+        let nameLine = truncatedLine(title, font: nameFont, color: textSecondaryCG, width: maxWidth)
         let sizeBounds = CTLineGetBoundsWithOptions(sizeLine, .useOpticalBounds)
         let nameBounds = CTLineGetBoundsWithOptions(nameLine, .useOpticalBounds)
         let gap = radius * 0.10
@@ -1077,7 +1098,9 @@ final class SunburstNSView: NSView, CALayerDelegate {
             switch hit {
             case .arc(let arc): controller?.reveal(arc.node)
             case .hole: if let displayRoot { controller?.reveal(displayRoot) }
-            case nil: break
+            // Clicking the emptiness around the disc resets the selection,
+            // exactly like clicking the centre.
+            case nil: if let displayRoot { controller?.reveal(displayRoot) }
             }
         }
     }

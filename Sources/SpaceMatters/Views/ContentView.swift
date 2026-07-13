@@ -236,7 +236,9 @@ private struct TreemapPane: View {
             case .sunburst: SunburstView(controller: controller)
             }
         }
-        .background(theme.treemapBackground)
+        // The treemap has its own darker canvas; the sunburst floats on the
+        // app's panel colour (same as the neighbouring panes).
+        .background(mapMode == .treemap ? theme.treemapBackground : theme.panelBackground)
     }
 }
 
