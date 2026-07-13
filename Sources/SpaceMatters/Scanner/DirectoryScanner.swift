@@ -171,8 +171,8 @@ final class DirectoryScanner: ScanBackend {
         extLock.unlock()
     }
 
-    /// Snapshot of the top `limit` extensions by `metric`, materialised as rows.
-    func snapshotExtensions(metric: SizeMetric, limit: Int) -> [ExtRow] {
+    /// Snapshot of the top `limit` extensions by on-disk size, materialised as rows.
+    func snapshotExtensions(limit: Int) -> [ExtRow] {
         extLock.lock()
         let copy = extStats
         extLock.unlock()
@@ -180,9 +180,7 @@ final class DirectoryScanner: ScanBackend {
         var rows = copy.map { key, stat in
             ExtRow(key: key, name: key.displayName, logical: stat.logical, physical: stat.physical, count: stat.count)
         }
-        rows.sort { a, b in
-            metric == .physical ? a.physical > b.physical : a.logical > b.logical
-        }
+        rows.sort { $0.physical > $1.physical }
         if rows.count > limit { rows.removeLast(rows.count - limit) }
         return rows
     }
@@ -298,6 +296,8 @@ final class DirectoryScanner: ScanBackend {
         var filesLogical: Int64 = 0
         var filesPhysical: Int64 = 0
         var fileCount: Int64 = 0
+        var sparseExcess: Int64 = 0
+        var compressedExcess: Int64 = 0
         var localExt: [ExtKey: ExtStat] = [:]
 
         // Avoid a double slash when the parent is "/" so paths match skip entries.
@@ -320,6 +320,7 @@ final class DirectoryScanner: ScanBackend {
             } else {
                 var effL = entry.logicalSize
                 var effP = entry.physicalSize
+                var effExcess = entry.apparentExcess
                 // Exact mode: count a multi-linked inode's blocks only on its first
                 // sighting; later hardlinks contribute 0 bytes (still 1 file entry).
                 if exact && entry.linkCount > 1 {
@@ -327,10 +328,12 @@ final class DirectoryScanner: ScanBackend {
                     let firstSighting = seenInodes
                         .insert(InodeKey(dev: entry.deviceID, ino: entry.fileID)).inserted
                     linkLock.unlock()
-                    if !firstSighting { effL = 0; effP = 0 }
+                    if !firstSighting { effL = 0; effP = 0; effExcess = 0 }
                 }
                 filesLogical += effL
                 filesPhysical += effP
+                if entry.isSparse { sparseExcess += effExcess }
+                else if entry.isCompressed { compressedExcess += effExcess }
                 fileCount += 1
                 let key = ExtKey(name: entry.name, length: entry.nameLength)
                 localExt[key, default: ExtStat()].add(logical: effL, physical: effP)
@@ -356,7 +359,9 @@ final class DirectoryScanner: ScanBackend {
             filesLogical: filesLogical,
             filesPhysical: filesPhysical,
             fileCount: fileCount,
-            dominantExt: dominantExt
+            dominantExt: dominantExt,
+            sparseExcess: sparseExcess,
+            compressedExcess: compressedExcess
         )
 
         // Propagate this directory's direct-file totals to itself and every
@@ -368,6 +373,8 @@ final class DirectoryScanner: ScanBackend {
                 n.aggLogical.wrappingAdd(filesLogical, ordering: .relaxed)
                 n.aggPhysical.wrappingAdd(filesPhysical, ordering: .relaxed)
                 n.fileCount.wrappingAdd(fileCount, ordering: .relaxed)
+                if sparseExcess != 0 { n.aggSparseExcess.wrappingAdd(sparseExcess, ordering: .relaxed) }
+                if compressedExcess != 0 { n.aggCompressedExcess.wrappingAdd(compressedExcess, ordering: .relaxed) }
                 node = n.parent
             }
         }
@@ -394,7 +401,10 @@ struct ExtRow: Identifiable {
     let count: Int64
     var id: ExtKey { key }
 
-    func size(_ metric: SizeMetric) -> Int64 {
-        metric == .physical ? physical : logical
+    /// Non-nil when this type's apparent bytes dwarf its footprint (the .ext4 /
+    /// .raw disk-image case) — surfaced as a tooltip, sizes stay on-disk.
+    /// Cause split isn't tracked per extension; the generic wording covers it.
+    var divergence: SizeDivergence? {
+        SizeDivergence.notable(onDisk: physical, apparent: logical, sparseExcess: 0, compressedExcess: 0)
     }
 }

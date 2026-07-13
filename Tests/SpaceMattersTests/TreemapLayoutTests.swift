@@ -27,7 +27,7 @@ import Foundation
             FileTileInfo(name: "a.png", size: 300, extName: ".png"),
             FileTileInfo(name: "b.png", size: 100, extName: ".png"),
         ]
-        let refined = TreemapLayout.compute(root: root, rect: rect, metric: .physical, rootFiles: files)
+        let refined = TreemapLayout.compute(root: root, rect: rect, rootFiles: files)
         let fileTiles = refined.tiles.filter { $0.file != nil }
         #expect(fileTiles.count == 2)
         #expect(Set(fileTiles.map { $0.file!.name }) == ["a.png", "b.png"])
@@ -35,7 +35,7 @@ import Foundation
         #expect(!refined.tiles.contains { $0.isFileBlock }) // files fully listed → no residual block
 
         // Overview (no rootFiles): a single aggregate block, no per-file tiles.
-        let overview = TreemapLayout.compute(root: root, rect: rect, metric: .physical)
+        let overview = TreemapLayout.compute(root: root, rect: rect)
         #expect(overview.tiles.allSatisfy { $0.file == nil })
         #expect(overview.tiles.filter { $0.isFileBlock }.count == 1)
     }

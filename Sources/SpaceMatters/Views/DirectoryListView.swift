@@ -20,7 +20,6 @@ struct DirectoryListView: View {
         let _ = controller.selectedRowIDs
         let _ = controller.revealTarget
         let _ = controller.expanded
-        let _ = controller.metric
         let rows = controller.visibleRows()
 
         DirectoryTable(
@@ -84,7 +83,6 @@ struct OutlineRowView: View {
     let isSelected: Bool
     let isHovered: Bool
     let isDirty: Bool
-    let metric: SizeMetric
     let controller: ScanController
     let theme: Theme
 
@@ -102,8 +100,17 @@ struct OutlineRowView: View {
 
     private var size: Int64 {
         switch row.kind {
-        case .directory(let node): return node.size(metric)
-        case .file(let file, _): return file.size(metric)
+        case .directory(let node): return node.sizeOnDisk
+        case .file(let file, _): return file.physical
+        }
+    }
+
+    /// Notable apparent-vs-on-disk gap (sparse image, compressed content) —
+    /// shown as a dashed badge; the tooltip carries both figures and the cause.
+    private var divergence: SizeDivergence? {
+        switch row.kind {
+        case .directory(let node): return node.divergence
+        case .file(let file, _): return file.divergence
         }
     }
 
@@ -152,6 +159,14 @@ struct OutlineRowView: View {
 
             Spacer(minLength: 8)
 
+            if let d = divergence {
+                Image(systemName: "circle.dashed")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(theme.textSecondary)
+                    .help(d.summary)
+                    .accessibilityLabel("Apparent size \(Format.bytes(d.apparent)), \(d.label)")
+            }
+
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
                     Capsule().fill(theme.barTrack)
@@ -166,6 +181,7 @@ struct OutlineRowView: View {
                 .font(.system(size: 11, weight: .medium).monospacedDigit())
                 .foregroundStyle(theme.textSecondary)
                 .frame(width: 66, alignment: .trailing)
+                .help(divergence?.summary ?? "")
         }
         .padding(.leading, CGFloat(row.depth) * 14 + 8)
         .padding(.trailing, 10)

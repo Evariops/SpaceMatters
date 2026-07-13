@@ -38,7 +38,7 @@ import Foundation
     @Test func cameraNeverMovesTheWorld() {
         let (root, a, _) = makeTree()
         let world = TreemapWorld()
-        world.sync(root: root, metric: .physical, version: 1)
+        world.sync(root: root, version: 1)
 
         let full = build(world, root: root, scale: 1)
         let zoomedVisible = CGRect(x: 0, y: 0,
@@ -68,13 +68,13 @@ import Foundation
     @Test func smallDriftKeepsTheTiling() {
         let (root, a, _) = makeTree()
         let world = TreemapWorld()
-        world.sync(root: root, metric: .physical, version: 1)
+        world.sync(root: root, version: 1)
         let before = build(world, root: root, scale: 1)
 
         // +1 % on `a` — well under ε.
         a.aggPhysical.store(606, ordering: .relaxed)
         root.aggPhysical.store(1006, ordering: .relaxed)
-        world.sync(root: root, metric: .physical, version: 2)
+        world.sync(root: root, version: 2)
         let after = build(world, root: root, scale: 1)
 
         #expect(after.tiles.count == before.tiles.count)
@@ -92,7 +92,7 @@ import Foundation
     @Test func lodExpansionFollowsProjectedSizeWithHysteresis() {
         let (root, _, _) = makeTree()
         let world = TreemapWorld()
-        world.sync(root: root, metric: .physical, version: 1)
+        world.sync(root: root, version: 1)
 
         // Children project far below collapseSide → the root (always expanded)
         // renders its underlay + aggregated children, nothing deeper.
@@ -119,7 +119,7 @@ import Foundation
     @Test func fileBlockRefinesAtFileLODThreshold() {
         let (root, _, _) = makeTree()
         let world = TreemapWorld()
-        world.sync(root: root, metric: .physical, version: 1)
+        world.sync(root: root, version: 1)
 
         let files = [
             FileTileInfo(name: "big.bin", size: 70, extName: ".bin"),
@@ -139,7 +139,7 @@ import Foundation
         // A pending listing (nil) keeps the aggregate block and flags the build
         // so the view schedules a follow-up once the listing lands.
         let freshWorld = TreemapWorld()
-        freshWorld.sync(root: root, metric: .physical, version: 1)
+        freshWorld.sync(root: root, version: 1)
         let pending = freshWorld.build(root: root, visible: freshWorld.worldBounds,
                                        scale: (sx: 50, sy: 50), needsRegions: false,
                                        files: { _ in nil })
@@ -165,7 +165,7 @@ import Foundation
         root.aggPhysical.store(sizes.reduce(0, +), ordering: .relaxed)
 
         let world = TreemapWorld()
-        world.sync(root: root, metric: .physical, version: 1)
+        world.sync(root: root, version: 1)
         _ = build(world, root: root, scale: 1)
 
         // 40 ticks: the biggest child triples gradually (~3 % of total per step,
@@ -174,7 +174,7 @@ import Foundation
             sizes[0] = 600 + Int64(step) * 30
             kids[0].aggPhysical.store(sizes[0], ordering: .relaxed)
             root.aggPhysical.store(sizes.reduce(0, +), ordering: .relaxed)
-            world.sync(root: root, metric: .physical, version: UInt64(1 + step))
+            world.sync(root: root, version: UInt64(1 + step))
             let result = build(world, root: root, scale: 1)
             var worst: CGFloat = 1
             for tile in result.tiles where tile.node !== root {
@@ -190,7 +190,7 @@ import Foundation
     @Test func focusNodeFollowsTheCamera() {
         let (root, a, _) = makeTree()
         let world = TreemapWorld()
-        world.sync(root: root, metric: .physical, version: 1)
+        world.sync(root: root, version: 1)
         _ = build(world, root: root, scale: 1)
 
         #expect(world.focusNode(root: root, visible: world.worldBounds) === root)

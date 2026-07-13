@@ -116,13 +116,11 @@ final class TreemapWorld {
     /// window lazily (re-bake with hysteresis — never mid-drag).
     private(set) var worldSize: CGSize
 
-    private var metric: SizeMetric
     private var version: UInt64
     private var rootID: ObjectIdentifier?
 
-    init(aspect: CGFloat = 1.6, metric: SizeMetric = .physical) {
+    init(aspect: CGFloat = 1.6) {
         self.worldSize = Self.size(forAspect: aspect)
-        self.metric = metric
         self.version = 0
     }
 
@@ -172,7 +170,6 @@ final class TreemapWorld {
 
     private struct FileLayout {
         let count: Int64
-        let metric: SizeMetric
         let files: [FileTileInfo]
         let unitRects: [CGRect]
     }
@@ -182,18 +179,17 @@ final class TreemapWorld {
 
     // MARK: Synchronisation with the data
 
-    /// Align the world with the current tree state. A metric or root change is a
-    /// new world (full reset); a version change only marks entries stale — they
-    /// revalidate lazily, locally, on their next visit (ε-stable).
-    func sync(root: FSNode, metric: SizeMetric, version: UInt64) {
+    /// Align the world with the current tree state. A root change is a new world
+    /// (full reset); a version change only marks entries stale — they revalidate
+    /// lazily, locally, on their next visit (ε-stable).
+    func sync(root: FSNode, version: UInt64) {
         let rid = ObjectIdentifier(root)
-        if rid != rootID || metric != self.metric {
+        if rid != rootID {
             entries.removeAll(keepingCapacity: true)
             fileLayouts.removeAll(keepingCapacity: true)
             fileLayoutOrder.removeAll(keepingCapacity: true)
-            if rid != rootID { expanded.removeAll(keepingCapacity: true) }
+            expanded.removeAll(keepingCapacity: true)
             rootID = rid
-            self.metric = metric
         }
         self.version = version
     }
@@ -327,7 +323,7 @@ final class TreemapWorld {
                             pending: inout Bool) -> FileLayout? {
         let id = ObjectIdentifier(node)
         let count = node.directFileCount
-        if let cached = fileLayouts[id], cached.count == count, cached.metric == metric {
+        if let cached = fileLayouts[id], cached.count == count {
             return cached.files.isEmpty ? nil : cached
         }
         guard let listing = files(node) else {
@@ -337,7 +333,7 @@ final class TreemapWorld {
         let sorted = listing.filter { $0.size > 0 }.sorted { $0.size > $1.size }
         let weights = sorted.map { Double($0.size) }
         let unit = CGRect(x: 0, y: 0, width: 1, height: 1)
-        let layout = FileLayout(count: count, metric: metric, files: sorted,
+        let layout = FileLayout(count: count, files: sorted,
                                 unitRects: TreemapLayout.squarifySorted(weights, into: unit))
         fileLayouts[id] = layout
         fileLayoutOrder.removeAll { $0 == id }
@@ -356,7 +352,7 @@ final class TreemapWorld {
             if entry.stamp != version { revalidate(entry, node: node, rect: rect) }
             return entry
         }
-        let built = TreemapLayout.buildItems(node: node, depth: 1, metric: metric, files: nil)
+        let built = TreemapLayout.buildItems(node: node, depth: 1, files: nil)
         let entry = Entry(items: built.items, weights: built.weights, stamp: version)
         decide(entry, rect: rect)
         entries[id] = entry
@@ -370,7 +366,7 @@ final class TreemapWorld {
     /// geometry only (bit-stable structure, exact areas). Otherwise re-decide
     /// this node alone — a local move, animated by the caller's morph.
     private func revalidate(_ entry: Entry, node: FSNode, rect: CGRect) {
-        let built = TreemapLayout.buildItems(node: node, depth: 1, metric: metric, files: nil)
+        let built = TreemapLayout.buildItems(node: node, depth: 1, files: nil)
         defer { entry.stamp = version }
         let sameSet = built.items.count == entry.items.count && zip(built.items, entry.items).allSatisfy {
             $0.node === $1.node && $0.isFileBlock == $1.isFileBlock

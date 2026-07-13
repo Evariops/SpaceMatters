@@ -3,8 +3,17 @@ import CoreGraphics
 /// One of the current zoom root's own files, rendered as its own tile (SPEC-05).
 struct FileTileInfo: Equatable {
     let name: String
-    let size: Int64      // already resolved to the metric used for layout
+    let size: Int64      // on-disk bytes (the only metric the map is weighted by)
     let extName: String  // ".png" etc — colours the tile, matches the legend
+    /// Apparent-vs-on-disk gap, when notable (sparse image…) — hover pill only.
+    let divergence: SizeDivergence?
+
+    init(name: String, size: Int64, extName: String, divergence: SizeDivergence? = nil) {
+        self.name = name
+        self.size = size
+        self.extName = extName
+        self.divergence = divergence
+    }
 }
 
 /// A laid-out rectangle in the treemap.
@@ -49,7 +58,7 @@ enum TreemapLayout {
     /// discrete choices here (decided once, at a reference rect) and rerun only the
     /// continuous geometry (`placeRows`) per frame: replaying a fixed row/orientation
     /// decomposition on any rect tiles it exactly and continuously. The choices are
-    /// rebuilt only when the tree, metric or zoom root changes — never on resize.
+    /// rebuilt only when the tree or zoom root changes — never on resize.
     ///
     /// Held by the controller alongside `sortCache`/`fileCache`. At the reference
     /// rect the output is identical to a plain squarify, so the at-rest look is
@@ -66,18 +75,16 @@ enum TreemapLayout {
             init(items: [Item], weights: [Double]) { self.items = items; self.weights = weights }
         }
         fileprivate var entries: [ObjectIdentifier: Entry] = [:]
-        private var metric: SizeMetric?
         private var version: UInt64 = .max
         private var rootID: ObjectIdentifier?
 
-        /// Drop the memo when the tree (version), metric or zoom root changed; keep it
+        /// Drop the memo when the tree (version) or zoom root changed; keep it
         /// across pure resizes. A changed root matters because a node cached as a small
         /// sub-region must re-decide its structure when it becomes the full-rect root.
-        func invalidate(metric: SizeMetric, version: UInt64, root: FSNode) {
+        func invalidate(version: UInt64, root: FSNode) {
             let rid = ObjectIdentifier(root)
-            if self.metric != metric || self.version != version || self.rootID != rid {
+            if self.version != version || self.rootID != rid {
                 entries.removeAll(keepingCapacity: true)
-                self.metric = metric
                 self.version = version
                 self.rootID = rid
             }
@@ -99,7 +106,6 @@ enum TreemapLayout {
     static func compute(
         root: FSNode,
         rect: CGRect,
-        metric: SizeMetric,
         rootFiles: [FileTileInfo]? = nil,
         cache: Cache? = nil,
         needsRegions: Bool = true,
@@ -109,7 +115,7 @@ enum TreemapLayout {
         var result = Result()
         result.tiles.reserveCapacity(2048)
         if needsRegions { result.regions.reserveCapacity(2048) }
-        layout(node: root, rect: rect, depth: 0, metric: metric, files: rootFiles,
+        layout(node: root, rect: rect, depth: 0, files: rootFiles,
                minSide: minSide, maxDepth: maxDepth, cache: cache ?? Cache(),
                needsRegions: needsRegions, into: &result)
         return result
@@ -129,7 +135,6 @@ enum TreemapLayout {
         node: FSNode,
         rect: CGRect,
         depth: Int,
-        metric: SizeMetric,
         files: [FileTileInfo]?,
         minSide: CGFloat,
         maxDepth: Int,
@@ -150,7 +155,7 @@ enum TreemapLayout {
         if let cached = cache.entries[ObjectIdentifier(node)] {
             entry = cached
         } else {
-            let built = buildItems(node: node, depth: depth, metric: metric, files: files)
+            let built = buildItems(node: node, depth: depth, files: files)
             entry = Cache.Entry(items: built.items, weights: built.weights)
             cache.entries[ObjectIdentifier(node)] = entry
         }
@@ -189,7 +194,7 @@ enum TreemapLayout {
                 result.tiles.append(TreemapTile(rect: r, node: item.node, depth: depth + 1, isFileBlock: item.isFileBlock))
             } else if entry.recurse[i] {
                 // Sub-directories: no file refinement (files: nil) — B2.
-                layout(node: item.node, rect: r, depth: depth + 1, metric: metric, files: nil,
+                layout(node: item.node, rect: r, depth: depth + 1, files: nil,
                        minSide: minSide, maxDepth: maxDepth, cache: cache, needsRegions: needsRegions, into: &result)
             } else {
                 if needsRegions { result.regions[ObjectIdentifier(item.node)] = r }
@@ -202,14 +207,14 @@ enum TreemapLayout {
     /// squarify decisions and placement can run without re-sorting on every frame.
     /// Internal: `TreemapWorld` builds its per-node entries from the same items.
     static func buildItems(
-        node: FSNode, depth: Int, metric: SizeMetric, files: [FileTileInfo]?
+        node: FSNode, depth: Int, files: [FileTileInfo]?
     ) -> (items: [Item], weights: [Double]) {
         var items: [Item] = []
         for child in node.children {
-            let w = Double(child.size(metric))
+            let w = Double(child.sizeOnDisk)
             if w > 0 { items.append(Item(weight: w, node: child, isFileBlock: false, file: nil)) }
         }
-        let directFiles = Double(node.directFilesSize(metric))
+        let directFiles = Double(node.directFilesPhysical)
         if directFiles > 0 {
             if depth == 0, let files, !files.isEmpty {
                 // SPEC-05: individual tiles for the zoom root's own files.

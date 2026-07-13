@@ -105,7 +105,7 @@ final class CommandScanner: ScanBackend {
     var directoryCount: Int64 { dirCountAtomic.load(ordering: .relaxed) }
     var scanErrorCount: Int64 { errAtomic.load(ordering: .relaxed) }
 
-    func snapshotExtensions(metric: SizeMetric, limit: Int) -> [ExtRow] {
+    func snapshotExtensions(limit: Int) -> [ExtRow] {
         extLock.lock()
         let copy = extStats
         extLock.unlock()
@@ -113,7 +113,7 @@ final class CommandScanner: ScanBackend {
         var rows = copy.map { key, stat in
             ExtRow(key: key, name: key.displayName, logical: stat.logical, physical: stat.physical, count: stat.count)
         }
-        rows.sort { metric == .physical ? $0.physical > $1.physical : $0.logical > $1.logical }
+        rows.sort { $0.physical > $1.physical }
         if rows.count > limit { rows.removeLast(rows.count - limit) }
         return rows
     }
@@ -222,6 +222,10 @@ final class CommandScanner: ScanBackend {
             if parent !== accParent { flushAccumulator() }
             accParent = parent
             accLogical += logical; accPhysical += physical; accCount += 1
+            // `find` reports no BSD flags, but fewer blocks than bytes means
+            // holes — the Docker.raw / VM disk-image case this stream is full of.
+            // (ext4 has no transparent compression to mistake it for.)
+            if physical < logical { accSparseExcess += logical - physical }
 
             let key = ExtKey(fileName: name)
             extLock.lock()
@@ -242,18 +246,21 @@ final class CommandScanner: ScanBackend {
     private var accLogical: Int64 = 0
     private var accPhysical: Int64 = 0
     private var accCount: Int64 = 0
+    private var accSparseExcess: Int64 = 0
 
     private func flushAccumulator() {
         guard let parent = accParent, accCount > 0 else { accParent = nil; return }
-        parent.adjustDirectFiles(logical: accLogical, physical: accPhysical, count: accCount)
+        parent.adjustDirectFiles(logical: accLogical, physical: accPhysical, count: accCount,
+                                 sparseExcess: accSparseExcess)
         var node: FSNode? = parent
         while let cur = node {
             cur.aggLogical.wrappingAdd(accLogical, ordering: .relaxed)
             cur.aggPhysical.wrappingAdd(accPhysical, ordering: .relaxed)
             cur.fileCount.wrappingAdd(accCount, ordering: .relaxed)
+            if accSparseExcess != 0 { cur.aggSparseExcess.wrappingAdd(accSparseExcess, ordering: .relaxed) }
             node = cur.parent
         }
-        accParent = nil; accLogical = 0; accPhysical = 0; accCount = 0
+        accParent = nil; accLogical = 0; accPhysical = 0; accCount = 0; accSparseExcess = 0
     }
 
     /// `nil` on Int64 overflow (≥ 20 digits) — the caller drops the record.

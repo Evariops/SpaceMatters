@@ -276,9 +276,18 @@ private struct Breadcrumb: View {
             Spacer(minLength: 8)
 
             if let sel = controller.selection {
-                Text(Format.bytes(sel.size(controller.metric)))
-                    .font(.system(size: 11, weight: .medium).monospacedDigit())
-                    .foregroundStyle(theme.textSecondary)
+                // On-disk is the number; a notable apparent-size gap (sparse
+                // image, compressed content) is spelled out instead of hidden.
+                if let d = sel.divergence {
+                    Text("\(Format.bytes(d.onDisk)) · \(Format.bytes(d.apparent)) apparent")
+                        .font(.system(size: 11, weight: .medium).monospacedDigit())
+                        .foregroundStyle(theme.textSecondary)
+                        .help(d.summary)
+                } else {
+                    Text(Format.bytes(sel.sizeOnDisk))
+                        .font(.system(size: 11, weight: .medium).monospacedDigit())
+                        .foregroundStyle(theme.textSecondary)
+                }
             }
         }
     }
@@ -293,7 +302,7 @@ private struct Breadcrumb: View {
         .buttonStyle(.plain)
         .help(node.name)
         .accessibilityLabel(node.name)
-        .accessibilityValue(Format.bytes(node.size(controller.metric)))
+        .accessibilityValue(Format.bytes(node.sizeOnDisk))
         .accessibilityHint(isCurrent ? "Current folder" : "Zoom to this folder")
         .accessibilityAddTraits(isCurrent ? [.isSelected, .isButton] : .isButton)
     }
@@ -352,24 +361,6 @@ private struct ToolbarBar: View {
             }
 
             if controller.root != nil {
-                Picker("", selection: Binding(get: { controller.metric }, set: { controller.metric = $0 })) {
-                    ForEach(SizeMetric.allCases) { Text($0.label).tag($0) }
-                }
-                .pickerStyle(.segmented)
-                .fixedSize()
-                .accessibilityLabel("Size metric")
-                .help(
-                    """
-                    How sizes are measured:
-
-                    • On disk — the space files actually take up on your disk (allocated blocks). This is what matters for freeing up space, and matches `du`.
-
-                    • Logical — the size of the files' content.
-
-                    They differ because the disk stores files in fixed-size blocks (~4 KB): a tiny file still uses a whole block, so "On disk" is usually larger. macOS-compressed files are the exception (smaller on disk than their content).
-                    """
-                )
-
                 // Counting mode — host scans only (VM scans are always attribution).
                 if controller.isHostScan {
                     Picker("", selection: Binding(get: { controller.countingMode }, set: { controller.countingMode = $0 })) {
@@ -454,6 +445,13 @@ private struct StatsStrip: View {
     var body: some View {
         HStack(spacing: 16) {
             Stat(value: Format.bytes(controller.totalSize), label: "total", theme: theme)
+            // The apparent (content) total appears only when it notably exceeds
+            // what's on disk — sparse disk images, compressed system files. It
+            // can legitimately exceed the volume's capacity; the tooltip says why.
+            if let d = controller.totalDivergence {
+                Stat(value: Format.bytes(d.apparent), label: "apparent", theme: theme)
+                    .help(d.summary)
+            }
             Stat(value: Format.count(controller.fileCount), label: "files", theme: theme)
             Stat(value: Format.count(controller.dirCount), label: "folders", theme: theme)
             if controller.isScanning {

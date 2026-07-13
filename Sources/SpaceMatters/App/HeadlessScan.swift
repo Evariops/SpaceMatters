@@ -46,6 +46,8 @@ enum HeadlessScan {
 
         let logical = root.aggLogical.load(ordering: .relaxed)
         let physical = root.aggPhysical.load(ordering: .relaxed)
+        let sparse = root.aggSparseExcess.load(ordering: .relaxed)
+        let compressed = root.aggCompressedExcess.load(ordering: .relaxed)
         let files = root.fileCount.load(ordering: .relaxed)
         let dirs = scanner.dirCount.load(ordering: .relaxed)
         let errors = scanner.errorCount.load(ordering: .relaxed)
@@ -53,8 +55,10 @@ enum HeadlessScan {
         print("roots:     \(paths.count)")
         print("files:     \(files)")
         print("dirs:      \(dirs)")
-        print("logical:   \(logical) bytes  (\(Format.bytes(logical)))")
-        print("physical:  \(physical) bytes  (\(Format.bytes(physical)))")
+        print("on-disk:   \(physical) bytes  (\(Format.bytes(physical)))")
+        print("apparent:  \(logical) bytes  (\(Format.bytes(logical)))")
+        if sparse > 0 { print("sparse:    \(sparse) bytes not allocated  (\(Format.bytes(sparse)))") }
+        if compressed > 0 { print("compressed:\(compressed) bytes saved  (\(Format.bytes(compressed)))") }
         print("errors:    \(errors)")
         print(String(format: "elapsed:   %.3f s  (%.0f files/s)", elapsed, Double(files) / max(elapsed, 0.001)))
 
@@ -67,7 +71,7 @@ enum HeadlessScan {
             }
         }
 
-        let top = scanner.snapshotExtensions(metric: .physical, limit: 8)
+        let top = scanner.snapshotExtensions(limit: 8)
         if !top.isEmpty {
             print("top types:")
             for row in top {
@@ -119,12 +123,12 @@ enum HeadlessScan {
             }
         }
 
-        print(String(format: "DONE in %.2fs — dirs=%d files=%d  on-disk=%@  logical=%@",
+        print(String(format: "DONE in %.2fs — dirs=%d files=%d  on-disk=%@  apparent=%@",
                      Date().timeIntervalSince(start), scanner.directoryCount,
                      root.fileCount.load(ordering: .relaxed),
                      Format.bytes(root.aggPhysical.load(ordering: .relaxed)),
                      Format.bytes(root.aggLogical.load(ordering: .relaxed))))
-        for row in scanner.snapshotExtensions(metric: .physical, limit: 6) {
+        for row in scanner.snapshotExtensions(limit: 6) {
             print("  \(row.name): \(Format.bytes(row.physical)) (\(Format.count(row.count)) files)")
         }
         if let failure = scanner.failure {
