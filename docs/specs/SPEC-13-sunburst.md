@@ -58,7 +58,7 @@ The toggle ([MapModePicker](../../Sources/SpaceMatters/Views/ContentView.swift),
 
 - **Angular AA at extreme zoom**: arc params are Float on the GPU; edge distances multiply by up to the 10⁶× viewport clamp. Same envelope philosophy as the treemap's floating origin; no shimmer seen at realistic zooms — re-check if the clamp ever loosens.
 - **Noon seam**: the first and last arcs each draw their own border at 12 o'clock, reading as one continuous radial line hole→rim (dotMemory shows the same). Cosmetic; a half-border at the two seam edges would hide it if it ever grates.
-- **Mode switch recreates the NSView**: the camera resets to fit and world entries rebuild lazily on the next build. Cheap (entries are per-visible-node) and matches "opening the view"; promote both views to a persistent pair only if switching ever feels lossy.
+- **Mode switch recreates the NSView** — and that is a *Metal lifecycle hazard*, found the hard way: a view that presents while detached sends its drawables to an uncomposited layer, draining the 3-deep pool; `nextDrawable()` then times out (~1 s each) and the freshly attached view shows black — for seconds on the treemap (until a data tick re-presented) and indefinitely on the sunburst (nothing re-poked it; only the CG overlay drew). Cure, both views: never present while `window == nil`, re-present on attach (`viewDidMoveToWindow` → `setScale`), and `draw()` reports a dropped frame so the view schedules one retry. The camera state itself resets cheaply — except `zoomRoot`, which both views now honour on (re)creation so the projections always agree on where you are.
 
 ## 6. Effort & dependencies
 

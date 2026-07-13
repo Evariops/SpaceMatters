@@ -160,6 +160,8 @@ final class SunburstNSView: NSView, CALayerDelegate {
     /// One-shot follow-up when a file listing was still loading during a build.
     private var fileRetryScheduled = false
     private var fileAttempts: [ObjectIdentifier: Int] = [:]
+    /// One-shot follow-up when a present dropped (dry drawable pool).
+    private var presentRetryScheduled = false
 
     // Layers.
     private let metalLayer: CAMetalLayer
@@ -236,7 +238,12 @@ final class SunburstNSView: NSView, CALayerDelegate {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        if window == nil { cancelAnimations() }
+        guard let window else { cancelAnimations(); return }
+        // (Re)attached — only now does the layer take part in compositing:
+        // size the drawable for this screen and present. Presenting while
+        // detached is what drained the drawable pool on a mode switch and
+        // left the wheel blank (nextDrawable → nil, ~1 s timeout each).
+        setScale(window.backingScaleFactor)
     }
 
     private func setScale(_ scale: CGFloat) {
@@ -664,16 +671,29 @@ final class SunburstNSView: NSView, CALayerDelegate {
     }
 
     /// Push the current world to screen through the camera — a pure GPU render.
+    /// Never while detached (drawables presented to an uncomposited layer are
+    /// lost and drain the pool); a dropped frame schedules one retry so the
+    /// wheel can't stay blank until the next data tick.
     private func presentArcs() {
+        guard window != nil else { return }
         let viewport = camera.rect.offsetBy(dx: -rebaseOrigin.x, dy: -rebaseOrigin.y)
-        renderer.draw(into: metalLayer,
-                      camera: Camera.ortho(viewport: viewport),
-                      pointsPerUnit: cameraScale,
-                      center: SIMD2<Float>(Float(SunburstWorld.center.x - rebaseOrigin.x),
-                                           Float(SunburstWorld.center.y - rebaseOrigin.y)),
-                      morph: morphT,
-                      clearColor: backgroundComps,
-                      borderColor: borderComps)
+        let presented = renderer.draw(
+            into: metalLayer,
+            camera: Camera.ortho(viewport: viewport),
+            pointsPerUnit: cameraScale,
+            center: SIMD2<Float>(Float(SunburstWorld.center.x - rebaseOrigin.x),
+                                 Float(SunburstWorld.center.y - rebaseOrigin.y)),
+            morph: morphT,
+            clearColor: backgroundComps,
+            borderColor: borderComps)
+        if !presented, !presentRetryScheduled, bounds.width > 1 {
+            presentRetryScheduled = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+                guard let self else { return }
+                self.presentRetryScheduled = false
+                self.presentArcs()
+            }
+        }
     }
 
     // MARK: Camera navigation (same gestures as the treemap)

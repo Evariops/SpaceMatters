@@ -116,16 +116,20 @@ final class SunburstMetalRenderer {
 
     /// Draw the last uploaded instances into `layer`. A camera-only frame calls
     /// this alone — no buffer writes, just a new matrix (and morph progress).
+    /// Returns `false` when no frame was presented (zero-sized layer, or the
+    /// drawable pool was dry) so the caller can schedule a retry — a dropped
+    /// frame here would otherwise leave the map blank until the next data tick.
+    @discardableResult
     func draw(into layer: CAMetalLayer,
               camera: Camera,
               pointsPerUnit: CGFloat,
               center: SIMD2<Float>,
               morph: Float = 1,
               clearColor: SIMD4<Float>,
-              borderColor: SIMD4<Float>) {
+              borderColor: SIMD4<Float>) -> Bool {
         let size = layer.drawableSize
-        guard size.width > 0, size.height > 0 else { return }
-        guard let drawable = layer.nextDrawable() else { return }
+        guard size.width > 0, size.height > 0 else { return false }
+        guard let drawable = layer.nextDrawable() else { return false }
 
         inflight.wait()
 
@@ -144,7 +148,7 @@ final class SunburstMetalRenderer {
         guard let cmd = queue.makeCommandBuffer(),
               let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else {
             inflight.signal()
-            return
+            return false
         }
         if let buffer = boundInstances, instanceCount > 0 {
             enc.setRenderPipelineState(pipeline)
@@ -170,6 +174,7 @@ final class SunburstMetalRenderer {
             cmd.present(drawable)
             cmd.commit()
         }
+        return true
     }
 
     // MARK: - Shader (MSL, compiled at launch)

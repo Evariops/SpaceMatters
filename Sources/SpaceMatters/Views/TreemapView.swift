@@ -168,6 +168,8 @@ final class TreemapNSView: NSView, CALayerDelegate {
     /// One-shot follow-up when a file listing was still loading during a build.
     private var fileRetryScheduled = false
     private var fileAttempts: [ObjectIdentifier: Int] = [:]
+    /// One-shot follow-up when a present dropped (dry drawable pool).
+    private var presentRetryScheduled = false
 
     // Layers.
     private let metalLayer: CAMetalLayer
@@ -253,7 +255,12 @@ final class TreemapNSView: NSView, CALayerDelegate {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        if window == nil { cancelAnimations() }   // break the CADisplayLink → self cycle on teardown
+        guard let window else { cancelAnimations(); return }   // break the CADisplayLink → self cycle on teardown
+        // (Re)attached — e.g. after a map-mode switch: size the drawable for
+        // this screen and present. Presenting while detached drains the
+        // drawable pool (frames go to an uncomposited layer) and used to leave
+        // the map black for seconds after a switch.
+        setScale(window.backingScaleFactor)
     }
 
     private func setScale(_ scale: CGFloat) {
@@ -354,6 +361,14 @@ final class TreemapNSView: NSView, CALayerDelegate {
                 }
             }
             camera.rect = world.worldBounds
+            // A view (re)created while zoomed — a map-mode switch, typically —
+            // must land on the zoomed folder, not the whole world: the
+            // breadcrumb, list and the other projection all point there.
+            if let target = zoomRoot, target !== root,
+               let rect = world.worldRect(of: target, root: root) {
+                camera.rect = clampedViewport(fitTarget(for: rect))
+                fitMode = false
+            }
             rebuildTiles(morph: false)
             presentTiles()
             overlayLayer.setNeedsDisplay()
@@ -657,14 +672,27 @@ final class TreemapNSView: NSView, CALayerDelegate {
     }
 
     /// Push the current world to screen through the camera — a pure GPU render.
+    /// Never while detached (drawables presented to an uncomposited layer are
+    /// lost and drain the pool); a dropped frame schedules one retry so the map
+    /// can't stay blank until the next data tick.
     private func presentTiles() {
+        guard window != nil else { return }
         let viewport = camera.rect.offsetBy(dx: -rebaseOrigin.x, dy: -rebaseOrigin.y)
-        renderer.draw(into: metalLayer,
-                      camera: Camera.ortho(viewport: viewport),
-                      pointsPerUnit: camera.scale(viewSize: bounds.size),
-                      morph: morphT,
-                      clearColor: backgroundComps,
-                      borderColor: borderComps)
+        let presented = renderer.draw(
+            into: metalLayer,
+            camera: Camera.ortho(viewport: viewport),
+            pointsPerUnit: camera.scale(viewSize: bounds.size),
+            morph: morphT,
+            clearColor: backgroundComps,
+            borderColor: borderComps)
+        if !presented, !presentRetryScheduled, bounds.width > 1 {
+            presentRetryScheduled = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+                guard let self else { return }
+                self.presentRetryScheduled = false
+                self.presentTiles()
+            }
+        }
     }
 
     // MARK: Camera navigation (SPEC-10 M2 — the map)

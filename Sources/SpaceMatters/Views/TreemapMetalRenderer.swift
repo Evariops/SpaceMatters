@@ -158,17 +158,20 @@ final class TreemapMetalRenderer {
     /// alone — no buffer writes, just a new matrix (and morph progress). `contentSize`
     /// is the displayed pixel size; when the drawable is pooled larger than the view
     /// (SPEC-10 §3.6) the viewport clamps rendering to the visible region.
+    /// Returns `false` when no frame was presented (zero-sized layer, dry drawable
+    /// pool) so the caller can schedule a retry instead of staying blank.
+    @discardableResult
     func draw(into layer: CAMetalLayer,
               camera: Camera,
               pointsPerUnit: (sx: CGFloat, sy: CGFloat) = (1, 1),
               morph: Float = 1,
               clearColor: SIMD4<Float>,
               borderColor: SIMD4<Float>,
-              contentSize: CGSize? = nil) {
+              contentSize: CGSize? = nil) -> Bool {
         let size = layer.drawableSize
-        guard size.width > 0, size.height > 0 else { return }
+        guard size.width > 0, size.height > 0 else { return false }
         ensureAttachments(size)
-        guard let drawable = layer.nextDrawable() else { return }
+        guard let drawable = layer.nextDrawable() else { return false }
 
         inflight.wait()
 
@@ -195,7 +198,7 @@ final class TreemapMetalRenderer {
         guard let cmd = queue.makeCommandBuffer(),
               let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else {
             inflight.signal()
-            return
+            return false
         }
         if let buffer = boundInstances, instanceCount > 0 {
             enc.setRenderPipelineState(pipeline)
@@ -228,6 +231,7 @@ final class TreemapMetalRenderer {
             cmd.present(drawable)
             cmd.commit()
         }
+        return true
     }
 
     private func ensureAttachments(_ size: CGSize) {
