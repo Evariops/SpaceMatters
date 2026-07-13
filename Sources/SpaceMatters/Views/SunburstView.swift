@@ -869,9 +869,11 @@ final class SunburstNSView: NSView, CALayerDelegate {
         let center = viewPoint(SunburstWorld.center)
 
         // The hole: the display root's own disc — a subtle panel over the map
-        // background, the total in the middle (the dotMemory centre).
+        // background, the total in the middle (the dotMemory centre). Drawn
+        // whatever the morph clock says: the hole is static world geometry,
+        // and hiding it per data tick made the centre blink on live scans.
         let holePts = SunburstWorld.holeRadius * scale
-        if morphT >= 1, holePts > 4 {
+        if holePts > 4 {
             let c = CGPoint(x: center.x, y: size.height - center.y)
             let holeRect = CGRect(x: c.x - holePts, y: c.y - holePts,
                                   width: holePts * 2, height: holePts * 2)
