@@ -45,7 +45,6 @@ struct TreemapView: View {
                 version: controller.version,
                 zoomRoot: controller.zoomRoot,
                 zoomRequestID: controller.zoomRequestID,
-                metric: controller.metric,
                 selection: controller.selection,
                 selectedExt: controller.selectedExt,
                 searchMatchIDs: controller.searchMatchIDs,
@@ -68,11 +67,10 @@ struct TreemapView: View {
     /// largest children by share — so VoiceOver conveys the shape of the map.
     private var treemapSummary: String {
         guard let zoom = controller.zoomRoot else { return "" }
-        let m = controller.metric
-        let head = "Showing \(zoom.name), \(Format.bytes(zoom.size(m)))."
-        let total = max(zoom.size(m), 1)
+        let head = "Showing \(zoom.name), \(Format.bytes(zoom.sizeOnDisk))."
+        let total = max(zoom.sizeOnDisk, 1)
         let kids = controller.sortedChildren(zoom).prefix(5).map {
-            "\($0.name) \(Int((Double($0.size(m)) / Double(total) * 100).rounded())) percent"
+            "\($0.name) \(Int((Double($0.sizeOnDisk) / Double(total) * 100).rounded())) percent"
         }
         return kids.isEmpty ? head : head + " Largest: " + kids.joined(separator: ", ")
     }
@@ -137,7 +135,6 @@ private struct TreemapRepresentable: NSViewRepresentable {
     let version: UInt64
     let zoomRoot: FSNode?
     let zoomRequestID: Int
-    let metric: SizeMetric
     let selection: FSNode?
     let selectedExt: ExtKey?
     let searchMatchIDs: Set<ObjectIdentifier>
@@ -149,7 +146,7 @@ private struct TreemapRepresentable: NSViewRepresentable {
         let view = TreemapNSView(renderer: renderer)
         view.onHover = onHover
         view.apply(controller: controller, theme: theme, version: version, zoomRoot: zoomRoot,
-                   zoomRequestID: zoomRequestID, metric: metric, selection: selection,
+                   zoomRequestID: zoomRequestID, selection: selection,
                    selectedExt: selectedExt, searchMatchIDs: searchMatchIDs,
                    highlightVersion: highlightVersion)
         return view
@@ -158,7 +155,7 @@ private struct TreemapRepresentable: NSViewRepresentable {
     func updateNSView(_ view: TreemapNSView, context: Context) {
         view.onHover = onHover
         view.apply(controller: controller, theme: theme, version: version, zoomRoot: zoomRoot,
-                   zoomRequestID: zoomRequestID, metric: metric, selection: selection,
+                   zoomRequestID: zoomRequestID, selection: selection,
                    selectedExt: selectedExt, searchMatchIDs: searchMatchIDs,
                    highlightVersion: highlightVersion)
     }
@@ -181,7 +178,6 @@ final class TreemapNSView: NSView, CALayerDelegate {
     private var version: UInt64 = .max
     private var zoomRoot: FSNode?
     private var zoomRequestID: Int = .min
-    private var metric: SizeMetric = .physical
     private var selection: FSNode?
     private var selectedExt: ExtKey?
     private var searchMatchIDs: Set<ObjectIdentifier> = []
@@ -369,7 +365,7 @@ final class TreemapNSView: NSView, CALayerDelegate {
     // MARK: SwiftUI → view
 
     func apply(controller: ScanController, theme: Theme, version: UInt64, zoomRoot: FSNode?,
-               zoomRequestID: Int, metric: SizeMetric, selection: FSNode?, selectedExt: ExtKey?,
+               zoomRequestID: Int, selection: FSNode?, selectedExt: ExtKey?,
                searchMatchIDs: Set<ObjectIdentifier>, highlightVersion: Int) {
         self.controller = controller
 
@@ -383,7 +379,7 @@ final class TreemapNSView: NSView, CALayerDelegate {
         while let parent = root?.parent { root = parent }
         let rootChanged = root !== scanRoot
 
-        let dataChanged = version != self.version || metric != self.metric || themeChanged
+        let dataChanged = version != self.version || themeChanged
         let navRequested = zoomRequestID != self.zoomRequestID && self.zoomRequestID != .min
         let firstApply = self.zoomRequestID == .min
         let highlightChanged = selectedExt != self.selectedExt
@@ -393,7 +389,6 @@ final class TreemapNSView: NSView, CALayerDelegate {
         self.version = version
         self.zoomRoot = zoomRoot
         self.zoomRequestID = zoomRequestID
-        self.metric = metric
         self.selectedExt = selectedExt
         self.searchMatchIDs = searchMatchIDs
         self.highlightVersion = highlightVersion
@@ -407,7 +402,7 @@ final class TreemapNSView: NSView, CALayerDelegate {
             overlayLayer.setNeedsDisplay()
             return
         }
-        world.sync(root: root, metric: metric, version: version)
+        world.sync(root: root, version: version)
 
         if rootChanged || firstApply {
             // A new scan (or first appearance): fresh world, camera at fit.
@@ -427,7 +422,7 @@ final class TreemapNSView: NSView, CALayerDelegate {
         }
 
         if dataChanged {
-            // FSEvents refresh / deletion / metric change: entries revalidate
+            // FSEvents refresh / deletion: entries revalidate
             // lazily (ε-local), and whatever moved morphs (SPEC-10 §3.4). A pure
             // theme change only recolours — no motion to animate. And a *live
             // scan* teleports: it restructures violently at 10 Hz, so sliding
@@ -662,7 +657,7 @@ final class TreemapNSView: NSView, CALayerDelegate {
 
     private func tileSize(_ tile: TreemapWorld.Tile) -> Int64 {
         if let file = tile.file { return file.size }
-        return tile.isFileBlock ? tile.node.directFilesSize(metric) : tile.node.size(metric)
+        return tile.isFileBlock ? tile.node.directFilesPhysical : tile.node.sizeOnDisk
     }
 
     /// File tiles for a folder whose block crossed the file-LOD threshold.
@@ -680,7 +675,8 @@ final class TreemapNSView: NSView, CALayerDelegate {
             return []        // failed/blocked: keep the aggregate block
         }
         return items.map {
-            FileTileInfo(name: $0.name, size: $0.size(metric), extName: OutlineRowView.extDisplay($0.name))
+            FileTileInfo(name: $0.name, size: $0.physical, extName: OutlineRowView.extDisplay($0.name),
+                         divergence: $0.divergence)
         }
     }
 
@@ -1050,10 +1046,22 @@ final class TreemapNSView: NSView, CALayerDelegate {
 
     private func hoverInfo(for tile: TreemapWorld.Tile) -> HoverInfo {
         if let file = tile.file {
-            return HoverInfo(title: file.name, isDirectory: false, sizeText: Format.bytes(file.size))
+            return HoverInfo(title: file.name, isDirectory: false,
+                             sizeText: Self.sizeText(onDisk: file.size, divergence: file.divergence))
         }
-        return HoverInfo(title: hoverPath(tile.node), isDirectory: tile.node.isDirectory,
-                         sizeText: Format.bytes(tile.node.size(metric)))
+        let node = tile.node
+        let divergence = tile.isFileBlock ? nil : node.divergence
+        return HoverInfo(title: hoverPath(node), isDirectory: node.isDirectory,
+                         sizeText: Self.sizeText(
+                            onDisk: tile.isFileBlock ? node.directFilesPhysical : node.sizeOnDisk,
+                            divergence: divergence))
+    }
+
+    /// "75 MB · 512 GB apparent (sparse)" when the tile hides a divergence;
+    /// plain on-disk size otherwise.
+    private static func sizeText(onDisk: Int64, divergence: SizeDivergence?) -> String {
+        guard let d = divergence else { return Format.bytes(onDisk) }
+        return "\(Format.bytes(onDisk)) · \(Format.bytes(d.apparent)) apparent (\(d.label))"
     }
 
     /// Path of a node relative to the current zoom root — so identical folder names

@@ -39,7 +39,7 @@ protocol ScanBackend: AnyObject {
     /// remote `find` missing, exited non-zero with no output). `nil` on success —
     /// per-entry permission errors are counted in `scanErrorCount` instead.
     var failure: String? { get }
-    func snapshotExtensions(metric: SizeMetric, limit: Int) -> [ExtRow]
+    func snapshotExtensions(limit: Int) -> [ExtRow]
     /// Subtract a deleted subtree's per-extension contribution from the live
     /// File-types table (A6). No-op for backends that don't support deletion.
     func subtractExtensions(_ delta: [ExtKey: ExtStat])

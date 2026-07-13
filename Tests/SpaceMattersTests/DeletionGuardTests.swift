@@ -71,7 +71,7 @@ import Foundation
         // The tree is untouched too — no aggregates were subtracted.
         #expect(NavigationTests.child(c.root!, "sub") === sub)
 
-        let file = ScanController.FileItem(name: "victim.bin", logical: 4096, physical: 4096)
+        let file = ScanController.FileItem(name: "victim.bin", logical: 4096, physical: 4096, compressed: false)
         let okFile = await c.remove(file: file, parent: sub, permanently: true)
         #expect(!okFile)
         #expect(FileManager.default.fileExists(atPath: fixture.appendingPathComponent("sub/victim.bin").path))
@@ -94,7 +94,7 @@ import Foundation
         #expect(c.isScanning)
         #expect(FileManager.default.fileExists(atPath: fixture.appendingPathComponent("sub").path))
 
-        let file = ScanController.FileItem(name: "victim.bin", logical: 4096, physical: 4096)
+        let file = ScanController.FileItem(name: "victim.bin", logical: 4096, physical: 4096, compressed: false)
         let okFile = await c.remove(file: file, parent: sub, permanently: true)
         #expect(!okFile)
         #expect(FileManager.default.fileExists(atPath: fixture.appendingPathComponent("sub/victim.bin").path))

@@ -30,10 +30,6 @@ final class ScanController {
     private(set) var version: UInt64 = 0
     private(set) var extRows: [ExtRow] = []
 
-    var metric: SizeMetric = .physical {
-        didSet { if metric != oldValue { extRows = scanner?.snapshotExtensions(metric: metric, limit: 250) ?? []; bump() } }
-    }
-
     /// Exact vs attribution counting. Dedup happens at scan time, so flipping this
     /// re-scans the same target with the new semantics (host scans only; VM scans
     /// are always attribution).
@@ -293,7 +289,15 @@ final class ScanController {
     private var lastSampleCount: Int64 = 0
     private var tickIndex = 0
 
-    var totalSize: Int64 { metric == .physical ? totalPhysical : totalLogical }
+    /// Everything the app displays is on-disk (allocated) size — the number that
+    /// matches what deleting frees. The logical total survives only as the
+    /// "apparent" annotation (`totalDivergence`).
+    var totalSize: Int64 { totalPhysical }
+
+    /// Root-level apparent-vs-on-disk gap (sparse VM images, compressed system
+    /// files) — the stats strip surfaces it so a huge apparent size is explained
+    /// instead of silently dropped.
+    var totalDivergence: SizeDivergence? { root?.divergence }
 
     var isScanning: Bool { phase == .scanning }
 
@@ -530,7 +534,17 @@ final class ScanController {
         let name: String
         let logical: Int64
         let physical: Int64
-        func size(_ m: SizeMetric) -> Int64 { m == .physical ? physical : logical }
+        /// UF_COMPRESSED was set — with the two sizes, enough to classify.
+        let compressed: Bool
+
+        var sparseExcess: Int64 { compressed ? 0 : max(0, logical - physical) }
+        var compressedExcess: Int64 { compressed ? max(0, logical - physical) : 0 }
+        /// Non-nil when this file's declared length dwarfs its footprint — the
+        /// 512 GiB sparse snapshot that occupies 75 MiB.
+        var divergence: SizeDivergence? {
+            SizeDivergence.notable(onDisk: physical, apparent: logical,
+                                   sparseExcess: sparseExcess, compressedExcess: compressedExcess)
+        }
     }
 
     enum RowID: Hashable {
@@ -562,13 +576,12 @@ final class ScanController {
 
     // Caches (not observed).
     @ObservationIgnored private var sortCache: [ObjectIdentifier: [FSNode]] = [:]
-    @ObservationIgnored private var sortCacheMetric: SizeMetric = .physical
     /// Cached file listing per directory, tagged with the directory's direct-file
     /// count so it stays valid during a live scan and only re-enumerates the disk
     /// when that directory's contents actually changed. Items are kept sorted by
-    /// `metric` (tagged too): `visibleRows()` runs at 10 Hz during a scan and
-    /// must not re-sort every expanded folder's files on each evaluation.
-    private struct FileListing { let count: Int64; let metric: SizeMetric; let items: [FileItem] }
+    /// on-disk size: `visibleRows()` runs at 10 Hz during a scan and must not
+    /// re-sort every expanded folder's files on each evaluation.
+    private struct FileListing { let count: Int64; let items: [FileItem] }
     @ObservationIgnored private var fileCache: [ObjectIdentifier: FileListing] = [:]
     /// Directories whose file listing is being enumerated off-main right now
     /// (prevents duplicate walks while `visibleRows()` polls at 10 Hz).
@@ -578,7 +591,7 @@ final class ScanController {
     @ObservationIgnored private var nodePaths: [ObjectIdentifier: String] = [:]
     /// Size-independent treemap structure (per-node sorted children/weights). Lives
     /// here, with the other model caches, so a window resize reuses it and only the
-    /// rect placement reruns per frame. Invalidated on (metric, version) inside.
+    /// rect placement reruns per frame. Invalidated on `version` inside.
     @ObservationIgnored private var layoutCache = TreemapLayout.Cache()
 
     private static let maxFilesPerFolder = 2000
@@ -621,29 +634,28 @@ final class ScanController {
         }
     }
 
-    /// Children sorted by current metric, cached after the scan so repeated
-    /// outline rebuilds are O(1) lookups, not sorts.
     /// Squarified treemap layout for `root` at `rect`. The size-independent
     /// structure (per-node sorted children + weights) is memoised across calls and
     /// reused on resize — only the rect placement reruns per frame. Same output as
-    /// a fresh `TreemapLayout.compute`; the cache tracks the tree via (metric,
-    /// version), like `sortCache`/`fileCache`.
+    /// a fresh `TreemapLayout.compute`; the cache tracks the tree via `version`,
+    /// like `sortCache`/`fileCache`.
     func treemapLayout(root: FSNode, rect: CGRect, rootFiles: [FileTileInfo]?,
                        needsRegions: Bool = true) -> TreemapLayout.Result {
-        layoutCache.invalidate(metric: metric, version: version, root: root)
-        return TreemapLayout.compute(root: root, rect: rect, metric: metric, rootFiles: rootFiles,
+        layoutCache.invalidate(version: version, root: root)
+        return TreemapLayout.compute(root: root, rect: rect, rootFiles: rootFiles,
                                      cache: layoutCache, needsRegions: needsRegions)
     }
 
+    /// Children sorted by on-disk size, cached after the scan so repeated
+    /// outline rebuilds are O(1) lookups, not sorts.
     func sortedChildren(_ node: FSNode) -> [FSNode] {
         let children = node.children
         if phase == .scanning {
-            return children.sorted { $0.size(metric) > $1.size(metric) }
+            return children.sorted { $0.sizeOnDisk > $1.sizeOnDisk }
         }
-        if sortCacheMetric != metric { sortCache.removeAll(); sortCacheMetric = metric }
         let key = ObjectIdentifier(node)
         if let cached = sortCache[key], cached.count == children.count { return cached }
-        let sorted = children.sorted { $0.size(metric) > $1.size(metric) }
+        let sorted = children.sorted { $0.sizeOnDisk > $1.sizeOnDisk }
         sortCache[key] = sorted
         return sorted
     }
@@ -658,37 +670,29 @@ final class ScanController {
         // Valid as long as the folder's file count is unchanged — true across the
         // 10 Hz refresh during a scan (a folder's files are set once, atomically)
         // and forever after it.
-        if let cached = fileCache[key], cached.count == count {
-            if cached.metric == metric { return cached.items }
-            // Metric flipped: re-sort the cached listing, no disk I/O.
-            let resorted = cached.items.sorted { $0.size(metric) > $1.size(metric) }
-            fileCache[key] = FileListing(count: count, metric: metric, items: resorted)
-            return resorted
-        }
+        if let cached = fileCache[key], cached.count == count { return cached.items }
 
         // Cache miss: enumerate off the main actor — a 100k-file folder or a slow
         // network volume must not beach-ball the UI — and repaint when it lands.
         // Callers get an empty placeholder for the frame or two it takes.
         guard count > 0, let dirPath = path(for: node) else {
-            fileCache[key] = FileListing(count: count, metric: metric, items: [])
+            fileCache[key] = FileListing(count: count, items: [])
             return []
         }
         guard !fileListingsInFlight.contains(key) else { return [] }
         fileListingsInFlight.insert(key)
         let epoch = treeEpoch
-        let m = metric
         Task { @MainActor in
             var items = await Task.detached(priority: .userInitiated) {
                 Self.enumerateFiles(dirPath: dirPath)
             }.value
             self.fileListingsInFlight.remove(key)
             guard epoch == self.treeEpoch else { return }
+            items.sort { $0.physical > $1.physical }
             if items.count > Self.maxFilesPerFolder {
-                items.sort { $0.physical > $1.physical }
                 items.removeLast(items.count - Self.maxFilesPerFolder)
             }
-            items.sort { $0.size(m) > $1.size(m) }
-            self.fileCache[key] = FileListing(count: node.directFileCount, metric: m, items: items)
+            self.fileCache[key] = FileListing(count: node.directFileCount, items: items)
             self.bump()
         }
         return []
@@ -704,7 +708,8 @@ final class ScanController {
         enumerateDirectory(fd: fd, buffer: buf, bufferSize: bufSize) { entry in
             guard !entry.isDirectory else { return }
             let name = String(decoding: UnsafeRawBufferPointer(start: entry.name, count: entry.nameLength), as: UTF8.self)
-            items.append(FileItem(name: name, logical: entry.logicalSize, physical: entry.physicalSize))
+            items.append(FileItem(name: name, logical: entry.logicalSize, physical: entry.physicalSize,
+                                  compressed: entry.isCompressed))
         }
         buf.deallocate()
         close(fd)
@@ -794,10 +799,10 @@ final class ScanController {
                 out.append(OutlineRow(
                     kind: .directory(node), depth: depth, siblingMax: siblingMax,
                     isExpandable: false, isExpanded: !kids.isEmpty, id: .dir(ObjectIdentifier(node))))
-                let childMax = max(kids.first?.size(metric) ?? 1, 1)
+                let childMax = max(kids.first?.sizeOnDisk ?? 1, 1)
                 for kid in kids { walk(kid, depth: depth + 1, siblingMax: childMax) }
             }
-            walk(root, depth: 0, siblingMax: max(root.size(metric), 1))
+            walk(root, depth: 0, siblingMax: max(root.sizeOnDisk, 1))
             return out
         }
 
@@ -818,19 +823,18 @@ final class ScanController {
             guard isOpen else { return }
 
             let kids = sortedChildren(node)
-            // Pre-sorted by the current metric (cached). Files at zero size *in the
-            // current metric* are dropped — a space tool has nothing to say about
-            // them (macOS marker files like `.localized`, empty locks…), and a 0 B
-            // on-disk file that still has logical bytes reappears in Logical mode.
-            // Sorted descending → the zero tail is a prefix cut, not a filter pass.
-            let files = filesIn(node).prefix(while: { $0.size(metric) > 0 })
-            let childMax = max(kids.first?.size(metric) ?? 0, files.first?.size(metric) ?? 0, 1)
+            // Pre-sorted by on-disk size (cached). Files occupying zero blocks are
+            // dropped — a space tool has nothing to say about them (macOS marker
+            // files like `.localized`, empty locks…). Sorted descending → the zero
+            // tail is a prefix cut, not a filter pass.
+            let files = filesIn(node).prefix(while: { $0.physical > 0 })
+            let childMax = max(kids.first?.sizeOnDisk ?? 0, files.first?.physical ?? 0, 1)
 
             // Merge folders + files by size, biggest first.
             var di = 0, fi = 0
             while di < kids.count || fi < files.count {
-                let dSize = di < kids.count ? kids[di].size(metric) : -1
-                let fSize = fi < files.count ? files[fi].size(metric) : -1
+                let dSize = di < kids.count ? kids[di].sizeOnDisk : -1
+                let fSize = fi < files.count ? files[fi].physical : -1
                 if dSize >= fSize {
                     walk(kids[di], depth: depth + 1, siblingMax: childMax)
                     di += 1
@@ -848,7 +852,7 @@ final class ScanController {
                 }
             }
         }
-        walk(root, depth: 0, siblingMax: max(root.size(metric), 1))
+        walk(root, depth: 0, siblingMax: max(root.sizeOnDisk, 1))
         return out
     }
 
@@ -931,7 +935,7 @@ final class ScanController {
         applyDirectoryRemoval(node)
         if !extDelta.isEmpty {
             scanner?.subtractExtensions(extDelta)
-            extRows = scanner?.snapshotExtensions(metric: metric, limit: 250) ?? extRows
+            extRows = scanner?.snapshotExtensions(limit: 250) ?? extRows
         }
         return true
     }
@@ -940,11 +944,15 @@ final class ScanController {
         let logical = node.aggLogical.load(ordering: .relaxed)
         let physical = node.aggPhysical.load(ordering: .relaxed)
         let count = node.fileCount.load(ordering: .relaxed)
+        let sparseE = node.aggSparseExcess.load(ordering: .relaxed)
+        let compressedE = node.aggCompressedExcess.load(ordering: .relaxed)
         var p = node.parent
         while let a = p {
             a.aggLogical.wrappingAdd(-logical, ordering: .relaxed)
             a.aggPhysical.wrappingAdd(-physical, ordering: .relaxed)
             a.fileCount.wrappingAdd(-count, ordering: .relaxed)
+            if sparseE != 0 { a.aggSparseExcess.wrappingAdd(-sparseE, ordering: .relaxed) }
+            if compressedE != 0 { a.aggCompressedExcess.wrappingAdd(-compressedE, ordering: .relaxed) }
             p = a.parent
         }
         noteAppliedPhysical(-physical)
@@ -1006,12 +1014,15 @@ final class ScanController {
         guard await Self.diskRemove(path: path, permanently: permanently) else { return false }
         guard epoch == treeEpoch else { return true } // deleted on disk; tree is gone
 
-        parent.adjustDirectFiles(logical: -file.logical, physical: -file.physical, count: -1)
+        parent.adjustDirectFiles(logical: -file.logical, physical: -file.physical, count: -1,
+                                 sparseExcess: -file.sparseExcess, compressedExcess: -file.compressedExcess)
         var p: FSNode? = parent
         while let a = p {
             a.aggLogical.wrappingAdd(-file.logical, ordering: .relaxed)
             a.aggPhysical.wrappingAdd(-file.physical, ordering: .relaxed)
             a.fileCount.wrappingAdd(-1, ordering: .relaxed)
+            if file.sparseExcess != 0 { a.aggSparseExcess.wrappingAdd(-file.sparseExcess, ordering: .relaxed) }
+            if file.compressedExcess != 0 { a.aggCompressedExcess.wrappingAdd(-file.compressedExcess, ordering: .relaxed) }
             p = a.parent
         }
         noteAppliedPhysical(-file.physical)
@@ -1019,7 +1030,7 @@ final class ScanController {
         var d = ExtStat()
         d.add(logical: file.logical, physical: file.physical)
         scanner?.subtractExtensions([ExtKey(fileName: file.name): d])
-        extRows = scanner?.snapshotExtensions(metric: metric, limit: 250) ?? extRows
+        extRows = scanner?.snapshotExtensions(limit: 250) ?? extRows
 
         fileCache[ObjectIdentifier(parent)] = nil // re-enumerate fresh next time
         sortCache.removeAll()
@@ -1064,6 +1075,8 @@ final class ScanController {
         let oldL = node.aggLogical.load(ordering: .relaxed)
         let oldP = node.aggPhysical.load(ordering: .relaxed)
         let oldC = node.fileCount.load(ordering: .relaxed)
+        let oldSparseE = node.aggSparseExcess.load(ordering: .relaxed)
+        let oldCompressedE = node.aggCompressedExcess.load(ordering: .relaxed)
         let oldDirs = Self.subtreeDirCount(node)
         // The File-types reconciliation needs a *single-threaded* disk walk of
         // the subtree's old per-extension bytes. On a refresh rooted near the
@@ -1102,6 +1115,8 @@ final class ScanController {
             n.aggLogical.wrappingAdd(-oldL, ordering: .relaxed)
             n.aggPhysical.wrappingAdd(-oldP, ordering: .relaxed)
             n.fileCount.wrappingAdd(-oldC, ordering: .relaxed)
+            if oldSparseE != 0 { n.aggSparseExcess.wrappingAdd(-oldSparseE, ordering: .relaxed) }
+            if oldCompressedE != 0 { n.aggCompressedExcess.wrappingAdd(-oldCompressedE, ordering: .relaxed) }
             a = n.parent
         }
         node.zeroAggregates()
@@ -1150,7 +1165,7 @@ final class ScanController {
 
         sortCache.removeAll(); fileCache.removeAll()
         refreshTotals()
-        extRows = scanner?.snapshotExtensions(metric: metric, limit: 250) ?? extRows
+        extRows = scanner?.snapshotExtensions(limit: 250) ?? extRows
         bump()
         // The rebuilt nodes have fresh identities: an active search would keep
         // matching the freed objects and silently drop this subtree's hits.
@@ -1503,6 +1518,8 @@ final class ScanController {
         var filesLogical: Int64 = 0
         var filesPhysical: Int64 = 0
         var fileCount: Int64 = 0
+        var sparseExcess: Int64 = 0
+        var compressedExcess: Int64 = 0
         var dominantExt: ExtKey = .none
         /// Direct child directories, after the same skip rules as the scanner
         /// (skip paths, foreign mount points) — so a structural diff against the
@@ -1549,8 +1566,11 @@ final class ScanController {
                 snap.filesLogical += entry.logicalSize
                 snap.filesPhysical += entry.physicalSize
                 snap.fileCount += 1
+                if entry.isSparse { snap.sparseExcess += entry.apparentExcess }
+                else if entry.isCompressed { snap.compressedExcess += entry.apparentExcess }
                 if entry.linkCount > 1 { snap.sawHardlinks = true }
-                snap.items.append(FileItem(name: name, logical: entry.logicalSize, physical: entry.physicalSize))
+                snap.items.append(FileItem(name: name, logical: entry.logicalSize, physical: entry.physicalSize,
+                                           compressed: entry.isCompressed))
                 let key = ExtKey(name: entry.name, length: entry.nameLength)
                 snap.ext[key, default: ExtStat()].add(logical: entry.logicalSize, physical: entry.physicalSize)
             }
@@ -1622,7 +1642,7 @@ final class ScanController {
             if let known = extSnapshots[childPath], child.childCount == 0,
                let ds = scanner as? DirectoryScanner {
                 ds.subtractExtensions(known)
-                extRows = ds.snapshotExtensions(metric: metric, limit: 250)
+                extRows = ds.snapshotExtensions(limit: 250)
             } else if child.fileCount.load(ordering: .relaxed) > 0 {
                 typesDrifted = true
             }
@@ -1653,7 +1673,7 @@ final class ScanController {
             noteAppliedPhysical(addedPhysical)
             if let ds = scanner as? DirectoryScanner {
                 ds.mergeExtensions(sub.snapshotRawExtensions())
-                extRows = ds.snapshotExtensions(metric: metric, limit: 250)
+                extRows = ds.snapshotExtensions(limit: 250)
             }
         }
 
@@ -1661,13 +1681,18 @@ final class ScanController {
         let dLogical = snap.filesLogical - node.directFilesLogical
         let dPhysical = snap.filesPhysical - node.directFilesPhysical
         let dCount = snap.fileCount - node.directFileCount
-        if dLogical != 0 || dPhysical != 0 || dCount != 0 {
-            node.adjustDirectFiles(logical: dLogical, physical: dPhysical, count: dCount)
+        let dSparseE = snap.sparseExcess - node.directSparseExcess
+        let dCompressedE = snap.compressedExcess - node.directCompressedExcess
+        if dLogical != 0 || dPhysical != 0 || dCount != 0 || dSparseE != 0 || dCompressedE != 0 {
+            node.adjustDirectFiles(logical: dLogical, physical: dPhysical, count: dCount,
+                                   sparseExcess: dSparseE, compressedExcess: dCompressedE)
             var n: FSNode? = node
             while let a = n {
                 a.aggLogical.wrappingAdd(dLogical, ordering: .relaxed)
                 a.aggPhysical.wrappingAdd(dPhysical, ordering: .relaxed)
                 a.fileCount.wrappingAdd(dCount, ordering: .relaxed)
+                if dSparseE != 0 { a.aggSparseExcess.wrappingAdd(dSparseE, ordering: .relaxed) }
+                if dCompressedE != 0 { a.aggCompressedExcess.wrappingAdd(dCompressedE, ordering: .relaxed) }
                 n = a.parent
             }
             noteAppliedPhysical(dPhysical)
@@ -1682,7 +1707,7 @@ final class ScanController {
             if oldExt != snap.ext, let ds = scanner as? DirectoryScanner {
                 ds.subtractExtensions(oldExt)
                 ds.mergeExtensions(snap.ext)
-                extRows = ds.snapshotExtensions(metric: metric, limit: 250)
+                extRows = ds.snapshotExtensions(limit: 250)
             }
         } else if dLogical != 0 || dPhysical != 0 || dCount != 0 {
             typesDrifted = true
@@ -1692,12 +1717,11 @@ final class ScanController {
 
         // The snapshot *is* the fresh listing — the outline follows for free.
         var items = snap.items
+        items.sort { $0.physical > $1.physical }
         if items.count > Self.maxFilesPerFolder {
-            items.sort { $0.physical > $1.physical }
             items.removeLast(items.count - Self.maxFilesPerFolder)
         }
-        items.sort { $0.size(metric) > $1.size(metric) }
-        fileCache[ObjectIdentifier(node)] = FileListing(count: snap.fileCount, metric: metric, items: items)
+        fileCache[ObjectIdentifier(node)] = FileListing(count: snap.fileCount, items: items)
 
         refreshTotals()
         bump()
@@ -1851,7 +1875,7 @@ final class ScanController {
         // often than the size refresh.
         tickIndex += 1
         if final || tickIndex % 4 == 0 {
-            extRows = scanner.snapshotExtensions(metric: metric, limit: 250)
+            extRows = scanner.snapshotExtensions(limit: 250)
         }
 
         if scanner.isFinished && phase == .scanning {
@@ -1868,7 +1892,7 @@ final class ScanController {
             }
             filesPerSecond = 0
             stopTimer()
-            extRows = scanner.snapshotExtensions(metric: metric, limit: 250)
+            extRows = scanner.snapshotExtensions(limit: 250)
         }
 
         bump()

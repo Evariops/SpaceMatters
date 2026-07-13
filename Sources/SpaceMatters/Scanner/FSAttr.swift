@@ -12,8 +12,15 @@ enum FSAttr {
     static let cmnName: UInt32          = 0x0000_0001
     static let cmnDevID: UInt32         = 0x0000_0002 // dev_t, exact mode (inode dedup key)
     static let cmnObjType: UInt32       = 0x0000_0008
+    static let cmnFlags: UInt32         = 0x0004_0000 // BSD st_flags (u_int32) — UF_COMPRESSED lives here
     static let cmnFileID: UInt32        = 0x0200_0000 // inode number (u_int64), exact mode
     static let cmnError: UInt32         = 0x2000_0000
+
+    // BSD file flags (sys/stat.h)
+    /// File data is transparently compressed by the filesystem (AFSC/decmpfs).
+    /// Distinguishes "smaller on disk because compressed" from "smaller on disk
+    /// because sparse" — the two causes call for different user guidance.
+    static let ufCompressed: UInt32     = 0x0000_0020
 
     // Directory attribute bits
     static let dirMountStatus: UInt32   = 0x0000_0004
@@ -42,6 +49,9 @@ struct BulkEntry {
     let isMountPoint: Bool
     let logicalSize: Int64
     let physicalSize: Int64
+    /// BSD `st_flags` of the entry (0 when the filesystem doesn't report them,
+    /// e.g. some network mounts) — used to tell compressed apart from sparse.
+    let flags: UInt32
     /// Inode number — only populated when the enumerator is `hardlinkAware`
     /// (exact counting mode); `0` otherwise.
     let fileID: UInt64
@@ -53,6 +63,21 @@ struct BulkEntry {
     /// Hardlink count — `0` unless `hardlinkAware`. `> 1` marks a file whose
     /// blocks are shared by several directory entries (dedup candidate).
     let linkCount: UInt32
+
+    /// Content stored compressed (APFS/HFS+ transparent compression): the
+    /// apparent size exceeds the footprint because the data shrank.
+    @inline(__always)
+    var isCompressed: Bool { flags & FSAttr.ufCompressed != 0 }
+
+    /// Holes: fewer blocks allocated than the content length (VM/container disk
+    /// images, database preallocations…). Never true for block-padded regular
+    /// files — padding makes the physical size *larger*, not smaller.
+    @inline(__always)
+    var isSparse: Bool { !isCompressed && physicalSize < logicalSize }
+
+    /// Bytes of apparent size not backed by disk blocks (0 for ordinary files).
+    @inline(__always)
+    var apparentExcess: Int64 { max(0, logicalSize - physicalSize) }
 }
 
 /// Enumerate every direct child of an open directory file descriptor, invoking
@@ -68,7 +93,8 @@ func enumerateDirectory(
 ) -> Int {
     var attrList = attrlist()
     attrList.bitmapcount = 5 // ATTR_BIT_MAP_COUNT
-    attrList.commonattr = FSAttr.cmnReturnedAttrs | FSAttr.cmnName | FSAttr.cmnObjType | FSAttr.cmnError
+    attrList.commonattr = FSAttr.cmnReturnedAttrs | FSAttr.cmnName | FSAttr.cmnObjType
+        | FSAttr.cmnFlags | FSAttr.cmnError
     attrList.dirattr = FSAttr.dirMountStatus
     attrList.fileattr = FSAttr.fileTotalSize | FSAttr.fileAllocSize
     // Exact counting mode also needs the inode + link count to dedup hardlinks.
@@ -139,6 +165,15 @@ func enumerateDirectory(
                 off += 4
             }
 
+            // ATTR_CMN_FLAGS (0x00040000) packs after OBJTYPE (0x08), before
+            // FILEID (0x02000000) — ascending-bit order. Gated on the returned
+            // mask: a filesystem that can't report flags just yields 0.
+            var flags: UInt32 = 0
+            if commonReturned & FSAttr.cmnFlags != 0 {
+                flags = entry.loadUnaligned(fromByteOffset: off, as: UInt32.self)
+                off += 4
+            }
+
             // ATTR_CMN_FILEID (0x02000000) sorts after ATTR_CMN_OBJTYPE (0x08) in
             // the buffer's ascending-bit packing order. Present only in exact mode.
             var fileID: UInt64 = 0
@@ -186,6 +221,7 @@ func enumerateDirectory(
                     isMountPoint: isMountPoint,
                     logicalSize: logical,
                     physicalSize: physical,
+                    flags: flags,
                     fileID: fileID,
                     deviceID: deviceID,
                     linkCount: linkCount

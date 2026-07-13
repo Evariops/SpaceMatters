@@ -164,7 +164,6 @@ struct DirectoryTable: NSViewRepresentable {
                 isSelected: controller.selectedRowIDs.contains(row.id),
                 isHovered: index == hoveredRow,
                 isDirty: isDirty,
-                metric: controller.metric,
                 controller: controller,
                 theme: theme
             )

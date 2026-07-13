@@ -7,7 +7,7 @@ struct TypeBreakdownView: View {
 
     var body: some View {
         let rows = controller.extRows
-        let maxSize = rows.first?.size(controller.metric) ?? 1
+        let maxSize = rows.first?.physical ?? 1
 
         VStack(alignment: .leading, spacing: 0) {
             HStack {
@@ -33,7 +33,7 @@ struct TypeBreakdownView: View {
             ScrollView {
                 LazyVStack(spacing: 0) {
                     ForEach(rows) { row in
-                        TypeRow(row: row, metric: controller.metric, maxSize: max(maxSize, 1),
+                        TypeRow(row: row, maxSize: max(maxSize, 1),
                                 isSelected: controller.selectedExt == row.key) {
                             controller.toggleExt(row.key)
                         }
@@ -47,7 +47,6 @@ struct TypeBreakdownView: View {
 
 private struct TypeRow: View {
     let row: ExtRow
-    let metric: SizeMetric
     let maxSize: Int64
     let isSelected: Bool
     let onTap: () -> Void
@@ -55,7 +54,7 @@ private struct TypeRow: View {
     @State private var hovering = false
 
     private var fraction: Double {
-        maxSize > 0 ? min(1, Double(row.size(metric)) / Double(maxSize)) : 0
+        maxSize > 0 ? min(1, Double(row.physical) / Double(maxSize)) : 0
     }
 
     var body: some View {
@@ -80,10 +79,13 @@ private struct TypeRow: View {
             }
             .frame(height: 5)
 
-            Text(Format.bytes(row.size(metric)))
+            Text(Format.bytes(row.physical))
                 .font(.system(size: 11, weight: .medium).monospacedDigit())
                 .foregroundStyle(theme.textSecondary)
                 .frame(width: 66, alignment: .trailing)
+                // Disk-image types (.raw, .ext4…) can declare far more than they
+                // occupy — the tooltip carries the apparent size and the why.
+                .help(row.divergence?.summary ?? "")
 
             Text(Format.count(row.count))
                 .font(.system(size: 10).monospacedDigit())
@@ -97,7 +99,7 @@ private struct TypeRow: View {
         .onTapGesture(perform: onTap)
         .onHover { hovering = $0 }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(row.name), \(Format.bytes(row.size(metric))), \(Format.count(row.count)) files")
+        .accessibilityLabel("\(row.name), \(Format.bytes(row.physical)), \(Format.count(row.count)) files")
         .accessibilityAddTraits(isSelected ? [.isSelected, .isButton] : .isButton)
         .accessibilityHint("Filter the treemap by this file type")
     }

@@ -60,7 +60,7 @@ import Foundation
         #expect(root.aggLogical.load(ordering: .relaxed) == 4000 + 900)         // 4900
         #expect(scanner.directoryCount == 2)                                     // root + sub
 
-        let exts = Set(scanner.snapshotExtensions(metric: .physical, limit: 10).map(\.name))
+        let exts = Set(scanner.snapshotExtensions(limit: 10).map(\.name))
         #expect(exts.contains(".dat") && exts.contains(".txt"))
     }
 }
