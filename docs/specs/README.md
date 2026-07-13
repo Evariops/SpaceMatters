@@ -23,5 +23,9 @@ Guiding principle (carried over from the plan): **integrity > performance > robu
 | [SPEC-07](SPEC-07-distribution.md) | **Signed/notarized DMG distribution via GitHub** (v1) | J1.1–J1.5, D4 | 1–2 d | — |
 | [SPEC-08](SPEC-08-accessibility.md) | Full accessibility & i18n | J10.1–J10.4, J9.5 | 1–2 d | SPEC-01 (partial) |
 | [SPEC-09](SPEC-09-gpu-treemap-rendering.md) | **3D-native** GPU treemap rendering (Metal, ortho 2D projection) | perf-resize (PR #17) | 2–3 d | PR #17 (NSView seam, done) |
+| [SPEC-10](SPEC-10-world-treemap.md) | Persistent **world** treemap: continuous camera, LOD, morph | perf-resize (PR #24) | 3–4 d | SPEC-09 |
+| [SPEC-11](SPEC-11-incremental-refresh.md) | Incremental per-directory refresh — the living map | SPEC-02/04 follow-up | 2–3 d | SPEC-02, SPEC-04 |
+| [SPEC-12](SPEC-12-auto-update.md) | Auto-updates (Sparkle 2) | J1.x, D4 | 1 d | SPEC-07 |
+| [SPEC-13](SPEC-13-sunburst.md) | **Sunburst view** — polar projection of the world (same scan, no re-scan on switch) | feature request | 1–2 d | SPEC-09, SPEC-10 |
 
 **Recommended order**: SPEC-02 (unblocks SPEC-04 and closes A6/A7 cleanly) → SPEC-01 → SPEC-03 → SPEC-08 → SPEC-04 → SPEC-05/06/07 depending on product priorities.

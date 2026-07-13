@@ -216,18 +216,49 @@ private struct FDABanner: View {
 private struct TreemapPane: View {
     @Bindable var controller: ScanController
     @Environment(\.theme) private var theme
+    /// Persisted map projection. Both modes draw the same scan through the same
+    /// controller (tree, zoom, selection, search) — switching never re-scans.
+    @AppStorage("mapMode") private var mapMode = MapMode.treemap
 
     var body: some View {
         VStack(spacing: 0) {
-            Breadcrumb(controller: controller)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 7)
-                .background(theme.panelBackground)
+            HStack(spacing: 10) {
+                Breadcrumb(controller: controller)
+                MapModePicker(mode: $mapMode)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .background(theme.panelBackground)
 
             Divider().overlay(theme.separator)
-            TreemapView(controller: controller)
+            switch mapMode {
+            case .treemap: TreemapView(controller: controller)
+            case .sunburst: SunburstView(controller: controller)
+            }
         }
-        .background(theme.treemapBackground)
+        // The treemap has its own darker canvas; the sunburst floats on the
+        // app's panel colour (same as the neighbouring panes).
+        .background(mapMode == .treemap ? theme.treemapBackground : theme.panelBackground)
+    }
+}
+
+/// Treemap ⇄ sunburst switch — two projections of the same scan.
+private struct MapModePicker: View {
+    @Binding var mode: MapMode
+
+    var body: some View {
+        Picker("", selection: $mode) {
+            Image(systemName: "rectangle.split.3x3")
+                .accessibilityLabel("Treemap")
+                .tag(MapMode.treemap)
+            Image(systemName: "chart.pie")
+                .accessibilityLabel("Sunburst")
+                .tag(MapMode.sunburst)
+        }
+        .pickerStyle(.segmented)
+        .fixedSize()
+        .accessibilityLabel("Map style")
+        .help("Map style: treemap or sunburst — same scan, no re-scan when switching")
     }
 }
 

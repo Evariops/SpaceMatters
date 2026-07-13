@@ -57,70 +57,9 @@ struct TreemapView: View {
             }
             .accessibilityElement(children: .ignore)
             .accessibilityLabel("Treemap")
-            .accessibilityValue(treemapSummary)
+            .accessibilityValue(mapAccessibilitySummary(controller))
         } else {
-            TreemapUnavailableView()
-        }
-    }
-
-    /// A spoken summary of the (drawing-opaque) treemap: the zoomed folder plus its
-    /// largest children by share — so VoiceOver conveys the shape of the map.
-    private var treemapSummary: String {
-        guard let zoom = controller.zoomRoot else { return "" }
-        let head = "Showing \(zoom.name), \(Format.bytes(zoom.sizeOnDisk))."
-        let total = max(zoom.sizeOnDisk, 1)
-        let kids = controller.sortedChildren(zoom).prefix(5).map {
-            "\($0.name) \(Int((Double($0.sizeOnDisk) / Double(total) * 100).rounded())) percent"
-        }
-        return kids.isEmpty ? head : head + " Largest: " + kids.joined(separator: ", ")
-    }
-}
-
-/// Shown when the Metal renderer can't initialise — no GPU device (a VM without
-/// paravirtualisation) or a broken runtime shader compile. Every Mac that runs
-/// macOS 15 has a Metal GPU, so this is an error state, not a supported mode.
-private struct TreemapUnavailableView: View {
-    @Environment(\.theme) private var theme
-
-    var body: some View {
-        VStack(spacing: 8) {
-            Image(systemName: "exclamationmark.triangle")
-                .font(.system(size: 26))
-                .foregroundStyle(theme.textSecondary)
-            Text("GPU rendering unavailable")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(theme.textPrimary)
-            Text("SpaceMatters draws the treemap with Metal, which this machine doesn't provide.")
-                .font(.system(size: 11))
-                .foregroundStyle(theme.textSecondary)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 320)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .accessibilityElement(children: .combine)
-    }
-}
-
-/// The hover pill's payload — computed in the NSView, rendered by SwiftUI.
-struct HoverInfo: Equatable {
-    let title: String
-    let isDirectory: Bool
-    let sizeText: String
-}
-
-/// Isolates the hover state (see `TreemapView.hoverModel`).
-@MainActor @Observable
-final class HoverModel {
-    var info: HoverInfo?
-}
-
-/// The only view that observes `HoverModel.info` — mouse moves invalidate it alone.
-private struct HoverPill: View {
-    let model: HoverModel
-    var body: some View {
-        if let hover = model.info {
-            HoverLabel(title: hover.title, isDirectory: hover.isDirectory, sizeText: hover.sizeText)
-                .padding(8).allowsHitTesting(false)
+            MapUnavailableView()
         }
     }
 }
@@ -229,6 +168,8 @@ final class TreemapNSView: NSView, CALayerDelegate {
     /// One-shot follow-up when a file listing was still loading during a build.
     private var fileRetryScheduled = false
     private var fileAttempts: [ObjectIdentifier: Int] = [:]
+    /// One-shot follow-up when a present dropped (dry drawable pool).
+    private var presentRetryScheduled = false
 
     // Layers.
     private let metalLayer: CAMetalLayer
@@ -314,7 +255,12 @@ final class TreemapNSView: NSView, CALayerDelegate {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        if window == nil { cancelAnimations() }   // break the CADisplayLink → self cycle on teardown
+        guard let window else { cancelAnimations(); return }   // break the CADisplayLink → self cycle on teardown
+        // (Re)attached — e.g. after a map-mode switch: size the drawable for
+        // this screen and present. Presenting while detached drains the
+        // drawable pool (frames go to an uncomposited layer) and used to leave
+        // the map black for seconds after a switch.
+        setScale(window.backingScaleFactor)
     }
 
     private func setScale(_ scale: CGFloat) {
@@ -415,6 +361,14 @@ final class TreemapNSView: NSView, CALayerDelegate {
                 }
             }
             camera.rect = world.worldBounds
+            // A view (re)created while zoomed — a map-mode switch, typically —
+            // must land on the zoomed folder, not the whole world: the
+            // breadcrumb, list and the other projection all point there.
+            if let target = zoomRoot, target !== root,
+               let rect = world.worldRect(of: target, root: root) {
+                camera.rect = clampedViewport(fitTarget(for: rect))
+                fitMode = false
+            }
             rebuildTiles(morph: false)
             presentTiles()
             overlayLayer.setNeedsDisplay()
@@ -718,14 +672,27 @@ final class TreemapNSView: NSView, CALayerDelegate {
     }
 
     /// Push the current world to screen through the camera — a pure GPU render.
+    /// Never while detached (drawables presented to an uncomposited layer are
+    /// lost and drain the pool); a dropped frame schedules one retry so the map
+    /// can't stay blank until the next data tick.
     private func presentTiles() {
+        guard window != nil else { return }
         let viewport = camera.rect.offsetBy(dx: -rebaseOrigin.x, dy: -rebaseOrigin.y)
-        renderer.draw(into: metalLayer,
-                      camera: Camera.ortho(viewport: viewport),
-                      pointsPerUnit: camera.scale(viewSize: bounds.size),
-                      morph: morphT,
-                      clearColor: backgroundComps,
-                      borderColor: borderComps)
+        let presented = renderer.draw(
+            into: metalLayer,
+            camera: Camera.ortho(viewport: viewport),
+            pointsPerUnit: camera.scale(viewSize: bounds.size),
+            morph: morphT,
+            clearColor: backgroundComps,
+            borderColor: borderComps)
+        if !presented, !presentRetryScheduled, bounds.width > 1 {
+            presentRetryScheduled = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+                guard let self else { return }
+                self.presentRetryScheduled = false
+                self.presentTiles()
+            }
+        }
     }
 
     // MARK: Camera navigation (SPEC-10 M2 — the map)
@@ -1082,79 +1049,11 @@ final class TreemapNSView: NSView, CALayerDelegate {
         guard let tile = tileAt(p), let controller else { return nil }
         let menu = NSMenu()
         menu.autoenablesItems = false
-        if let file = tile.file, let base = controller.path(for: tile.node) {
-            let path = (base == "/" ? "/" : base + "/") + file.name
-            menu.addItem(ClosureMenuItem(title: "Open", symbol: "arrow.up.forward.app") { controller.openItem(path) })
-            menu.addItem(ClosureMenuItem(title: "Reveal in Finder", symbol: "folder") { controller.revealInFinder(path) })
-            menu.addItem(ClosureMenuItem(title: "Copy Path", symbol: "doc.on.doc") { controller.copyPath(path) })
+        if let file = tile.file {
+            MapContextMenu.addFileItems(menu, fileName: file.name, node: tile.node, controller: controller)
         } else {
-            buildDirMenu(menu, node: tile.node, controller: controller)
+            MapContextMenu.addDirectoryItems(menu, node: tile.node, controller: controller)
         }
         return menu.numberOfItems > 0 ? menu : nil
-    }
-
-    private func buildDirMenu(_ menu: NSMenu, node: FSNode, controller: ScanController) {
-        if node.isDirectory {
-            menu.addItem(ClosureMenuItem(title: "Zoom In", symbol: "plus.magnifyingglass") { controller.zoom(into: node) })
-        }
-        if controller.canZoomOut {
-            menu.addItem(ClosureMenuItem(title: "Zoom Out", symbol: "minus.magnifyingglass") { controller.zoomOut() })
-        }
-        guard let path = controller.path(for: node) else { return }
-        menu.addItem(.separator())
-        if controller.isHostScan {
-            menu.addItem(ClosureMenuItem(title: "Reveal in Finder", symbol: "folder") { controller.revealInFinder(path) })
-            menu.addItem(ClosureMenuItem(title: "Copy Path", symbol: "doc.on.doc") { controller.copyPath(path) })
-            menu.addItem(.separator())
-            let trash = ClosureMenuItem(title: "Move to Trash", symbol: "trash") {
-                Task { _ = await controller.remove(directory: node, permanently: false) }
-            }
-            trash.isEnabled = !controller.isScanning
-            menu.addItem(trash)
-        } else {
-            menu.addItem(ClosureMenuItem(title: "Copy Path (in VM)", symbol: "doc.on.doc") { controller.copyPath(path) })
-        }
-    }
-}
-
-/// An `NSMenuItem` that runs a closure when chosen.
-private final class ClosureMenuItem: NSMenuItem {
-    private let handler: () -> Void
-    init(title: String, symbol: String? = nil, handler: @escaping () -> Void) {
-        self.handler = handler
-        super.init(title: title, action: #selector(fire), keyEquivalent: "")
-        target = self
-        if let symbol { image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) }
-    }
-    @available(*, unavailable)
-    required init(coder: NSCoder) { fatalError("init(coder:) unavailable") }
-    @objc private func fire() { handler() }
-}
-
-private struct HoverLabel: View {
-    let title: String
-    let isDirectory: Bool
-    let sizeText: String
-    @Environment(\.theme) private var theme
-
-    var body: some View {
-        HStack(spacing: 6) {
-            Image(systemName: isDirectory ? "folder.fill" : "doc.fill")
-                .foregroundStyle(theme.accent)
-            Text(title)
-                .foregroundStyle(theme.textPrimary)
-                .lineLimit(1)
-                .truncationMode(.head)
-            Text(sizeText)
-                .foregroundStyle(theme.textSecondary)
-        }
-        .font(.system(size: 11, weight: .medium))
-        .padding(.horizontal, 9)
-        .padding(.vertical, 5)
-        .background(
-            RoundedRectangle(cornerRadius: 7)
-                .fill(theme.panelBackground.opacity(0.95))
-                .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(theme.separator))
-        )
     }
 }
