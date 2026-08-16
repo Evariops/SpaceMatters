@@ -182,4 +182,43 @@ import simd
         // Alpha carries the dim factor in the sunburst — it must survive.
         #expect(Verdict.safe.applied(to: SIMD4<Float>(0.5, 0.5, 0.5, 0.42)).w == 0.42)
     }
+
+    @Test func theFirstMarkSwitchesTheOutlineToIt() async throws {
+        let root = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let c = await scanned(root)
+        #expect(c.showVerdictsOnly == false)
+
+        #expect(c.annotate(path: root.appendingPathComponent("caches").path,
+                           verdict: .safe, reason: "x") != nil)
+        // A session marks as it goes; the outline follows without being asked.
+        #expect(c.showVerdictsOnly)
+    }
+
+    @Test func turningTheFilterOffIsNotUndoneByTheNextMark() async throws {
+        // The app must not argue with the user mid-analysis.
+        let root = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let c = await scanned(root)
+        #expect(c.annotate(path: root.appendingPathComponent("caches").path,
+                           verdict: .safe, reason: "x") != nil)
+        c.showVerdictsOnly = false
+
+        #expect(c.annotate(path: root.appendingPathComponent("keepme").path,
+                           verdict: .review, reason: "y") != nil)
+        #expect(c.showVerdictsOnly == false)
+    }
+
+    @Test func clearingRearmsTheAutoFilterForTheNextRun() async throws {
+        let root = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let c = await scanned(root)
+        let caches = root.appendingPathComponent("caches").path
+        #expect(c.annotate(path: caches, verdict: .safe, reason: "x") != nil)
+        c.clearVerdicts()
+        #expect(c.showVerdictsOnly == false)
+
+        #expect(c.annotate(path: caches, verdict: .safe, reason: "again") != nil)
+        #expect(c.showVerdictsOnly)
+    }
 }

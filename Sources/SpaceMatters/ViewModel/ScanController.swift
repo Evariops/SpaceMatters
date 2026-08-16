@@ -770,6 +770,10 @@ final class ScanController {
     /// Outline filter: show only what an assistant marked. Off whenever there is
     /// nothing marked, so the list can never come up mysteriously empty.
     var showVerdictsOnly = false
+    /// Whether the first mark of this batch already switched the filter on.
+    /// Without it, a user who turns the filter *off* mid-analysis would have it
+    /// turned back on by the session's next mark — the app arguing with them.
+    @ObservationIgnored private var didAutoFilter = false
 
     /// A node's verdict, inherited from the nearest annotated ancestor: marking
     /// `~/Library/Caches` has to paint the region, not one tile inside it.
@@ -789,14 +793,24 @@ final class ScanController {
     func annotate(path: String, verdict: Verdict, reason: String) -> String? {
         guard let node = nearestNode(toPath: path), let resolved = self.path(for: node),
               resolved == Self.canonical(path) || resolved == path else { return nil }
+        let wasEmpty = verdictPaths.isEmpty
         verdictPaths[resolved] = VerdictNote(verdict: verdict, reason: reason)
         rebindVerdicts()
+        // The first mark of a run switches the outline to it. A session marks as
+        // it goes, and one folder highlighted eight levels down a 335 k-folder
+        // tree is a finding nobody sees — this makes the analysis visible while
+        // it happens. Once only: after that the toggle is the user's.
+        if wasEmpty, !didAutoFilter {
+            didAutoFilter = true
+            showVerdictsOnly = true
+        }
         return resolved
     }
 
     func clearVerdicts() {
         guard !verdictPaths.isEmpty else { return }
         verdictPaths.removeAll()
+        didAutoFilter = false // the next run gets the same courtesy
         rebindVerdicts()
     }
 
@@ -820,7 +834,11 @@ final class ScanController {
         }
         verdictsByNode = resolved
         verdictAncestry = ancestry
-        verdictCount = verdictPaths.count
+        // Counts what actually resolved against *this* tree, not what is stored.
+        // Scanning another disk leaves the paths behind — durable, so they come
+        // back if the user returns — but a filter button offering to hide
+        // everything down to nothing is a button that lies.
+        verdictCount = resolved.count
         if resolved.isEmpty { showVerdictsOnly = false }
         verdictVersion &+= 1
     }
