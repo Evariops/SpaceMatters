@@ -11,7 +11,7 @@ let package = Package(
         // Auto-update (SPEC-12). Binary XCFramework; ≥ 2.9 for native markdown
         // release notes. SwiftPM copies the framework next to dev/test binaries
         // (@loader_path); the .app bundle embeds it under Contents/Frameworks.
-        .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.9.0")
+        .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.9.5")
     ],
     targets: [
         .executableTarget(
