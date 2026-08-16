@@ -159,11 +159,17 @@ struct DirectoryTable: NSViewRepresentable {
             let row = rows[index]
             let isDirty: Bool
             if case .directory(let node) = row.kind { isDirty = controller.isDirty(node) } else { isDirty = false }
+            // Resolved here, at row-build time, so it becomes part of the
+            // value SwiftUI diffs (inherited from the nearest annotated
+            // ancestor, the same rule the maps use).
+            var verdict: VerdictNote?
+            if case .directory(let node) = row.kind { verdict = controller.verdict(for: node) }
             return OutlineRowView(
                 row: row,
                 isSelected: controller.selectedRowIDs.contains(row.id),
                 isHovered: index == hoveredRow,
                 isDirty: isDirty,
+                verdict: verdict,
                 controller: controller,
                 theme: theme
             )

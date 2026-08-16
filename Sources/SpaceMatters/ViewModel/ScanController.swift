@@ -432,6 +432,14 @@ final class ScanController {
         isHost: Bool,
         nodePaths: [ObjectIdentifier: String]
     ) {
+        // Verdicts belong to the analysis that produced them. A rescan of the
+        // same root keeps them — the user is refreshing what they are working
+        // on, and the marks are the work. Anything else (another disk, another
+        // folder, a fresh pick after Home) is a different analysis, and carrying
+        // stale colours into it would assert conclusions nobody drew about it.
+        // Checked here, before `rootPath` is overwritten below.
+        if displayPath.isEmpty || displayPath != rootPath { discardVerdicts() }
+
         // The old tree is being replaced: abort in-flight structural operations
         // (they re-check the epoch after each await), stop a sub-scan that would
         // otherwise keep re-scanning an orphaned subtree, and keep the outgoing
@@ -504,6 +512,9 @@ final class ScanController {
 
     /// Discard the current scan and return to the disk-selection splash.
     func goHome() {
+        // Leaving the analysis ends it: re-picking the same disk from the splash
+        // starts a fresh one, not a resumption of the last session's verdicts.
+        discardVerdicts()
         treeEpoch &+= 1
         activeSubScan?.cancel()
         let oldScanner = scanner
@@ -750,6 +761,157 @@ final class ScanController {
         return (base == "/" ? "/" : base + "/") + file.name
     }
 
+    // MARK: LLM verdicts (SPEC-14 §3.5)
+
+    /// Verdicts keyed by node, for the renderers — rebuilt from `verdictPaths`
+    /// whenever the tree changes.
+    @ObservationIgnored private(set) var verdictsByNode: [ObjectIdentifier: VerdictNote] = [:]
+    /// The source of truth. Paths survive what node identity does not: SPEC-02
+    /// `invalidate` rebuilds a subtree as *fresh objects*, and a verdict that
+    /// silently migrated to the wrong node would be worse than losing it.
+    @ObservationIgnored private var verdictPaths: [String: VerdictNote] = [:]
+    /// Bumped so views redraw; separate from `version`, which means "the tree
+    /// changed" and would re-run layout for a recolour.
+    private(set) var verdictVersion = 0
+    /// Observable so the menu can enable "Clear" without reaching into the map.
+    private(set) var verdictCount = 0
+    /// Every ancestor of an annotated node — what the outline needs to place a
+    /// mark that sits eight levels down without listing everything in between.
+    @ObservationIgnored private var verdictAncestry: Set<ObjectIdentifier> = []
+    /// Outline filter: show only what an assistant marked. Off whenever there is
+    /// nothing marked, so the list can never come up mysteriously empty.
+    var showVerdictsOnly = false
+    /// Whether the first mark of this batch already switched the filter on.
+    /// Without it, a user who turns the filter *off* mid-analysis would have it
+    /// turned back on by the session's next mark — the app arguing with them.
+    @ObservationIgnored private var didAutoFilter = false
+
+    /// A node's verdict, inherited from the nearest annotated ancestor: marking
+    /// `~/Library/Caches` has to paint the region, not one tile inside it.
+    func verdict(for node: FSNode) -> VerdictNote? {
+        guard !verdictsByNode.isEmpty else { return nil }
+        var current: FSNode? = node
+        while let n = current {
+            if let note = verdictsByNode[ObjectIdentifier(n)] { return note }
+            current = n.parent
+        }
+        return nil
+    }
+
+    /// Returns the resolved path, or `nil` when it isn't in the scanned tree —
+    /// the caller reports that rather than annotating nothing silently.
+    @discardableResult
+    func annotate(path: String, verdict: Verdict, reason: String) -> String? {
+        guard let node = nearestNode(toPath: path), let resolved = self.path(for: node),
+              resolved == Self.canonical(path) || resolved == path else { return nil }
+        let wasEmpty = verdictPaths.isEmpty
+        verdictPaths[resolved] = VerdictNote(verdict: verdict, reason: reason)
+        rebindVerdicts()
+        // The first mark of a run switches the outline to it. A session marks as
+        // it goes, and one folder highlighted eight levels down a 335 k-folder
+        // tree is a finding nobody sees — this makes the analysis visible while
+        // it happens. Once only: after that the toggle is the user's.
+        if wasEmpty, !didAutoFilter {
+            didAutoFilter = true
+            showVerdictsOnly = true
+        }
+        return resolved
+    }
+
+    func clearVerdicts() {
+        guard !verdictPaths.isEmpty else { return }
+        discardVerdicts()
+    }
+
+    /// Forget every mark. Unlike `rebindVerdicts` this touches no nodes, so it is
+    /// safe to call mid-teardown, while the tree is being replaced.
+    private func discardVerdicts() {
+        guard !verdictPaths.isEmpty else { return }
+        verdictPaths.removeAll()
+        verdictsByNode = [:]
+        verdictAncestry = []
+        verdictCount = 0
+        didAutoFilter = false // the next run gets the same courtesy
+        showVerdictsOnly = false
+        verdictVersion &+= 1
+    }
+
+    /// Re-resolve every annotated path against the current tree. Cheap — there
+    /// are tens of verdicts, not thousands — so it runs on every tree bump
+    /// rather than trying to detect which subtree moved.
+    private func rebindVerdicts() {
+        var resolved: [ObjectIdentifier: VerdictNote] = [:]
+        var ancestry: Set<ObjectIdentifier> = []
+        for (path, note) in verdictPaths {
+            guard let node = node(at: path) else { continue }
+            resolved[ObjectIdentifier(node)] = note
+            var parent = node.parent
+            while let n = parent {
+                // Stop early where an ancestor is already recorded: with many
+                // marks under one tree this turns a quadratic walk into a linear
+                // one.
+                if !ancestry.insert(ObjectIdentifier(n)).inserted { break }
+                parent = n.parent
+            }
+        }
+        verdictsByNode = resolved
+        verdictAncestry = ancestry
+        // Counts what actually resolved against *this* tree, not what is stored.
+        // Scanning another disk leaves the paths behind — durable, so they come
+        // back if the user returns — but a filter button offering to hide
+        // everything down to nothing is a button that lies.
+        verdictCount = resolved.count
+        if resolved.isEmpty { showVerdictsOnly = false }
+        verdictVersion &+= 1
+    }
+
+    // MARK: LLM briefing (SPEC-14 §3.7)
+
+    /// Markdown digest of what the user is currently looking at — the zoom root,
+    /// not necessarily the whole scan — budgeted to fit a chat context.
+    ///
+    /// `nil` when there is nothing scanned yet. Available mid-scan too: the tree
+    /// is consistent at any tick (sizes are atomics propagated as directories
+    /// complete), it is simply incomplete, which the header's timing line makes
+    /// visible.
+    func llmBriefing(maxNodes: Int = 300) -> String? {
+        guard let root else { return nil }
+        let target = zoomRoot ?? root
+        let whole = target === root
+        let snapshot = TreeDigest.Snapshot(
+            title: whole ? rootName : target.name,
+            path: path(for: target) ?? rootPath,
+            isWholeScan: whole,
+            onDisk: target.sizeOnDisk,
+            apparent: target.sizeApparent,
+            files: target.fileCount.load(ordering: .relaxed),
+            // Only the scan-wide directory count is tracked; a subtree's would be
+            // a fresh walk for one header number.
+            folders: whole ? dirCount : nil,
+            skipped: errorCount,
+            counting: countingMode,
+            scanDate: scanDate,
+            elapsed: elapsed,
+            // `extRows` is scanner-global and exact; a subtree gets the
+            // reconstructed estimate instead, labelled as such by the renderer.
+            // There is no exact third option — no per-directory extension table
+            // survives the scan, by design.
+            types: whole ? extRows : TreeQuery.approximateTypes(of: target))
+        return TreeDigest.briefing(root: target, snapshot: snapshot,
+                                   options: .init(maxNodes: maxNodes))
+    }
+
+    /// Puts `llmBriefing()` on the general pasteboard. Returns false when there
+    /// was nothing to copy, so the caller can stay silent instead of clearing the
+    /// user's clipboard for no reason.
+    @discardableResult
+    func copyLLMBriefing() -> Bool {
+        guard let text = llmBriefing() else { return false }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        return true
+    }
+
     /// Resolve a filesystem path back to its directory node by walking from the
     /// nearest seed. Used to re-bind navigation state after `invalidate` rebuilds
     /// a subtree's nodes as fresh objects (their identities change, paths don't).
@@ -810,6 +972,28 @@ final class ScanController {
                 out.append(OutlineRow(
                     kind: .directory(node), depth: depth, siblingMax: siblingMax,
                     isExpandable: false, isExpanded: !kids.isEmpty, id: .dir(ObjectIdentifier(node))))
+                let childMax = max(kids.first?.sizeOnDisk ?? 1, 1)
+                for kid in kids { walk(kid, depth: depth + 1, siblingMax: childMax) }
+            }
+            walk(root, depth: 0, siblingMax: max(root.sizeOnDisk, 1))
+            return out
+        }
+
+        // Verdicts-only: the same pruned-tree shape search uses — the marked
+        // folders plus the ancestors needed to place them, fully expanded, and
+        // nothing below a mark (its contents are not the finding, it is).
+        if showVerdictsOnly, !verdictsByNode.isEmpty {
+            var out: [OutlineRow] = []
+            func walk(_ node: FSNode, depth: Int, siblingMax: Int64) {
+                let id = ObjectIdentifier(node)
+                guard verdictAncestry.contains(id) || verdictsByNode[id] != nil else { return }
+                let marked = verdictsByNode[id] != nil
+                let kids = marked ? [] : sortedChildren(node).filter {
+                    verdictAncestry.contains(ObjectIdentifier($0)) || verdictsByNode[ObjectIdentifier($0)] != nil
+                }
+                out.append(OutlineRow(
+                    kind: .directory(node), depth: depth, siblingMax: siblingMax,
+                    isExpandable: false, isExpanded: !kids.isEmpty, id: .dir(id)))
                 let childMax = max(kids.first?.sizeOnDisk ?? 1, 1)
                 for kid in kids { walk(kid, depth: depth + 1, siblingMax: childMax) }
             }
@@ -1966,6 +2150,9 @@ final class ScanController {
             } else {
                 phase = .finished
                 scanDate = Date()
+                // Open the MCP socket only now: a session that attaches finds a
+                // finished tree rather than an empty controller (SPEC-14 §3.5).
+                MCPBridge.shared.startIfNeeded(controller: self)
                 startWatching() // begin watching the disk for changes (SPEC-04)
                 // Capture the budget baseline *after* startWatching — it resets
                 // watch state (including the baseline) on entry (issue #14).
@@ -1981,5 +2168,8 @@ final class ScanController {
 
     private func bump() {
         version &+= 1
+        // The tree may have been rebuilt under the verdicts (SPEC-02 invalidate
+        // replaces nodes with fresh objects); re-resolve them by path.
+        if !verdictPaths.isEmpty { rebindVerdicts() }
     }
 }

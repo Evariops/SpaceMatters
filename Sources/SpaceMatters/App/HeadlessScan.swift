@@ -82,6 +82,42 @@ enum HeadlessScan {
         return 0
     }
 
+    /// Scan a path and print the LLM briefing (SPEC-14 §3.7) on stdout — the same
+    /// text `⌘⇧C` puts on the clipboard. Exists so the digest can be inspected and
+    /// piped on a real tree without driving the GUI, and it is the entry point the
+    /// MCP server (SPEC-14 phase 2) grows out of.
+    @discardableResult
+    static func runBriefing(path: String, maxNodes: Int) -> Int32 {
+        guard FileManager.default.fileExists(atPath: path) else {
+            FileHandle.standardError.write(Data("error: path does not exist: \(path)\n".utf8))
+            return 1
+        }
+        let url = URL(fileURLWithPath: path)
+        let root = FSNode(name: url.lastPathComponent.isEmpty ? url.path : url.lastPathComponent, parent: nil)
+        let seeds = [DirectoryScanner.Seed(path: url.path, node: root)]
+        let scanner = DirectoryScanner(root: root, seeds: seeds,
+                                       skipPaths: DirectoryScanner.recommendedSkipPaths(seedPaths: [url.path]))
+        let start = Date()
+        scanner.start()
+        while !scanner.isFinished { usleep(20_000) }
+
+        let snapshot = TreeDigest.Snapshot(
+            title: root.name,
+            path: url.path,
+            isWholeScan: true,
+            onDisk: root.sizeOnDisk,
+            apparent: root.sizeApparent,
+            files: root.fileCount.load(ordering: .relaxed),
+            folders: scanner.dirCount.load(ordering: .relaxed),
+            skipped: scanner.errorCount.load(ordering: .relaxed),
+            counting: .attribution,
+            scanDate: Date(),
+            elapsed: Date().timeIntervalSince(start),
+            types: scanner.snapshotExtensions(limit: 15))
+        print(TreeDigest.briefing(root: root, snapshot: snapshot, options: .init(maxNodes: maxNodes)))
+        return 0
+    }
+
     /// Headless VM scan that prints rising counts as the stream arrives — proves
     /// the find-over-SSH backend updates progressively, not in one blocking call.
     /// Returns an exit code (0 ok, 1 failure) so scripts can rely on it.

@@ -68,6 +68,17 @@ final class AppModel {
         if filesystem.root != nil { route = .filesystem }
     }
 
+    /// SPEC-14 phase 0: hand the current view to an assistant of the user's
+    /// choosing via the clipboard — no MCP install, no network, no API key.
+    /// Filesystem mode only for now; the container/K8s/cleanup views have their
+    /// own shapes and no digest yet.
+    var canCopyBriefing: Bool { route == .filesystem && filesystem.root != nil }
+
+    func copyBriefing() {
+        guard canCopyBriefing else { return }
+        filesystem.copyLLMBriefing()
+    }
+
     /// Scan an arbitrary host over SSH (streamed `find`, read-only) — SPEC-06.
     func scanRemote(_ target: SSHTarget) {
         route = .filesystem

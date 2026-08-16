@@ -35,6 +35,15 @@ rm -rf "$FRAMEWORK/Versions/B/XPCServices"    "$FRAMEWORK/XPCServices" \
        "$FRAMEWORK/Versions/B/PrivateHeaders" "$FRAMEWORK/PrivateHeaders" \
        "$FRAMEWORK/Versions/B/Modules"        "$FRAMEWORK/Modules"
 
+# Claude skill (SPEC-14 phase 4). Shipped inside the bundle so "Set up the
+# Claude integration" can install it without a download; it is the method half
+# of the pairing whose data half is the --mcp server.
+if [ -d "Packaging/skills" ]; then
+    echo "Embedding Claude skills..."
+    mkdir -p "$APP/Contents/Resources/skills"
+    cp -R Packaging/skills/* "$APP/Contents/Resources/skills/"
+fi
+
 # App icon (J1.2). Regenerate with ./Packaging/make-icon.sh if the look changes.
 ICON_KEY=""
 if [ -f "Packaging/AppIcon.icns" ]; then

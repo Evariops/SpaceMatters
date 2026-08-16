@@ -298,6 +298,7 @@ final class DirectoryScanner: ScanBackend {
         var fileCount: Int64 = 0
         var sparseExcess: Int64 = 0
         var compressedExcess: Int64 = 0
+        var newestMTime: Int64 = 0
         var localExt: [ExtKey: ExtStat] = [:]
 
         // Avoid a double slash when the parent is "/" so paths match skip entries.
@@ -335,6 +336,10 @@ final class DirectoryScanner: ScanBackend {
                 if entry.isSparse { sparseExcess += effExcess }
                 else if entry.isCompressed { compressedExcess += effExcess }
                 fileCount += 1
+                // Deduped hardlinks contribute 0 bytes but their write time still
+                // counts: the file *is* in this folder, and coldness is about
+                // whether anything here is still in use, not who owns the blocks.
+                if entry.modTime > newestMTime { newestMTime = entry.modTime }
                 let key = ExtKey(name: entry.name, length: entry.nameLength)
                 localExt[key, default: ExtStat()].add(logical: effL, physical: effP)
             }
@@ -361,13 +366,15 @@ final class DirectoryScanner: ScanBackend {
             fileCount: fileCount,
             dominantExt: dominantExt,
             sparseExcess: sparseExcess,
-            compressedExcess: compressedExcess
+            compressedExcess: compressedExcess,
+            newestMTime: newestMTime
         )
 
         // Propagate this directory's direct-file totals to itself and every
         // ancestor. Summed across all directories, each node ends up holding the
-        // total size of its whole subtree.
-        if filesLogical != 0 || filesPhysical != 0 || fileCount != 0 {
+        // total size of its whole subtree. The write time rides the same walk,
+        // but as a max rather than a sum.
+        if filesLogical != 0 || filesPhysical != 0 || fileCount != 0 || newestMTime != 0 {
             var node: FSNode? = item.node
             while let n = node {
                 n.aggLogical.wrappingAdd(filesLogical, ordering: .relaxed)
@@ -375,6 +382,7 @@ final class DirectoryScanner: ScanBackend {
                 n.fileCount.wrappingAdd(fileCount, ordering: .relaxed)
                 if sparseExcess != 0 { n.aggSparseExcess.wrappingAdd(sparseExcess, ordering: .relaxed) }
                 if compressedExcess != 0 { n.aggCompressedExcess.wrappingAdd(compressedExcess, ordering: .relaxed) }
+                if newestMTime != 0 { n.raiseNewestMTime(newestMTime) }
                 node = n.parent
             }
         }

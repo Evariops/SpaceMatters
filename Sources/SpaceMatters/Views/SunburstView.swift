@@ -38,6 +38,7 @@ struct SunburstView: View {
                 selectedExt: controller.selectedExt,
                 searchMatchIDs: controller.searchMatchIDs,
                 highlightVersion: controller.highlightVersion,
+                verdictVersion: controller.verdictVersion,
                 isDark: theme.isDark,
                 onHover: { [hoverModel] in hoverModel.info = $0 }
             )
@@ -67,6 +68,7 @@ private struct SunburstRepresentable: NSViewRepresentable {
     let selectedExt: ExtKey?
     let searchMatchIDs: Set<ObjectIdentifier>
     let highlightVersion: Int
+    let verdictVersion: Int
     let isDark: Bool
     let onHover: (HoverInfo?) -> Void
 
@@ -76,7 +78,7 @@ private struct SunburstRepresentable: NSViewRepresentable {
         view.apply(controller: controller, theme: theme, version: version, zoomRoot: zoomRoot,
                    zoomRequestID: zoomRequestID, selection: selection,
                    selectedExt: selectedExt, searchMatchIDs: searchMatchIDs,
-                   highlightVersion: highlightVersion)
+                   highlightVersion: highlightVersion, verdictVersion: verdictVersion)
         return view
     }
 
@@ -85,7 +87,7 @@ private struct SunburstRepresentable: NSViewRepresentable {
         view.apply(controller: controller, theme: theme, version: version, zoomRoot: zoomRoot,
                    zoomRequestID: zoomRequestID, selection: selection,
                    selectedExt: selectedExt, searchMatchIDs: searchMatchIDs,
-                   highlightVersion: highlightVersion)
+                   highlightVersion: highlightVersion, verdictVersion: verdictVersion)
     }
 }
 
@@ -114,6 +116,7 @@ final class SunburstNSView: NSView, CALayerDelegate {
     private var selectedExt: ExtKey?
     private var searchMatchIDs: Set<ObjectIdentifier> = []
     private var highlightVersion: Int = .min
+    private var verdictVersion: Int = .min
     private var isDark = true
 
     // The world and the camera.
@@ -278,7 +281,8 @@ final class SunburstNSView: NSView, CALayerDelegate {
 
     func apply(controller: ScanController, theme: Theme, version: UInt64, zoomRoot: FSNode?,
                zoomRequestID: Int, selection: FSNode?, selectedExt: ExtKey?,
-               searchMatchIDs: Set<ObjectIdentifier>, highlightVersion: Int) {
+               searchMatchIDs: Set<ObjectIdentifier>, highlightVersion: Int,
+               verdictVersion: Int) {
         self.controller = controller
 
         let themeChanged = isDark != theme.isDark
@@ -298,6 +302,9 @@ final class SunburstNSView: NSView, CALayerDelegate {
         let rootMoved = zoomRoot !== displayRoot
         let highlightChanged = selectedExt != self.selectedExt
             || highlightVersion != self.highlightVersion || searchMatchIDs != self.searchMatchIDs
+            // A verdict change is a recolour, not a relayout — it rides the same
+            // repack path as search and type highlighting.
+            || verdictVersion != self.verdictVersion
         let selectionChanged = selection !== self.selection
 
         self.version = version
@@ -306,6 +313,7 @@ final class SunburstNSView: NSView, CALayerDelegate {
         self.selectedExt = selectedExt
         self.searchMatchIDs = searchMatchIDs
         self.highlightVersion = highlightVersion
+        self.verdictVersion = verdictVersion
         self.selection = selection
         self.scanRoot = root
         self.displayRoot = zoomRoot
@@ -372,6 +380,14 @@ final class SunburstNSView: NSView, CALayerDelegate {
         layer?.backgroundColor = backgroundCG
         backgroundComps = srgbComps(theme.panelBackground)
         borderComps = srgbComps(theme.treemapBorder)
+    }
+
+    /// Blend an arc toward its verdict (SPEC-14 §3.5). Applied after the palette
+    /// LUT so a verdict never poisons the cached type colours. `w` is the dim
+    /// factor here, not alpha, so only RGB moves.
+    private func verdictTinted(_ color: SIMD4<Float>, _ node: FSNode) -> SIMD4<Float> {
+        guard let controller, let note = controller.verdict(for: node) else { return color }
+        return note.verdict.applied(to: color)
     }
 
     private func srgbComps(_ color: Color) -> SIMD4<Float> {
@@ -592,7 +608,7 @@ final class SunburstNSView: NSView, CALayerDelegate {
             } else if hasSearch, !isUnderMatch(arc.node) {
                 dim = 1
             }
-            var color = arcColor(for: arc, weight: weight)
+            var color = verdictTinted(arcColor(for: arc, weight: weight), arc.node)
             color.w = dim   // `w` carries the dim factor (the shader's alpha is coverage)
             instances.append(ArcInstance(
                 bbox: SIMD4<Float>(Float(box.minX - rebaseOrigin.x),
@@ -1117,7 +1133,8 @@ final class SunburstNSView: NSView, CALayerDelegate {
         return HoverInfo(title: hoverPath(node), isDirectory: node.isDirectory,
                          sizeText: Self.sizeText(
                             onDisk: arc.isFileBlock ? node.directFilesPhysical : node.sizeOnDisk,
-                            divergence: divergence))
+                            divergence: divergence),
+                         verdict: controller?.verdict(for: node))
     }
 
     /// "75 MB · 512 GB apparent (sparse)" when the arc hides a divergence;

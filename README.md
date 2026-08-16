@@ -30,6 +30,26 @@ Memory stays low because the tree keeps one [`FSNode`](Sources/SpaceMatters/Mode
 
 Sizes are atomic counters propagated up the ancestor chain as each directory completes, and the UI reads them ten times per second. That is what makes the live view possible.
 
+## Asking an LLM about your disk
+
+Two ways, both local — nothing is uploaded, and SpaceMatters still makes no network request beyond its update feed.
+
+**Copy a briefing.** `⌘⇧C` puts a compact digest of the current view on the clipboard: totals, file types, and a tree budgeted to a few thousand tokens. Detail follows size rather than depth, single-child chains collapse, small siblings roll up, and folders carry what a size alone can't say — `cold:8mo` when nothing inside has been written since, `sparse`, or `cache:npm` when it's a location the app can safely empty itself. Paste it into any assistant.
+
+**Or let a Claude session query the scan directly**, through a read-only MCP server. The ✦ button in the analysis toolbar sets it up — showing exactly what it will write first — or do it yourself:
+
+```sh
+claude mcp add -s user spacematters -- /Applications/SpaceMatters.app/Contents/MacOS/SpaceMatters --mcp
+```
+
+Setup also installs a skill that teaches the session how to read a scan and what the usual directories on a Mac actually are: which caches regenerate, which only *look* like caches and hold state you can't get back, and what is never safe to delete.
+
+The session gets `overview`, `tree`, `top`, `types`, `find`, `aged`, `explain` and `cleanup_targets`. `find` is the one with no cheap shell equivalent — "19 `node_modules`, 6.7 GiB between them" is a single walk over the scan and a `find | xargs du` storm otherwise. `aged` answers the other half of any delete decision: regenerable *and* untouched for a year.
+
+**If SpaceMatters is open, the session attaches to it** — no second scan, and it sees exactly the tree on your screen. Two more tools appear: `focus` moves the app to the folder being discussed, and `annotate` paints a verdict onto the treemap and the sunburst. Mark a folder `safe`, `review` or `keep` and its whole region takes that colour, with the reason on hover — a colour alone is never the argument, so the sentence behind it is required. Edit › Clear LLM Verdicts undoes the lot. Close the app and the same command falls back to scanning on its own.
+
+The server scans once on the first call (`$HOME` by default, or pass a path) and answers from memory after that. **It cannot delete anything** — no such tool exists. Its output is a plan; the cleanup pass in the app is what acts on it, fenced and journalled. Anything it could not read, it says so rather than quietly under-reporting.
+
 ## Download
 
 Grab the latest `.dmg` from the [Releases page](../../releases/latest), open it, and drag SpaceMatters into Applications.

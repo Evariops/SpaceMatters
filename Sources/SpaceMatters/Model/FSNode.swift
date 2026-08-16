@@ -32,6 +32,13 @@ final class FSNode {
     /// sizes are always displayed on-disk; the gap surfaces as an annotation.
     let aggSparseExcess = Atomic<Int64>(0)
     let aggCompressedExcess = Atomic<Int64>(0)
+    /// Newest file write in the subtree, unix seconds — **`0` means unknown**
+    /// (streamed VM/SSH scans don't carry timestamps), never 1970. Max-propagated
+    /// up the ancestor chain exactly as sizes are sum-propagated, so "nothing in
+    /// here has been written since X" is a single atomic read (SPEC-14 §3.4).
+    /// Directory mtimes are deliberately excluded: they move whenever an entry is
+    /// added or removed, which would make nearly every folder look warm.
+    let newestMTime = Atomic<Int64>(0)
 
     /// This directory's own immediate files. Atomic so the UI can read live
     /// totals at refresh rate while a worker is still filling them in — a node is
@@ -41,12 +48,14 @@ final class FSNode {
     private let _directFileCount = Atomic<Int64>(0)
     private let _directSparseExcess = Atomic<Int64>(0)
     private let _directCompressedExcess = Atomic<Int64>(0)
+    private let _directNewestMTime = Atomic<Int64>(0)
 
     var directFilesLogical: Int64 { _directFilesLogical.load(ordering: .relaxed) }
     var directFilesPhysical: Int64 { _directFilesPhysical.load(ordering: .relaxed) }
     var directFileCount: Int64 { _directFileCount.load(ordering: .relaxed) }
     var directSparseExcess: Int64 { _directSparseExcess.load(ordering: .relaxed) }
     var directCompressedExcess: Int64 { _directCompressedExcess.load(ordering: .relaxed) }
+    var directNewestMTime: Int64 { _directNewestMTime.load(ordering: .relaxed) }
 
     /// Extension that accounts for the most bytes among this directory's direct
     /// files — used to colour the treemap by file type. Guarded by `gTreeLock`:
@@ -113,6 +122,19 @@ final class FSNode {
         _directCompressedExcess.store(max(0, directCompressedExcess + compressedExcess), ordering: .relaxed)
     }
 
+    /// Raise the subtree's newest-write watermark. Sizes accumulate, timestamps
+    /// don't — a max needs a CAS loop, and workers race on the shared ancestors
+    /// of every directory they finish.
+    func raiseNewestMTime(_ time: Int64) {
+        var current = newestMTime.load(ordering: .relaxed)
+        while time > current {
+            let (exchanged, actual) = newestMTime.compareExchange(
+                expected: current, desired: time, ordering: .relaxed)
+            if exchanged { return }
+            current = actual
+        }
+    }
+
     /// Zero this node's subtree aggregates ahead of an in-place re-scan (SPEC-02
     /// `invalidate`): the re-scan re-propagates fresh direct-file totals into it.
     func zeroAggregates() {
@@ -121,6 +143,7 @@ final class FSNode {
         fileCount.store(0, ordering: .relaxed)
         aggSparseExcess.store(0, ordering: .relaxed)
         aggCompressedExcess.store(0, ordering: .relaxed)
+        newestMTime.store(0, ordering: .relaxed)
     }
 
     /// Called once by the owning worker after a directory's entries are read.
@@ -131,13 +154,15 @@ final class FSNode {
         fileCount: Int64,
         dominantExt: ExtKey = .none,
         sparseExcess: Int64 = 0,
-        compressedExcess: Int64 = 0
+        compressedExcess: Int64 = 0,
+        newestMTime: Int64 = 0
     ) {
         _directFilesLogical.store(filesLogical, ordering: .relaxed)
         _directFilesPhysical.store(filesPhysical, ordering: .relaxed)
         _directFileCount.store(fileCount, ordering: .relaxed)
         _directSparseExcess.store(sparseExcess, ordering: .relaxed)
         _directCompressedExcess.store(compressedExcess, ordering: .relaxed)
+        _directNewestMTime.store(newestMTime, ordering: .relaxed)
         gTreeLock.lock()
         _dominantExt = dominantExt
         _children = children
@@ -156,6 +181,13 @@ final class FSNode {
     /// backup of this subtree would write. Shown only where it notably diverges.
     @inline(__always)
     var sizeApparent: Int64 { aggLogical.load(ordering: .relaxed) }
+
+    /// Most recent write anywhere in the subtree. `nil` when unknown — a streamed
+    /// scan carries no timestamps, and "unknown" must never be read as "ancient".
+    var newestWrite: Date? {
+        let seconds = newestMTime.load(ordering: .relaxed)
+        return seconds > 0 ? Date(timeIntervalSince1970: Double(seconds)) : nil
+    }
 
     /// Non-nil when this subtree's apparent size notably exceeds its footprint
     /// (sparse or compressed content) — drives the divergence badge.

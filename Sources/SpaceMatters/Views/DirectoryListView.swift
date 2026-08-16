@@ -20,6 +20,10 @@ struct DirectoryListView: View {
         let _ = controller.selectedRowIDs
         let _ = controller.revealTarget
         let _ = controller.expanded
+        // `verdictsByNode` is observation-ignored (it is read per row, per
+        // frame), so the rows would keep their old colours without this: the
+        // version is what tells SwiftUI a mark landed.
+        let _ = controller.verdictVersion
         let rows = controller.visibleRows()
 
         DirectoryTable(
@@ -83,6 +87,11 @@ struct OutlineRowView: View {
     let isSelected: Bool
     let isHovered: Bool
     let isDirty: Bool
+    /// Passed in rather than read from the controller inside the view: the row's
+    /// other inputs do not change when a mark lands, so SwiftUI would diff the
+    /// view as identical and skip the redraw — the treemap would recolour and
+    /// the outline would not.
+    let verdict: VerdictNote?
     let controller: ScanController
     let theme: Theme
 
@@ -139,8 +148,12 @@ struct OutlineRowView: View {
                 }
             }
 
+            // A verdict recolours the folder itself rather than adding a badge:
+            // the outline is scanned vertically, and a tinted icon reads down a
+            // long list where a trailing chip does not.
             Image(systemName: isDirectory ? "folder.fill" : "doc.fill")
-                .foregroundStyle(isDirectory ? theme.accent : theme.color(forHashable: colorKey))
+                .foregroundStyle(verdict.map { Color($0.verdict.tint) }
+                                 ?? (isDirectory ? theme.accent : theme.color(forHashable: colorKey)))
                 .font(.system(size: 11))
                 .frame(width: 14)
 
@@ -183,6 +196,9 @@ struct OutlineRowView: View {
                 .frame(width: 66, alignment: .trailing)
                 .help(divergence?.summary ?? "")
         }
+        // The verdict's reason, where the colour alone would be an assertion
+        // without an argument.
+        .help(verdict.map { "\($0.verdict.label) — \($0.reason)" } ?? "")
         .padding(.leading, CGFloat(row.depth) * 14 + 8)
         .padding(.trailing, 10)
         .padding(.vertical, 3)

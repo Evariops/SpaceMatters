@@ -12,6 +12,11 @@ enum FSAttr {
     static let cmnName: UInt32          = 0x0000_0001
     static let cmnDevID: UInt32         = 0x0000_0002 // dev_t, exact mode (inode dedup key)
     static let cmnObjType: UInt32       = 0x0000_0008
+    /// Last data-modification time (`struct timespec`, 16 B). Free: it rides in
+    /// the bulk buffer the walk already fills, no extra syscall. "Regenerable
+    /// *and* cold" is the only delete signal strong enough to act on unprompted
+    /// (SPEC-14 §3.4), and size alone can never express it.
+    static let cmnModTime: UInt32       = 0x0000_0400
     static let cmnFlags: UInt32         = 0x0004_0000 // BSD st_flags (u_int32) — UF_COMPRESSED lives here
     static let cmnFileID: UInt32        = 0x0200_0000 // inode number (u_int64), exact mode
     static let cmnError: UInt32         = 0x2000_0000
@@ -63,6 +68,10 @@ struct BulkEntry {
     /// Hardlink count — `0` unless `hardlinkAware`. `> 1` marks a file whose
     /// blocks are shared by several directory entries (dedup candidate).
     let linkCount: UInt32
+    /// Last modification, unix seconds. **`0` means unknown**, never 1970: a
+    /// filesystem that doesn't report the attribute must not read as "ancient",
+    /// which is exactly the inference a cold-data annotation would draw from it.
+    let modTime: Int64
 
     /// Content stored compressed (APFS/HFS+ transparent compression): the
     /// apparent size exceeds the footprint because the data shrank.
@@ -94,7 +103,7 @@ func enumerateDirectory(
     var attrList = attrlist()
     attrList.bitmapcount = 5 // ATTR_BIT_MAP_COUNT
     attrList.commonattr = FSAttr.cmnReturnedAttrs | FSAttr.cmnName | FSAttr.cmnObjType
-        | FSAttr.cmnFlags | FSAttr.cmnError
+        | FSAttr.cmnModTime | FSAttr.cmnFlags | FSAttr.cmnError
     attrList.dirattr = FSAttr.dirMountStatus
     attrList.fileattr = FSAttr.fileTotalSize | FSAttr.fileAllocSize
     // Exact counting mode also needs the inode + link count to dedup hardlinks.
@@ -165,6 +174,16 @@ func enumerateDirectory(
                 off += 4
             }
 
+            // ATTR_CMN_MODTIME (0x00000400) packs after OBJTYPE (0x08) and
+            // before FLAGS (0x00040000) — ascending-bit order. The value is a
+            // `struct timespec` (16 B here), not a bare time_t: read the whole
+            // thing or every attribute after it misaligns.
+            var modTime: Int64 = 0
+            if commonReturned & FSAttr.cmnModTime != 0 {
+                modTime = Int64(entry.loadUnaligned(fromByteOffset: off, as: time_t.self))
+                off += MemoryLayout<timespec>.size
+            }
+
             // ATTR_CMN_FLAGS (0x00040000) packs after OBJTYPE (0x08), before
             // FILEID (0x02000000) — ascending-bit order. Gated on the returned
             // mask: a filesystem that can't report flags just yields 0.
@@ -224,7 +243,8 @@ func enumerateDirectory(
                     flags: flags,
                     fileID: fileID,
                     deviceID: deviceID,
-                    linkCount: linkCount
+                    linkCount: linkCount,
+                    modTime: modTime
                 ))
             }
 
