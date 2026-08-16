@@ -169,6 +169,9 @@ private struct DiskChangedBanner: View {
             }
             .buttonStyle(PrimaryButtonStyle())
             .disabled(refreshing)
+            .help(rootGone
+                  ? "The scanned folder is gone — measure again from its current state."
+                  : "Re-measure only the folders that changed, instead of the whole disk.")
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
@@ -196,16 +199,20 @@ private struct FDABanner: View {
             Spacer(minLength: 12)
             Button("Open Settings", action: FullDiskAccess.openSettings)
                 .buttonStyle(PrimaryButtonStyle())
+                .help("Opens Privacy & Security › Full Disk Access. Tick SpaceMatters there.")
             Button("Relaunch", action: FullDiskAccess.relaunch)
                 .buttonStyle(.plain)
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(theme.textSecondary)
+                .help("A permission granted while the app runs only applies to the next launch.")
             Button(action: onDismiss) {
                 Image(systemName: "xmark")
                     .font(.system(size: 11, weight: .bold))
             }
             .buttonStyle(.plain)
             .foregroundStyle(theme.textSecondary)
+            .help("Hide this. Protected folders stay unreadable, so totals stay lower bounds.")
+            .accessibilityLabel("Dismiss")
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
@@ -356,6 +363,7 @@ private struct ToolbarBar: View {
             }
             .buttonStyle(.plain)
             .foregroundStyle(theme.textPrimary)
+            .help("Back to the list of disks, VMs and clusters. Discards this analysis.")
 
             if controller.isScanning {
                 Button(action: controller.cancel) {
@@ -363,6 +371,7 @@ private struct ToolbarBar: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(theme.textPrimary)
+                .help("Stop scanning. What has been measured so far stays on screen.")
                 ProgressView().controlSize(.small)
             } else if controller.root != nil {
                 Button(action: controller.rescan) {
@@ -371,6 +380,7 @@ private struct ToolbarBar: View {
                 .buttonStyle(.plain)
                 .foregroundStyle(theme.textPrimary)
                 .keyboardShortcut("r", modifiers: .command)
+                .help("Measure everything again from scratch (⌘R). Assistant marks are kept.")
             }
 
             if controller.root != nil {
@@ -380,12 +390,21 @@ private struct ToolbarBar: View {
 
             Spacer()
 
+            // Ahead of the search field rather than lost among the trailing
+            // glyph buttons: it is a feature to discover, not a preference to
+            // adjust. Carries its name because "what does ✦ do" has no answer a
+            // pictogram can give.
+            if controller.root != nil && !controller.isScanning {
+                AssistantButton(app: app)
+            }
+
             if controller.root != nil {
                 // Lowest layout priority so a narrowing window shrinks the search
                 // field first, before the stats or the segmented pickers give up
                 // space (#12).
                 searchField
                     .layoutPriority(-1)
+                    .help("Filter the outline to folders whose name matches (⌘F).")
                 Button("") { searchFocused = true }
                     .keyboardShortcut("f", modifiers: .command)
                     .opacity(0).frame(width: 0)
@@ -436,13 +455,6 @@ private struct ToolbarBar: View {
                 .accessibilityLabel("Filter to marked folders")
             }
 
-            // Hand the scan to an assistant (SPEC-14). An option, not a step, so
-            // it sits with the other optional explanations rather than greeting
-            // anyone with a dialog.
-            if controller.root != nil && !controller.isScanning {
-                AssistantButton(app: app)
-            }
-
             Button { isDark.toggle() } label: {
                 Image(systemName: isDark ? "sun.max.fill" : "moon.fill")
             }
@@ -475,6 +487,8 @@ private struct ToolbarBar: View {
                     Image(systemName: "xmark.circle.fill").font(.system(size: 11))
                 }
                 .buttonStyle(.plain).foregroundStyle(theme.textSecondary)
+                .help("Clear the search and show the whole tree again")
+                .accessibilityLabel("Clear search")
             }
         }
         .padding(.horizontal, 8).padding(.vertical, 4)

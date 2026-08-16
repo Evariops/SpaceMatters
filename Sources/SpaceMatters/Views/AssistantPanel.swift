@@ -7,8 +7,12 @@ import SwiftUI
 /// a step in using the app, so it lives where the other optional explanations
 /// live and stays out of the way until asked for.
 ///
-/// `sparkles` rather than Claude's own mark: naming the tool is fine, shipping
-/// someone else's logo in a third-party app is not.
+/// Named, not just drawn. A lone glyph cannot answer "what does this do", and
+/// the bar already speaks in words ("Home", "Rescan") — so this does too.
+///
+/// The word is *Claude*, but the mark is not: naming the tool an app integrates
+/// with is ordinary, shipping someone else's logo in an unaffiliated app implies
+/// an endorsement that does not exist.
 struct AssistantButton: View {
     let app: AppModel
     @Environment(\.theme) private var theme
@@ -16,12 +20,13 @@ struct AssistantButton: View {
 
     var body: some View {
         Button { showing = true } label: {
-            Image(systemName: "sparkles")
+            Label("Ask Claude", systemImage: "sparkles")
         }
         .buttonStyle(.plain)
-        .foregroundStyle(theme.textSecondary)
-        .help("Ask an assistant about this scan")
-        .accessibilityLabel("Assistant")
+        .foregroundStyle(theme.textPrimary)
+        .help("Hand this scan to an assistant: copy a briefing for any of them, "
+              + "or let a Claude Code session read it directly and mark folders on the map.")
+        .accessibilityLabel("Ask Claude about this scan")
         .accessibilityHint("Copy a briefing, or connect Claude Code to this scan")
         .popover(isPresented: $showing, arrowEdge: .bottom) {
             AssistantPanel(app: app)
