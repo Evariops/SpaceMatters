@@ -111,6 +111,16 @@ enum CleanupEngine {
                 id: "go-build", name: "Go build cache", category: "Rust & Go", icon: "wrench.and.screwdriver",
                 note: "Compiled build cache, rebuilt on demand.",
                 paths: [home + "/Library/Caches/go-build"]),
+            // GOPATH's default location only. A GUI app inherits no shell
+            // environment, so `$GOPATH` would read empty here far more often
+            // than it would read true; a relocated cache is simply not detected
+            // (and if it lives outside home, the fence would refuse it anyway).
+            // The clean itself doesn't rely on this path — `go clean -modcache`
+            // resolves its own location, env overrides included.
+            Cleanable(
+                id: "go-mod", name: "Go module cache", category: "Rust & Go", icon: "shippingbox.circle.fill",
+                note: "Module sources and zips, re-downloaded on next build (needs network).",
+                paths: [home + "/go/pkg/mod"]),
             Cleanable(
                 id: "homebrew", name: "Homebrew downloads", category: "Homebrew", icon: "mug.fill",
                 note: "Bottle, cask and API downloads, re-fetched on demand.",

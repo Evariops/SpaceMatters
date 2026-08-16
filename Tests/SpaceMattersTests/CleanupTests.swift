@@ -100,6 +100,47 @@ import Foundation
         #expect(FileManager.default.fileExists(atPath: cache.appendingPathComponent("a.bin").path))
     }
 
+    /// The reason `go-mod` is native-required, pinned as an executable fact
+    /// rather than a comment: Go marks each extracted module tree read-only
+    /// (0555, deepest first), and unlinking an entry needs write permission on
+    /// its parent *directory*. So the file engine reports failures and frees
+    /// nothing — exactly what `rm -rf $GOPATH/pkg/mod` does. If this ever
+    /// starts passing, the toolchain requirement can be reconsidered.
+    @Test func fileRemovalCannotEmptyAReadOnlyGoModuleTree() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("sm-gomod-\(UUID().uuidString)")
+        let cache = root.appendingPathComponent("pkg/mod")
+        let module = cache.appendingPathComponent("example.com/lib@v1.0.0")
+        try fm.createDirectory(at: module.appendingPathComponent("internal"), withIntermediateDirectories: true)
+        try Data(count: 4096).write(to: module.appendingPathComponent("internal/lib.go"))
+        // Deepest first, as `go mod download` does.
+        for dir in [module.appendingPathComponent("internal"), module,
+                    cache.appendingPathComponent("example.com")] {
+            try fm.setAttributes([.posixPermissions: 0o555], ofItemAtPath: dir.path)
+        }
+        defer {
+            for dir in [cache.appendingPathComponent("example.com"), module,
+                        module.appendingPathComponent("internal")] {
+                try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+            }
+            try? fm.removeItem(at: root)
+        }
+
+        let result = CleanupEngine.clean(Self.cleanable([cache.path]), allowedRoot: root.path)
+
+        #expect(result.failed == 1 && result.removed == 0)
+        #expect(fm.fileExists(atPath: module.appendingPathComponent("internal/lib.go").path))
+    }
+
+    /// The module cache target points at GOPATH's documented default and is
+    /// the one entry that blocks without its toolchain.
+    @Test func goModCacheTargetsTheDefaultGopath() throws {
+        let goMod = try #require(CleanupEngine.catalog(home: "/Users/x").first { $0.id == "go-mod" })
+        #expect(goMod.paths == ["/Users/x/go/pkg/mod"])
+        #expect(NativeCleaner.missingRequirement(
+            for: goMod.id, home: "/Users/x", isExecutable: { _ in false }) != nil)
+    }
+
     // MARK: Engine
 
     @Test func sizingMeasuresFixture() throws {

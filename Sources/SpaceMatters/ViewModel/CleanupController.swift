@@ -72,6 +72,13 @@ final class CleanupController {
                                     timeout: native.timeout, environment: native.environment)
          },
          blockedReason: @escaping @Sendable (String, String) -> String? = { id, home in
+            // A target whose vendor command is the only viable path is blocked
+            // when that command is missing, rather than offered a file removal
+            // that would fail on every entry (go-mod). Checked first: it is a
+            // property of the target, not of this machine's state.
+            if let missing = NativeCleaner.missingRequirement(for: id, home: home) {
+                return missing
+            }
             switch id {
             case "uv" where CleanupEngine.uvSymlinkMode(home: home):
                 return "uv link-mode is \"symlink\" — cleaning would break your virtualenvs"
