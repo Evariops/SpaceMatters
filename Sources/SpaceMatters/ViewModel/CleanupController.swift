@@ -72,9 +72,14 @@ final class CleanupController {
                                     timeout: native.timeout, environment: native.environment)
          },
          blockedReason: @escaping @Sendable (String, String) -> String? = { id, home in
-            id == "uv" && CleanupEngine.uvSymlinkMode(home: home)
-                ? "uv link-mode is \"symlink\" — cleaning would break your virtualenvs"
-                : nil
+            switch id {
+            case "uv" where CleanupEngine.uvSymlinkMode(home: home):
+                return "uv link-mode is \"symlink\" — cleaning would break your virtualenvs"
+            case "notion" where CleanupEngine.notionIsRunning():
+                return "Notion is running — quit it first, or it keeps writing to the cache"
+            default:
+                return nil
+            }
          },
          journal: @escaping (CleanupJournal.Entry) -> Void = { CleanupJournal.append($0) }) {
         self.catalog = catalog

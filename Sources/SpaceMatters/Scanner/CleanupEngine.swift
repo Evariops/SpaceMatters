@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(AppKit)
+import AppKit
+#endif
 
 /// A known-safe cleanup target for the Low-Hanging Fruits mode: a location whose
 /// contents are regenerable by design (package/build caches) or explicitly
@@ -35,6 +38,23 @@ enum CleanupEngine {
                 id: "trash", name: "Trash", category: "System", icon: "trash.fill",
                 note: "Files you already deleted. Emptying is permanent.",
                 paths: [home + "/.Trash"]),
+            // Notion's service worker never evicts: it keeps one full asset
+            // bucket per app release it has ever run (`notion-swv2-<version>`
+            // in CacheStorage/*/index.txt), so the directory grows by a few
+            // hundred MB per update and never shrinks. Deliberately narrow —
+            // the two HTTP-level caches of the `notion` partition only. Its
+            // siblings hold state the app cannot refetch: IndexedDB (unsynced
+            // edits), File System (offline attachments), Local Storage,
+            // Cookies (the session). See `notionIsRunning` for the live-app
+            // guard — the reason this target is app-specific rather than a
+            // generic "Electron caches" sweep.
+            Cleanable(
+                id: "notion", name: "Notion cache", category: "Apps", icon: "note.text",
+                note: "Web assets, re-downloaded at next launch — quit Notion first.",
+                paths: [
+                    home + "/Library/Application Support/Notion/Partitions/notion/Service Worker/CacheStorage",
+                    home + "/Library/Application Support/Notion/Partitions/notion/Cache",
+                ]),
             Cleanable(
                 id: "derived-data", name: "Xcode DerivedData", category: "Apple development", icon: "hammer.fill",
                 note: "Per-project build artifacts. Xcode rebuilds them on demand.",
@@ -257,6 +277,31 @@ enum CleanupEngine {
             }
         }
         return false
+    }
+
+    /// Notion's bundle identifier, and the helpers it spawns under it.
+    static let notionBundleID = "notion.id"
+
+    /// True while Notion is running — the target must not be offered then.
+    ///
+    /// This is the difference between an app cache and a package cache, and why
+    /// the catalog names apps one by one instead of sweeping every Electron
+    /// directory: a package manager is invoked and exits, a desktop app holds
+    /// its cache open for hours. Unlinking underneath it is not a crash on
+    /// macOS (the inode outlives the last close), but the service worker keeps
+    /// writing into files nothing can reach any more — the space is not
+    /// actually freed until quit, and the cache index can be left describing
+    /// entries that no longer exist. Quitting first makes both go away.
+    ///
+    /// Fails closed: when the running-app list cannot be consulted at all, the
+    /// target is treated as busy rather than assumed idle.
+    static func notionIsRunning() -> Bool {
+        #if canImport(AppKit)
+        return !NSRunningApplication.runningApplications(
+            withBundleIdentifier: notionBundleID).isEmpty
+        #else
+        return true
+        #endif
     }
 
     /// True only for a directory that is not itself a symlink (`lstat`, so the

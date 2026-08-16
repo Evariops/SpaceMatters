@@ -55,6 +55,51 @@ import Foundation
         }
     }
 
+    /// The Notion target names caches and nothing else. Its siblings inside the
+    /// same partition hold state the app cannot refetch — unsynced edits
+    /// (IndexedDB), offline attachments (File System), the session (Cookies) —
+    /// so widening the paths by one directory turns a regenerable cache into
+    /// data loss. Pinned by name: a future edit has to break this to ship.
+    @Test func notionTargetTouchesOnlyCaches() throws {
+        let home = NSHomeDirectory()
+        let notion = try #require(CleanupEngine.catalog().first { $0.id == "notion" })
+        let partition = home + "/Library/Application Support/Notion/Partitions/notion/"
+
+        #expect(notion.paths == [partition + "Service Worker/CacheStorage",
+                                 partition + "Cache"])
+        for forbidden in ["IndexedDB", "Local Storage", "Session Storage", "File System",
+                          "Cookies", "Databases", "blob_storage", "Preferences",
+                          "Service Worker/Database"] {
+            #expect(!notion.paths.contains { $0.hasSuffix("/" + forbidden) },
+                    "\(forbidden) is not regenerable — it must never be a cleanup path")
+        }
+    }
+
+    /// A running Notion blocks its own row: the app holds the cache open, so
+    /// deleting underneath it frees nothing until quit and can leave the cache
+    /// index describing entries that are gone.
+    @Test func notionRowIsBlockedWhileTheAppRuns() async throws {
+        let (root, cache) = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let notion = Cleanable(id: "notion", name: "Notion cache", category: "Apps",
+                               icon: "note.text", note: "fixture", paths: [cache.path])
+        let c = CleanupController(
+            catalog: [notion], allowedRoot: root.path,
+            blockedReason: { id, _ in
+                id == "notion" ? "Notion is running — quit it first" : nil
+            },
+            journal: { _ in })
+        c.load()
+        await Self.waitForReady(c)
+
+        #expect(c.rows.first?.size == .blocked("Notion is running — quit it first"))
+        c.toggleAll() // select-all must not sweep a blocked app row up
+        #expect(c.selectedRows.isEmpty)
+
+        await c.cleanSelected()
+        #expect(FileManager.default.fileExists(atPath: cache.appendingPathComponent("a.bin").path))
+    }
+
     // MARK: Engine
 
     @Test func sizingMeasuresFixture() throws {
