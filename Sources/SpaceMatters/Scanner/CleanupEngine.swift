@@ -151,50 +151,50 @@ enum CleanupEngine {
         case denied
     }
 
-    /// Physical bytes under the item's paths, via the same `getattrlistbulk`
-    /// walk as the scanner (symlinks counted as their own size, never followed;
-    /// mount points not crossed). Runs off the main thread.
+    /// Physical bytes under the item's paths.
+    ///
+    /// The walk itself is `DirectoryScanner`, seeded with the item's paths
+    /// instead of a volume — the engine is built for exactly this ("multiple
+    /// seeds let a single scan span several volumes, all aggregating into a
+    /// shared virtual root"), so a cache is measured by the same worker pool
+    /// that scans a whole disk rather than by a second, single-threaded walk.
+    /// Sizes reach `total` up the parent chain, so the seed nodes only need a
+    /// parent, never to be attached as children.
+    ///
+    /// The roots are still opened here first, with `O_NOFOLLOW`, for two
+    /// reasons the scanner cannot cover: it opens without `O_NOFOLLOW`, so a
+    /// symlinked root would be measured *through* its link — precisely what
+    /// `detect` and `clean` refuse — and it counts unreadable directories
+    /// without distinguishing the one case the UI acts on, a root that exists
+    /// but cannot be opened (the Trash without Full Disk Access).
+    ///
+    /// Counting matches `clean`: `exact: false`, so every hard link is counted,
+    /// like the file removal that follows. Runs off the main thread; the pool
+    /// is not shared, so callers size one item at a time.
     static func size(of item: Cleanable) -> Measure {
-        var total: Int64 = 0
-        var openedAny = false
+        let total = FSNode(name: "cleanup", parent: nil)
+        var seeds: [DirectoryScanner.Seed] = []
         var deniedRoot = false
-        let buffer = UnsafeMutableRawPointer.allocate(byteCount: bufferSize, alignment: 16)
-        defer { buffer.deallocate() }
 
         for root in item.paths {
-            var stack = [root]
-            while let dir = stack.popLast() {
-                // O_NOFOLLOW: a symlinked root must not be measured through its
-                // target (detect refuses it; clean would too), and a directory
-                // swapped for a link between enumeration and open is not chased.
-                let fd = open(dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
-                guard fd >= 0 else {
-                    // ENOENT and EACCES are different stories: a root that no
-                    // longer exists is *empty* (native cleaners like dotnet
-                    // remove their directories outright), only a root we're not
-                    // allowed to open reads as "needs access".
-                    if dir == root && (errno == EACCES || errno == EPERM) { deniedRoot = true }
-                    continue
-                }
-                if dir == root { openedAny = true }
-                let prefix = dir + "/"
-                _ = enumerateDirectory(fd: fd, buffer: buffer, bufferSize: bufferSize) { entry in
-                    if entry.isDirectory {
-                        if entry.isMountPoint { return }
-                        let name = String(
-                            decoding: UnsafeRawBufferPointer(start: entry.name, count: entry.nameLength),
-                            as: UTF8.self
-                        )
-                        stack.append(prefix + name)
-                    } else {
-                        total += entry.physicalSize
-                    }
-                }
-                close(fd)
+            let fd = open(root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+            guard fd >= 0 else {
+                // ENOENT and EACCES are different stories: a root that no
+                // longer exists is *empty* (native cleaners like dotnet and go
+                // remove their directories outright), only a root we're not
+                // allowed to open reads as "needs access".
+                if errno == EACCES || errno == EPERM { deniedRoot = true }
+                continue
             }
+            close(fd)
+            seeds.append(DirectoryScanner.Seed(path: root, node: FSNode(name: root, parent: total)))
         }
-        if openedAny { return .sized(total) }
-        return deniedRoot ? .denied : .sized(0)
+
+        guard !seeds.isEmpty else { return deniedRoot ? .denied : .sized(0) }
+        let scanner = DirectoryScanner(root: total, seeds: seeds)
+        scanner.start()
+        scanner.waitUntilFinished()
+        return .sized(total.sizeOnDisk)
     }
 
     // MARK: Cleaning
@@ -337,6 +337,4 @@ enum CleanupEngine {
     private static func resolvedPath(_ path: String) -> String {
         URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath().path
     }
-
-    private static let bufferSize = 256 * 1024
 }

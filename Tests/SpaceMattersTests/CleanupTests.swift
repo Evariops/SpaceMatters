@@ -154,6 +154,31 @@ import Foundation
         #expect(bytes >= 150_000) // physical ≥ logical of the two files
     }
 
+    /// A multi-path target (NuGet, Notion) becomes several scanner seeds whose
+    /// sizes reach the total up the parent chain, not through the child list —
+    /// so the total must be the sum of every path, and a missing one must not
+    /// void the others.
+    @Test func sizingAggregatesEveryPathOfATarget() throws {
+        let (root, cache) = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let second = root.appendingPathComponent("cache2")
+        try FileManager.default.createDirectory(at: second, withIntermediateDirectories: true)
+        try Data(count: 200_000).write(to: second.appendingPathComponent("c.bin"))
+
+        let both = CleanupEngine.size(of: Self.cleanable(
+            [cache.path, second.path, root.appendingPathComponent("absent").path]))
+        let first = CleanupEngine.size(of: Self.cleanable([cache.path]))
+        let other = CleanupEngine.size(of: Self.cleanable([second.path]))
+
+        guard case .sized(let bothBytes) = both, case .sized(let firstBytes) = first,
+              case .sized(let otherBytes) = other else {
+            Issue.record("expected .sized for all three, got \(both) / \(first) / \(other)")
+            return
+        }
+        #expect(bothBytes == firstBytes + otherBytes)
+        #expect(otherBytes >= 200_000)
+    }
+
     @Test func cleanRemovesContentsButKeepsRoot() throws {
         let (root, cache) = try Self.makeFixture()
         defer { try? FileManager.default.removeItem(at: root) }
