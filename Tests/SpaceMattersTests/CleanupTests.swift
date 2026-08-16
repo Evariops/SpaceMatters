@@ -25,19 +25,33 @@ import Foundation
                   icon: "shippingbox", note: "fixture", paths: paths)
     }
 
-    static func waitForReady(_ c: CleanupController, timeout: TimeInterval = 5) async {
+    /// Sizing is a real scanner walk, and the poll below pumps the *shared* main
+    /// run loop — every other `@MainActor` suite running in parallel pumps it
+    /// too, so each round costs far more than its 20 ms slice on a loaded
+    /// runner. The deadline is only there to stop a hang, so it is generous;
+    /// what matters is that expiring is *reported*. Giving up silently is what
+    /// turned one slow CI sizing into five bogus failures further down
+    /// `toggleAllCyclesTriState` — a row that was merely still `.pending` reads
+    /// exactly like a row that was never there.
+    static func waitForReady(_ c: CleanupController, timeout: TimeInterval = 60,
+                             sourceLocation: SourceLocation = #_sourceLocation) async {
         let deadline = Date().addingTimeInterval(timeout)
         while c.state != .ready && Date() < deadline {
             RunLoop.main.run(until: Date().addingTimeInterval(0.02))
             await Task.yield()
         }
+        #expect(c.state == .ready, "timed out waiting for .ready, still \(c.state)",
+                sourceLocation: sourceLocation)
     }
 
-    static func waitForCleaning(_ c: CleanupController, timeout: TimeInterval = 5) async {
+    static func waitForCleaning(_ c: CleanupController, timeout: TimeInterval = 60,
+                                sourceLocation: SourceLocation = #_sourceLocation) async {
         let deadline = Date().addingTimeInterval(timeout)
         while c.state != .cleaning && Date() < deadline {
             await Task.yield()
         }
+        #expect(c.state == .cleaning, "timed out waiting for .cleaning, still \(c.state)",
+                sourceLocation: sourceLocation)
     }
 
     // MARK: Catalog

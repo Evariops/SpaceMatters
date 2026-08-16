@@ -1370,9 +1370,24 @@ final class ScanController {
 
     // MARK: Live disk watching (SPEC-04)
 
+    /// Live watching pinned off. The incremental-refresh tests forge FSEvents
+    /// batches straight into `handleDiskChanges` to assert *exactly* which
+    /// reconcile decision a batch produces; a real stream on the same fixture
+    /// echoes their own writes back one `FSWatcher` latency later and adds
+    /// re-stats nobody asked for. A flag rather than a bare `stopWatching()`
+    /// because a rescan re-arms the stream.
+    @ObservationIgnored private(set) var liveWatchingSuspended = false
+
+    /// Detach from the disk for good — tests that drive `handleDiskChanges`
+    /// themselves need the forged batches to be the only input.
+    func suspendLiveWatching() {
+        liveWatchingSuspended = true
+        stopWatching()
+    }
+
     private func startWatching() {
         stopWatching()
-        guard isHostScan, !watchPaths.isEmpty else { return }
+        guard !liveWatchingSuspended, isHostScan, !watchPaths.isEmpty else { return }
         let w = FSWatcher(paths: watchPaths) { [weak self] changes in
             Task { @MainActor in self?.handleDiskChanges(changes) }
         }

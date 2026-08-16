@@ -24,6 +24,14 @@ import Foundation
         let c = ScanController()
         c.scan(url: root)
         await NavigationTests.waitForScan(c)
+        // The forged batches must be the *only* input. A real FSWatcher is armed
+        // on this same fixture, and it echoes the writes these tests make back
+        // one second later — a second batch for paths already reconciled, which
+        // lands as an extra re-stat or subtree pass. Harmless to the tree (both
+        // are idempotent), fatal to any assertion that counts them: it flaked
+        // `autoRestatCount == 1` on a loaded runner, where a cycle outlives the
+        // watcher's latency.
+        c.suspendLiveWatching()
         return c
     }
 
@@ -125,8 +133,9 @@ import Foundation
         #expect(c.dirtyNeeds[alphaPath] == .restat)
 
         await c.refreshDirty()
-        // NB: no `dirtyPaths.isEmpty` assert — the *real* FSWatcher also runs on
-        // this temp dir and its echo of our write may legitimately re-mark it.
+        // The watcher is suspended, so nothing re-marks the path behind us: the
+        // dirty set must drain completely.
+        #expect(c.dirtyPaths.isEmpty)
         #expect(alpha.directFileCount == 2)
         // Identity preserved — the precise path never went through invalidate.
         #expect(NavigationTests.child(c.root!, "alpha") === alpha)
