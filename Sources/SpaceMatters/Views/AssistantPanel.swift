@@ -40,6 +40,13 @@ private struct AssistantPanel: View {
     @State private var message: String?
     @State private var copied = false
 
+    /// Names the server so the session reaches for it instead of shelling out to
+    /// `du`, and asks for the map marks so the conclusions land somewhere the
+    /// user can see. Phrased to match the shipped skill's own trigger wording.
+    private static let starterPrompt =
+        "What's taking up space on my disk? Use the spacematters MCP server, "
+        + "and mark what you find on the map as you go."
+
     private enum Status {
         case checking
         /// Skill installed and the server registered — nothing left to do.
@@ -65,7 +72,13 @@ private struct AssistantPanel: View {
             }
         }
         .padding(14)
-        .frame(width: 340)
+        .frame(width: 380)
+        // The toolbar wraps its whole row in `.lineLimit(1)` to stay one line
+        // high (#12); a popover is a child of that view, so it inherits the
+        // clamp and every explanation here truncates to "…". Undo it locally.
+        .lineLimit(nil)
+        .multilineTextAlignment(.leading)
+        .background(theme.panelBackground)
         .task { await refresh() }
     }
 
@@ -101,15 +114,37 @@ private struct AssistantPanel: View {
             }
 
         case .ready:
-            VStack(alignment: .leading, spacing: 4) {
+            VStack(alignment: .leading, spacing: 6) {
                 Label("Claude Code is connected", systemImage: "checkmark.circle.fill")
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(theme.textPrimary)
-                Text("Ask a session what's filling your disk. While this window is open it reads "
-                     + "this scan directly, and can mark folders on the map.")
+
+                // "It's connected" is a status, not an action. The three steps
+                // and a ready-made prompt are what actually gets someone from
+                // here to an answer.
+                // Without `fixedSize` the stack compresses this multi-line Text
+                // to one line and ellipsises the other two steps away.
+                Text("1. Open a terminal, anywhere\n2. Run  claude\n3. Paste this:")
                     .font(.system(size: 11))
                     .foregroundStyle(theme.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
+
+                Text(Self.starterPrompt)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(theme.textPrimary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(7)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(RoundedRectangle(cornerRadius: 5).fill(theme.separator.opacity(0.35)))
+
+                Button {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(Self.starterPrompt, forType: .string)
+                    message = "Prompt copied. Keep this window open — the session will read "
+                        + "this scan and can mark folders on the map."
+                } label: {
+                    Label("Copy prompt", systemImage: "text.badge.checkmark")
+                }
             }
 
         case .notSetUp(let skillInstalled, let cliFound):
