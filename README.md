@@ -30,6 +30,22 @@ Memory stays low because the tree keeps one [`FSNode`](Sources/SpaceMatters/Mode
 
 Sizes are atomic counters propagated up the ancestor chain as each directory completes, and the UI reads them ten times per second. That is what makes the live view possible.
 
+## Asking an LLM about your disk
+
+Two ways, both local — nothing is uploaded, and SpaceMatters still makes no network request beyond its update feed.
+
+**Copy a briefing.** `⌘⇧C` puts a compact digest of the current view on the clipboard: totals, file types, and a tree budgeted to a few thousand tokens. Detail follows size rather than depth, single-child chains collapse, small siblings roll up, and folders carry what a size alone can't say — `cold:8mo` when nothing inside has been written since, `sparse`, or `cache:npm` when it's a location the app can safely empty itself. Paste it into any assistant.
+
+**Or let a Claude session query the scan directly**, through a read-only MCP server:
+
+```sh
+claude mcp add spacematters -- /Applications/SpaceMatters.app/Contents/MacOS/SpaceMatters --mcp
+```
+
+The session gets `overview`, `tree`, `top`, `types`, `find`, `aged`, `explain` and `cleanup_targets`. `find` is the one with no cheap shell equivalent — "19 `node_modules`, 6.7 GiB between them" is a single walk over the scan and a `find | xargs du` storm otherwise. `aged` answers the other half of any delete decision: regenerable *and* untouched for a year.
+
+The server scans once on the first call (`$HOME` by default, or pass a path) and answers from memory after that. **It cannot delete anything** — no such tool exists. Its output is a plan; the cleanup pass in the app is what acts on it, fenced and journalled. Without Full Disk Access it says so in its answers rather than quietly under-reporting.
+
 ## Download
 
 Grab the latest `.dmg` from the [Releases page](../../releases/latest), open it, and drag SpaceMatters into Applications.

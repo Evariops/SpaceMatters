@@ -30,6 +30,14 @@ enum Entry {
             let scope = idx + 2 < args.count ? args[idx + 2] : "full"
             exit(HeadlessScan.runVM(runtime: args[idx + 1], scope: scope))
         }
+        if let idx = args.firstIndex(of: "--mcp") {
+            // Defaults to the home directory: it holds the bytes a user can act
+            // on, and scanning "/" would spend the session's first minute on
+            // system files nobody is allowed to delete anyway.
+            let next = idx + 1 < args.count ? args[idx + 1] : nil
+            let root = (next?.hasPrefix("-") == false ? next : nil) ?? NSHomeDirectory()
+            exit(MCPServer(rootPath: root).run())
+        }
         if let idx = args.firstIndex(of: "--briefing") {
             guard idx + 1 < args.count else {
                 print("usage: SpaceMatters --briefing <path> [max-nodes]")
