@@ -777,10 +777,11 @@ final class ScanController {
             counting: countingMode,
             scanDate: scanDate,
             elapsed: elapsed,
-            // `extRows` is scanner-global — showing it under a zoom root would
-            // put the whole scan's types against a subtree's total. SPEC-14
-            // phase 1 adds the per-subtree rollup.
-            types: whole ? extRows : [])
+            // `extRows` is scanner-global and exact; a subtree gets the
+            // reconstructed estimate instead, labelled as such by the renderer.
+            // There is no exact third option — no per-directory extension table
+            // survives the scan, by design.
+            types: whole ? extRows : TreeQuery.approximateTypes(of: target))
         return TreeDigest.briefing(root: target, snapshot: snapshot,
                                    options: .init(maxNodes: maxNodes))
     }

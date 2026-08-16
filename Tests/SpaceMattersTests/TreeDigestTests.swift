@@ -229,6 +229,110 @@ import Foundation
         #expect(TreeDigest.tree(root: root, rootPath: "/root").contains("sparse"))
     }
 
+    // MARK: Coldness (SPEC-14 phase 1)
+
+    @Test func coldSubtreesAreMarkedAndWarmOnesAreNot() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let root = branch("root", in: nil) { r in
+            [leaf("stale", in: r, bytes: 100), leaf("active", in: r, bytes: 100)]
+        }
+        root.children.first { $0.name == "stale" }!
+            .raiseNewestMTime(Int64(now.timeIntervalSince1970 - 400 * 86_400))
+        root.children.first { $0.name == "active" }!
+            .raiseNewestMTime(Int64(now.timeIntervalSince1970 - 10 * 86_400))
+
+        var options = TreeDigest.Options()
+        options.now = now
+        let rendered = lines(TreeDigest.tree(root: root, rootPath: "/root", options: options))
+        #expect(rendered.contains { $0.contains("stale") && $0.contains("cold:13mo") })
+        #expect(rendered.contains { $0.contains("active") && !$0.contains("cold:") })
+    }
+
+    @Test func coldnessCrossesToYearsAndRoundsAtTheThreshold() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        func mark(daysAgo: Double) -> String {
+            let node = leaf("n", in: nil, bytes: 10)
+            node.raiseNewestMTime(Int64(now.timeIntervalSince1970 - daysAgo * 86_400))
+            var options = TreeDigest.Options()
+            options.now = now
+            return TreeDigest.tree(root: node, rootPath: "/n", options: options)
+        }
+        #expect(!mark(daysAgo: 179).contains("cold:"))
+        // Exactly at the 180-day threshold the mark must read "6mo", not "5mo".
+        #expect(mark(daysAgo: 180).contains("cold:6mo"))
+        #expect(mark(daysAgo: 1000).contains("cold:3y"))
+    }
+
+    @Test func coldMarksAreInheritedNotRepeated() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        func at(_ daysAgo: Double) -> Int64 { Int64(now.timeIntervalSince1970 - daysAgo * 86_400) }
+        let root = branch("root", in: nil) { r in
+            [
+                branch("stale", in: r, ownBytes: 10, ownFiles: 1) { s in
+                    [leaf("same", in: s, bytes: 900), leaf("older", in: s, bytes: 900)]
+                },
+            ]
+        }
+        let stale = root.children[0]
+        stale.children.first { $0.name == "same" }!.raiseNewestMTime(at(300))
+        stale.children.first { $0.name == "older" }!.raiseNewestMTime(at(900))
+        stale.raiseNewestMTime(at(300)) // the max of its subtree
+
+        var options = TreeDigest.Options()
+        options.now = now
+        let rendered = lines(TreeDigest.tree(root: root, rootPath: "/root", options: options))
+        #expect(rendered.contains { $0.contains("stale") && $0.contains("cold:10mo") })
+        // Same bucket as its parent → says nothing, costs a token, suppressed.
+        #expect(rendered.contains { $0.contains("same") && !$0.contains("cold:") })
+        // Meaningfully older than its parent → still earns a mark.
+        #expect(rendered.contains { $0.contains("older") && $0.contains("cold:2y") })
+    }
+
+    @Test func unknownTimestampsAreNeverMarkedCold() {
+        // Streamed scans carry none; silence is the only honest output.
+        let root = leaf("streamed", in: nil, bytes: 100)
+        #expect(!TreeDigest.tree(root: root, rootPath: "/streamed").contains("cold:"))
+    }
+
+    // MARK: Approximate types
+
+    @Test func approximateTypesRankBySubtreeBytes() {
+        // Each folder's own bytes go to its dominant extension — the only type
+        // signal that survives the scan.
+        let root = branch("root", in: nil) { r -> [FSNode] in
+            let jars = FSNode(name: "libs", parent: r)
+            jars.finishScan(children: [], filesLogical: 900, filesPhysical: 900, fileCount: 9,
+                            dominantExt: ExtKey(fileName: "a.jar"))
+            jars.aggPhysical.store(900, ordering: .relaxed)
+            let logs = FSNode(name: "logs", parent: r)
+            logs.finishScan(children: [], filesLogical: 100, filesPhysical: 100, fileCount: 4,
+                            dominantExt: ExtKey(fileName: "a.log"))
+            logs.aggPhysical.store(100, ordering: .relaxed)
+            return [jars, logs]
+        }
+        let rows = TreeQuery.approximateTypes(of: root)
+        #expect(rows.count == 2)
+        #expect(rows[0].name == ".jar")
+        #expect(rows[0].physical == 900)
+        #expect(rows[0].count == 9)
+        #expect(rows[1].name == ".log")
+    }
+
+    @Test func approximateTypesSkipFolderlessBytesAndRespectTheLimit() {
+        let root = branch("root", in: nil) { r -> [FSNode] in
+            (0..<10).map { i -> FSNode in
+                let n = FSNode(name: "d\(i)", parent: r)
+                n.finishScan(children: [], filesLogical: 10, filesPhysical: 10, fileCount: 1,
+                             dominantExt: ExtKey(fileName: "a.e\(i)"))
+                n.aggPhysical.store(10, ordering: .relaxed)
+                return n
+            }
+        }
+        #expect(TreeQuery.approximateTypes(of: root, limit: 3).count == 3)
+        // A folder with no direct files contributes nothing, not a `[no extension]` row.
+        #expect(!TreeQuery.approximateTypes(of: root).contains { $0.name == "[no extension]" })
+    }
+
     // MARK: Briefing
 
     @Test func briefingCarriesHeaderLegendAndTree() {
@@ -259,7 +363,8 @@ import Foundation
             types: [ExtRow(key: .none, name: "[no extension]", logical: 9, physical: 9, count: 9)])
         let out = TreeDigest.briefing(root: root, snapshot: snapshot)
         #expect(out.contains("this subtree only"))
-        #expect(!out.contains("## Largest file types")) // wrong denominator — withheld
-        #expect(!out.contains("Counting:"))
+        #expect(!out.contains("Counting:")) // scan-wide, wrong denominator here
+        // The subtree table is a reconstruction, and must never be quoted as measured.
+        #expect(out.contains("## Largest file types (estimated from per-folder dominant types)"))
     }
 }

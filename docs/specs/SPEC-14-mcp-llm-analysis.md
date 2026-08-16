@@ -1,7 +1,7 @@
 # SPEC-14 — LLM analysis: token-budgeted digests, an MCP server, and verdicts painted back onto the map
 
 > **Request**: let a Claude session do a *detailed* analysis of a scan. The app cannot spawn the session itself (`claude -p` is API-token-only, so subscription users have no headless path), so the flow inverts: **the user starts the session, and the session calls the app**.
-> **Status**: 🟡 **Phase 0 implemented** (branch `feat/llm-briefing`) — [TreeDigest](../../Sources/SpaceMatters/Model/TreeDigest.swift), the ⌘⇧C briefing, and a `--briefing` headless entry point. Phases 1–4 remain specified only.
+> **Status**: 🟡 **Phases 0–1 implemented** (branch `feat/llm-briefing`) — [TreeDigest](../../Sources/SpaceMatters/Model/TreeDigest.swift), the ⌘⇧C briefing, a `--briefing` headless entry point, `ATTR_CMN_MODTIME` with max-propagated watermarks, and [TreeQuery](../../Sources/SpaceMatters/Model/TreeQuery.swift). Phases 2–4 remain specified only.
 > **Guiding constraint**: the scanner measures, the LLM classifies. Everything here exists to hand a model the smallest payload that still supports a correct verdict — and to bring that verdict back into the map, where the user already is.
 
 ## 0. Phase 0 implementation result
@@ -12,6 +12,15 @@
 - **Decided during implementation**: a folder with no sub-folders does **not** print an `[n files here]` line. Its size line already states those bytes, and leaves are the most numerous node kind — the rule alone freed a large fraction of the budget on real trees.
 - **Measured**: `~/Library/Application Support` (35,5 GiB, 198 k files) at `maxNodes: 200` → 199 tree lines, 226 total, ~1 170 words ≈ 2,5–3 k tokens. At `maxNodes: 60` → exactly 60 tree lines.
 - **Tests**: 17 in [TreeDigestTests](../../Tests/SpaceMattersTests/TreeDigestTests.swift); full suite **141 green**. Live-verified end to end: the Edit-menu item exists, clicking it via System Events puts a 307-line briefing on the pasteboard.
+
+## 0b. Phase 1 implementation result
+
+- **`ATTR_CMN_MODTIME`** ([FSAttr](../../Sources/SpaceMatters/Scanner/FSAttr.swift#L16)) parsed between `OBJTYPE` and `FLAGS` as a whole `timespec`; `BulkEntry.modTime` in unix seconds, **`0` = unknown, never 1970**. `FSNode.newestMTime` is max-propagated up the ancestor chain by a CAS loop ([raiseNewestMTime](../../Sources/SpaceMatters/Model/FSNode.swift)) on the same walk that sum-propagates sizes. Directory mtimes are deliberately excluded — they move on any entry add/remove, which would make nearly every folder read as warm (test: `directoryMTimesAreIgnored`).
+- **`cold:8mo` / `cold:3y`** in the digest, **inherited rather than repeated**: watermarks are max-propagated so a child is always at least as cold as its parent, and re-stating the parent's bucket on every nested line costs a token and says nothing. A child that is *older* still earns its own mark.
+- **Cost: none measurable.** Same attribute list, same syscall. `~/Library/Application Support` (198 k files), 3 runs each against the pre-change build: base 1,38–1,43 s, with mtime 1,23–1,47 s — inside the noise. The cold annotations add ~60 words to a 200-node briefing (1 172 → 1 232).
+- **Accuracy cross-checked against the filesystem**, which is what would catch a wrong parse offset that the golden tests can't see: `find -exec stat` on three real subtrees gives 180 / 313 / 529 days, the digest prints `cold:6mo` / `cold:10mo` / `cold:17mo`. Exact.
+- **The per-subtree extension rollup planned in §4 step 4 turned out to be impossible as specified** — see the correction there. `TreeQuery.approximateTypes` reconstructs it from per-directory dominant types instead, labelled as an estimate wherever it is shown. Validated against the exact scan-wide table on a real 35 GiB tree: **top-10 overlap 10/10**, sizes within a few percent, minor rank shuffling in the 5–10 band (`.vscdb` over-credited 634 MiB → 979 MiB — precisely the predicted mixed-folder bias).
+- **Tests**: 6 in [ModTimeTests](../../Tests/SpaceMattersTests/ModTimeTests.swift) + 6 more in `TreeDigestTests`; full suite **153 green**.
 
 ## 1. Objective
 
@@ -79,7 +88,7 @@ Read-only by construction. Every tool takes an optional `path` scoping it to a s
 | `overview` | — | Volume, totals, counts, scan date, elapsed, skipped count; top file types; `TreeDigest(max_nodes: 120)`; the Low-Hanging Fruits report. **One call, enough to start reasoning.** |
 | `tree` | `path`, `max_nodes` (def. 200) | §3.1/§3.2 verbatim. |
 | `top` | `path`, `by: size\|count`, `ext`, `limit` | Flat descending ranking of directories in the subtree. |
-| `types` | `path`, `limit` | Extension breakdown **scoped to a subtree** — needs the new per-subtree rollup (§4, step 3). |
+| `types` | `path`, `limit` | Extension breakdown. Exact for the whole scan; **an explicitly-labelled estimate for any subtree** (§4 step 4 — no exact form is derivable from the tree). |
 | `find` | `pattern` (glob on directory name), `min_size` | **The tool with no cheap shell equivalent.** "340 `node_modules`, 22 GiB total, top 10 by size" is a one-pass walk over an in-memory tree and a `find \| xargs du` storm otherwise. |
 | `aged` | `path`, `older_than` (e.g. `6mo`), `min_size` | Subtrees whose newest write predates the cutoff (§3.4). |
 | `explain` | `path` | Everything known about one node: both sizes + divergence cause and prose, dominant extension, file/dir counts, newest mtime, catalog membership + its `note`, whether a native cleaner is required and available, recent journal entries touching it. |
@@ -132,7 +141,7 @@ It is twenty lines on top of §3.1, it needs no MCP install and no `--mcp` mode,
 
 **Phase 1 — time (~0.5 d)**
 3. `ATTR_CMN_MODTIME` in [FSAttr](../../Sources/SpaceMatters/Scanner/FSAttr.swift#L94) at the correct packing position; `BulkEntry.modTime`. `FSNode.newestMTime` + CAS-max propagation in `finishScan`. `cold:Nmo` annotation in the digest. Verify against the golden fixtures that nothing else shifted.
-4. Per-subtree extension rollup (walk + accumulate into a `[ExtKey: ExtStat]`, reusing [ExtRow](../../Sources/SpaceMatters/Scanner/DirectoryScanner.swift#L396)) — the `types` tool needs it, and it is independently useful for a future per-folder legend.
+4. ~~Per-subtree extension rollup (walk + accumulate into a `[ExtKey: ExtStat]`)~~ — **corrected during implementation: an exact one cannot exist.** The walk has nothing to accumulate: files are not objects and no per-directory extension table survives a scan, because collapsing files into their parent *is* the memory design ([FSNode](../../Sources/SpaceMatters/Model/FSNode.swift#L6)). The only surviving per-directory type signal is `dominantExt`. Storing a real table per directory would cost more than the tree itself and is refused on the same grounds the file objects were. So: [TreeQuery.approximateTypes](../../Sources/SpaceMatters/Model/TreeQuery.swift) attributes each directory's own-file bytes wholly to its dominant extension, and **every surface that shows it must label it an estimate** — only `DirectoryScanner.snapshotExtensions` is exact, and it cannot be scoped.
 
 **Phase 2 — MCP, detached (~1.5–2 d)**
 5. `App/MCP/JSONRPC.swift`: line-framed JSON-RPC 2.0 over stdin/stdout. ~150 lines, no dependency — do not add an SDK for three methods.
@@ -170,7 +179,7 @@ It is twenty lines on top of §3.1, it needs no MCP install and no `--mcp` mode,
 | Phase | Effort | Depends on |
 |---|---|---|
 | 0 — `TreeDigest` + clipboard briefing ✅ | 0.5 d | — |
-| 1 — `ATTR_CMN_MODTIME` + subtree type rollup | 0.5 d | — |
+| 1 — `ATTR_CMN_MODTIME` + subtree type estimate ✅ | 0.5 d | — |
 | 2 — MCP server, detached, read-only | 1.5–2 d | 0, 1 |
 | 3 — Connected mode, `annotate`, `focus` | 2 d | 2, SPEC-09/10/13 (shipped) |
 | 4 — Skill + one-click setup | 0.5 d | 2 |
