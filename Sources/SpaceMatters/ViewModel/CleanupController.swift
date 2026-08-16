@@ -2,8 +2,9 @@ import Foundation
 import Observation
 
 /// Drives the Low-Hanging Fruits mode: detects the known-safe cleanup targets,
-/// sizes them concurrently (rows fill in live, like a scan), and empties the
-/// selected ones. Nothing is pre-selected — cleaning is always an explicit
+/// sizes them one at a time (each walk drives the scanner's whole worker pool,
+/// so rows still fill in live — in order rather than all at once), and empties
+/// the selected ones. Nothing is pre-selected — cleaning is always an explicit
 /// choice, and it is refused while sizing or another clean is in flight.
 @MainActor
 @Observable
@@ -72,6 +73,13 @@ final class CleanupController {
                                     timeout: native.timeout, environment: native.environment)
          },
          blockedReason: @escaping @Sendable (String, String) -> String? = { id, home in
+            // A target whose vendor command is the only viable path is blocked
+            // when that command is missing, rather than offered a file removal
+            // that would fail on every entry (go-mod). Checked first: it is a
+            // property of the target, not of this machine's state.
+            if let missing = NativeCleaner.missingRequirement(for: id, home: home) {
+                return missing
+            }
             switch id {
             case "uv" where CleanupEngine.uvSymlinkMode(home: home):
                 return "uv link-mode is \"symlink\" — cleaning would break your virtualenvs"
@@ -118,8 +126,13 @@ final class CleanupController {
                 selected: previouslySelected.contains($0.id) && blocked[$0.id] == nil)
         }
         state = rows.contains { $0.size == .pending } ? .sizing : .ready
-        for item in detected where blocked[item.id] == nil {
-            Task {
+        // One target at a time. Each sizing walk now drives the full scanner
+        // worker pool, so running the targets concurrently would multiply
+        // threads rather than work — and the slowest target used to set the
+        // whole mode's load time anyway. Rows still fill in live, in order.
+        let pending = detected.filter { blocked[$0.id] == nil }
+        Task {
+            for item in pending {
                 let measure = await Task.detached(priority: .userInitiated) {
                     CleanupEngine.size(of: item)
                 }.value

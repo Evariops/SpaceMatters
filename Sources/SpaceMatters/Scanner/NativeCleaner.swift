@@ -19,6 +19,32 @@ struct NativeCleaner: Sendable, Equatable {
     /// Display name shown in the row and the journal ("brew cleanup").
     let label: String
 
+    /// Targets whose vendor command is not a preference but the *only* viable
+    /// path, mapped to the reason shown when its binary is missing.
+    ///
+    /// Go extracts every module into a tree it then marks read-only (`0555`,
+    /// deepest first). Unlinking an entry needs write permission on its parent
+    /// *directory*, not on the entry, so file removal returns EACCES on every
+    /// module — `rm -rf` fails the same way, which is why `go clean -modcache`
+    /// exists. Offering the target without the toolchain would walk 15 GB and
+    /// free nothing, reporting a wall of failures.
+    static let nativeRequired: [String: String] = [
+        "go-mod": "needs the Go toolchain — Go marks module files read-only, "
+            + "only `go clean -modcache` can empty the cache",
+    ]
+
+    /// The reason a *native-required* target cannot run here, or nil when it
+    /// can (or when the target has no such requirement). Drives `blockedReason`
+    /// in `CleanupController`, so the row is shown and explained rather than
+    /// silently offering a clean that would fail on every file.
+    static func missingRequirement(
+        for targetID: String, home: String = NSHomeDirectory(),
+        isExecutable: (String) -> Bool = { FileManager.default.isExecutableFile(atPath: $0) }
+    ) -> String? {
+        guard let reason = nativeRequired[targetID] else { return nil }
+        return available(for: targetID, home: home, isExecutable: isExecutable) == nil ? reason : nil
+    }
+
     /// The native cleaner for a catalog target, when its binary exists.
     /// Candidates are fixed absolute paths: a GUI app inherits no shell PATH,
     /// and probing the known install prefixes beats guessing an environment.
@@ -70,6 +96,14 @@ struct NativeCleaner: Sendable, Equatable {
                              "/usr/local/bin/go"],
                 arguments: ["clean", "-cache"],
                 environment: [:], timeout: 600, label: "go clean -cache"),
+            // Not an optimization — see `nativeRequired`. Removes the module
+            // cache root outright (like `dotnet nuget locals`), which sizing
+            // and detection already treat as "empty", not as an error.
+            "go-mod": Spec(
+                candidates: ["/opt/homebrew/bin/go", "/usr/local/go/bin/go",
+                             "/usr/local/bin/go"],
+                arguments: ["clean", "-modcache"],
+                environment: [:], timeout: 600, label: "go clean -modcache"),
         ]
     }
 }
