@@ -6,12 +6,34 @@
   "labels": ["dependencies"],
   "vulnerabilityAlerts": { "enabled": true, "schedule": ["at any time"], "labels": ["security"] },
   "pre-commit": { "enabled": true },
+  "customManagers": [
+    {
+      "description": "CI pins zizmor inline (pipx run zizmor==X); the pre-commit manager cannot see it.",
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/workflows/ci\\.yml$/"],
+      "matchStrings": ["zizmor==(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
+      "depNameTemplate": "zizmorcore/zizmor",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>.*)$"
+    }
+  ],
   "packageRules": [
     {
+      "description": "No automerge: the 'main protect' ruleset requires an approving review the bot cannot bypass.",
       "matchManagers": ["github-actions"],
       "groupName": "github-actions",
-      "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
-      "automerge": true
+      "matchUpdateTypes": ["minor", "patch", "pin", "digest"]
+    },
+    {
+      "description": "The runner image is the SDK we build against: macOS 26 would opt the app into the new design language and leave no macOS 15 machine in CI. Deliberate bump only — see platforms in Package.swift for the actual deployment target.",
+      "matchDatasources": ["github-runners"],
+      "matchPackageNames": ["macos"],
+      "enabled": false
+    },
+    {
+      "description": "Keep the inline CI pin and the pre-commit hook in one PR so they never drift.",
+      "matchPackageNames": ["zizmorcore/zizmor", "zizmorcore/zizmor-pre-commit"],
+      "groupName": "zizmor"
     },
     { "matchDatasources": ["docker"], "groupName": "docker base images" }
   ]
