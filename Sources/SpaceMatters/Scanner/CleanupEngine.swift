@@ -251,6 +251,26 @@ enum CleanupEngine {
                 id: "gh", name: "GitHub CLI cache", category: "Developer tools", icon: "terminal.fill",
                 note: "Cached API responses, re-fetched on demand.",
                 paths: [xdgCache(home) + "/gh"]),
+            // One extracted tree per engine version ever run — a bundled Python
+            // runtime and the analyser, not rules or results. Old versions are
+            // pure waste; the current one is re-downloaded on the next scan.
+            Cleanable(
+                id: "opengrep", name: "Opengrep engine", category: "Developer tools",
+                icon: "magnifyingglass",
+                note: "Extracted engine, one tree per version — re-downloaded on next scan.",
+                paths: [xdgCache(home) + "/opengrep", xdgCache(home) + "/semgrep"]),
+            // Narrow on purpose. `~/.cache/opencode` holds downloaded helper
+            // binaries (a language server, ripgrep) and the model list. Its
+            // sibling `~/.local/share/opencode` holds `auth.json` and
+            // `opencode.db` — the credentials and the conversation history —
+            // and must never be swept up with it. Same app, same-looking name,
+            // opposite verdict.
+            Cleanable(
+                id: "opencode", name: "opencode downloads", category: "Developer tools",
+                icon: "terminal",
+                note: "Helper binaries and the model list, re-fetched — sessions and login live "
+                    + "elsewhere and are untouched.",
+                paths: [xdgCache(home) + "/opencode"]),
             Cleanable(
                 id: "homebrew", name: "Homebrew downloads", category: "Homebrew", icon: "mug.fill",
                 note: "Bottle, cask and API downloads, re-fetched on demand.",

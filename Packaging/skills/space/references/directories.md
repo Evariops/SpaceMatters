@@ -98,6 +98,15 @@ installed. Removing the directory is both more complete and faster.
 
 Deleting these loses data the app cannot get back.
 
+- **A tool's `~/.cache/<name>` and its `~/.local/share/<name>` are opposites**,
+  and the matching names invite exactly the wrong conclusion. opencode is the
+  worked example: `~/.cache/opencode` is downloaded helper binaries and a model
+  list (disposable), while `~/.local/share/opencode` holds `auth.json` and
+  `opencode.db` — the login token and every conversation. Never generalise a
+  verdict from one to the other because the tool's name matches; check which of
+  the two you are looking at. The same split applies to most XDG-shaped tools:
+  `.cache` is disposable, `.local/share` and `.config` are not.
+
 - `Application Support/*/IndexedDB`, `Local Storage`, `Session Storage`,
   `Databases` — app state, drafts, unsynced edits.
 - `Application Support/*/File System`, `blob_storage` — offline attachments.

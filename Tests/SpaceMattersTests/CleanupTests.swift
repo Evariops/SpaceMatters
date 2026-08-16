@@ -792,6 +792,19 @@ private final class JournalBox {
         #expect(paths("uv").contains("/home/x/Library/Caches/uv"))
         #expect(paths("gh") == ["/home/x/.cache/gh"])
         #expect(paths("pre-commit").contains("/home/x/.cache/pre-commit"))
+        #expect(paths("opengrep").contains("/home/x/.cache/opengrep"))
+    }
+
+    /// A tool's `.cache` is disposable and its `.local/share` is not, however
+    /// alike the two names look. opencode keeps helper binaries in one and its
+    /// login token plus every conversation in the other — the catalog must
+    /// reach for exactly one of them.
+    @Test func onlyTheCacheHalfOfATwoDirectoryToolIsOffered() {
+        let opencode = CleanupEngine.catalog(home: "/home/x").first { $0.id == "opencode" }
+        #expect(opencode?.paths == ["/home/x/.cache/opencode"])
+        #expect(CleanupEngine.catalog(home: "/home/x").allSatisfy { item in
+            item.paths.allSatisfy { !$0.contains("/.local/share/opencode") }
+        })
     }
 
     /// npx installs a throwaway tree per invocation and never evicts one, so it

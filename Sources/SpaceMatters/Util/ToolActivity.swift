@@ -72,6 +72,11 @@ enum ToolActivity {
         "pre-commit": ["pre-commit"],
         "prek": ["pre-commit"],
         "gh": ["gh"],
+        // Both run *from* the tree being emptied — opengrep out of its
+        // extracted engine, opencode out of its downloaded helper binaries.
+        "opengrep": ["opengrep"],
+        "semgrep": ["opengrep"],
+        "opencode": ["opencode"],
         "gradle": ["gradle"],
         "mvn": ["maven"],
         "mvnd": ["maven"],
