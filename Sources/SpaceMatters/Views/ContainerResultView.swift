@@ -208,26 +208,29 @@ struct ContainerResultView: View {
             // Regular VStack (not Lazy): container data is small, and LazyVStack
             // glitches when expanding a row near the bottom.
             VStack(alignment: .leading, spacing: 0) {
-                sectionHeader("Images", count: controller.images.count)
-                let maxImage = controller.images.first?.size ?? 1
-                ForEach(controller.images) { image in
-                    ImageRow(
-                        image: image,
-                        fraction: ratio(image.size, maxImage),
-                        isExpanded: controller.expandedImages.contains(image.id),
-                        onToggle: { controller.toggle(image) },
-                        onRemove: { confirmRemove = image }
-                    )
-                    if controller.expandedImages.contains(image.id) {
-                        let layers = controller.layers(for: image)
-                        let maxLayer = layers.map(\.size).max() ?? 1
-                        if layers.isEmpty {
-                            Text("  loading layers…")
-                                .font(.system(size: 11)).foregroundStyle(theme.textSecondary)
-                                .padding(.leading, 40).padding(.vertical, 4)
-                        }
-                        ForEach(layers) { layer in
-                            LayerRow(layer: layer, fraction: ratio(layer.size, maxLayer))
+                // The rows below sum to several times the Images card, and a
+                // reader who adds them up is entitled to know why before they
+                // conclude the app is wrong: an image's size counts every layer
+                // it holds, including the ones its neighbours hold too.
+                sectionHeader("Images", count: controller.images.count,
+                              note: "sizes include shared layers — see the Images card for what pruning frees")
+                let groups = controller.imageGroups
+                let maxGroup = groups.first?.size ?? 1
+                ForEach(groups) { group in
+                    // A lone image needs no wrapper: it renders exactly as
+                    // before, so grouping only ever adds a level where there is
+                    // something to collapse.
+                    if group.isSingle, let image = group.images.first {
+                        imageRows(for: [image], max: maxGroup)
+                    } else {
+                        ImageGroupRow(
+                            group: group,
+                            fraction: ratio(group.size, maxGroup),
+                            isExpanded: controller.expandedGroups.contains(group.id),
+                            onToggle: { controller.toggle(group: group) })
+                        if controller.expandedGroups.contains(group.id) {
+                            imageRows(for: group.images,
+                                      max: group.images.first?.size ?? 1, indent: 18)
                         }
                     }
                 }
@@ -246,10 +249,44 @@ struct ContainerResultView: View {
         .background(theme.panelBackground)
     }
 
-    private func sectionHeader(_ title: String, count: Int) -> some View {
-        HStack {
+    /// The image rows themselves, each still expanding to its layers. Shared by
+    /// the ungrouped and grouped paths so a nested row behaves identically to a
+    /// top-level one.
+    @ViewBuilder
+    private func imageRows(for images: [CImage], max: Int64, indent: CGFloat = 0) -> some View {
+        ForEach(images) { image in
+            ImageRow(
+                image: image,
+                fraction: ratio(image.size, max),
+                indent: indent,
+                isExpanded: controller.expandedImages.contains(image.id),
+                onToggle: { controller.toggle(image) },
+                onRemove: { confirmRemove = image }
+            )
+            if controller.expandedImages.contains(image.id) {
+                let layers = controller.layers(for: image)
+                let maxLayer = layers.map(\.size).max() ?? 1
+                if layers.isEmpty {
+                    Text("  loading layers…")
+                        .font(.system(size: 11)).foregroundStyle(theme.textSecondary)
+                        .padding(.leading, 40 + indent).padding(.vertical, 4)
+                }
+                ForEach(layers) { layer in
+                    LayerRow(layer: layer, fraction: ratio(layer.size, maxLayer))
+                }
+            }
+        }
+    }
+
+    private func sectionHeader(_ title: String, count: Int, note: String? = nil) -> some View {
+        HStack(spacing: 6) {
             Text(title).font(.system(size: 11, weight: .semibold)).foregroundStyle(theme.textSecondary)
             Text("\(count)").font(.system(size: 10).monospacedDigit()).foregroundStyle(theme.textSecondary.opacity(0.7))
+            if let note {
+                Text(note)
+                    .font(.system(size: 9)).foregroundStyle(theme.textSecondary.opacity(0.6))
+                    .lineLimit(1).truncationMode(.tail)
+            }
             Spacer()
         }
         .padding(.horizontal, 12).padding(.top, 12).padding(.bottom, 4)
@@ -292,9 +329,81 @@ struct ContainerResultView: View {
     }
 }
 
+/// One identity — a tag and every image that still answers, or used to answer,
+/// to it. The line the user actually wants: which tag is holding the space, and
+/// how much of it is old builds.
+private struct ImageGroupRow: View {
+    let group: CImageGroup
+    let fraction: Double
+    let isExpanded: Bool
+    let onToggle: () -> Void
+    @Environment(\.theme) private var theme
+    @State private var hovering = false
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "chevron.right")
+                .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                .foregroundStyle(theme.textSecondary).font(.system(size: 9, weight: .bold))
+                .frame(width: 12)
+
+            Image(systemName: "square.stack.3d.up.fill")
+                .foregroundStyle(theme.accent).font(.system(size: 11)).frame(width: 14)
+
+            VStack(alignment: .leading, spacing: 0) {
+                Text(group.name)
+                    .font(.system(size: 12, weight: .medium)).foregroundStyle(theme.textPrimary)
+                    .lineLimit(1).truncationMode(.middle)
+                Text(subtitle)
+                    .font(.system(size: 9)).foregroundStyle(theme.textSecondary.opacity(0.8))
+            }
+
+            Spacer(minLength: 8)
+
+            if group.unusedCount > 0 {
+                Text("\(group.unusedCount) unused")
+                    .font(.system(size: 9, weight: .bold)).foregroundStyle(Color(hex: 0xE0915A))
+                    .padding(.horizontal, 5).padding(.vertical, 1)
+                    .background(Capsule().fill(Color(hex: 0xE0915A).opacity(0.18)))
+            }
+
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(theme.barTrack)
+                    Capsule().fill(theme.color(forHashable: group.name))
+                        .frame(width: max(0, geo.size.width * fraction))
+                }
+            }
+            .frame(width: 70, height: 5)
+
+            Text(Format.bytes(group.size))
+                .font(.system(size: 11, weight: .medium).monospacedDigit())
+                .foregroundStyle(theme.textSecondary)
+                .frame(width: 66, alignment: .trailing)
+        }
+        .padding(.horizontal, 10).padding(.vertical, 5)
+        .background(hovering ? theme.rowHover : .clear)
+        .contentShape(Rectangle())
+        .onTapGesture(perform: onToggle)
+        .onHover { hovering = $0 }
+    }
+
+    /// Says what the group is made of, leading with the part that is reclaimable
+    /// — superseded builds are the reason these groups are large.
+    private var subtitle: String {
+        var parts = ["\(group.images.count) images"]
+        if group.supersededCount > 0 { parts.append("\(group.supersededCount) superseded") }
+        // Changes the advice, so it belongs on the collapsed row rather than in
+        // a tooltip: deleting these one by one frees nothing.
+        if group.layersMostlyShared { parts.append("layers shared — remove as a set") }
+        return parts.joined(separator: " · ")
+    }
+}
+
 private struct ImageRow: View {
     let image: CImage
     let fraction: Double
+    var indent: CGFloat = 0
     let isExpanded: Bool
     let onToggle: () -> Void
     let onRemove: () -> Void
@@ -312,8 +421,22 @@ private struct ImageRow: View {
                 .foregroundStyle(image.inUse ? theme.accent : theme.textSecondary).font(.system(size: 11)).frame(width: 14)
 
             VStack(alignment: .leading, spacing: 0) {
-                Text(image.name).font(.system(size: 12)).foregroundStyle(theme.textPrimary).lineLimit(1).truncationMode(.middle)
-                Text(image.shortID).font(.system(size: 9).monospaced()).foregroundStyle(theme.textSecondary.opacity(0.7))
+                HStack(spacing: 5) {
+                    Text(image.name).font(.system(size: 12)).foregroundStyle(theme.textPrimary).lineLimit(1).truncationMode(.middle)
+                    // The name of a superseded image is the tag it *lost*, so
+                    // the badge is not decoration: without it the row claims a
+                    // tag that now points somewhere else.
+                    if let badge = image.origin.badge {
+                        Text(badge)
+                            .font(.system(size: 8, weight: .bold))
+                            .foregroundStyle(theme.textSecondary)
+                            .padding(.horizontal, 4).padding(.vertical, 1)
+                            .background(Capsule().fill(theme.textSecondary.opacity(0.14)))
+                    }
+                }
+                Text(caption)
+                    .font(.system(size: 9).monospaced()).foregroundStyle(theme.textSecondary.opacity(0.7))
+                    .lineLimit(1)
             }
 
             Spacer(minLength: 8)
@@ -332,21 +455,41 @@ private struct ImageRow: View {
             }
             .frame(width: 70, height: 5)
 
-            Text(Format.bytes(image.size))
-                .font(.system(size: 11, weight: .medium).monospacedDigit()).foregroundStyle(theme.textSecondary)
-                .frame(width: 66, alignment: .trailing)
+            VStack(alignment: .trailing, spacing: 0) {
+                Text(Format.bytes(image.size))
+                    .font(.system(size: 11, weight: .medium).monospacedDigit()).foregroundStyle(theme.textSecondary)
+                // Almost all of this image's bytes are layers other images also
+                // hold: deleting it alone frees the small figure, not the large
+                // one. Shown only when the gap is big enough to mislead.
+                if image.sharesMostOfItsBytes, let unique = image.uniqueSize {
+                    Text("\(Format.bytes(unique)) alone")
+                        .font(.system(size: 8).monospacedDigit())
+                        .foregroundStyle(theme.textSecondary.opacity(0.7))
+                }
+            }
+            .frame(width: 76, alignment: .trailing)
         }
-        .padding(.horizontal, 10).padding(.vertical, 4)
+        .padding(.leading, 10 + indent).padding(.trailing, 10).padding(.vertical, 4)
         .background(hovering ? theme.rowHover : .clear)
         .contentShape(Rectangle())
         .onTapGesture(perform: onToggle)
         .onHover { hovering = $0 }
+        .help(image.origin == .superseded
+              ? "This image used to carry \(image.name). A newer build or pull took the tag."
+              : image.name)
         .contextMenu {
             Button { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(image.id, forType: .string) } label: {
                 Label("Copy Image ID", systemImage: "doc.on.doc")
             }
             Button(role: .destructive, action: onRemove) { Label("Remove Image", systemImage: "trash") }
         }
+    }
+
+    /// The id, plus the age that tells two otherwise identical rebuilds apart —
+    /// the only thing distinguishing forty images of the same tag.
+    private var caption: String {
+        guard let created = image.created else { return image.shortID }
+        return "\(image.shortID) · \(Format.age(created))"
     }
 }
 

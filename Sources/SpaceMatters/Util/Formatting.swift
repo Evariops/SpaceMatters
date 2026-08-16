@@ -30,6 +30,25 @@ enum Format {
         countFormatter.string(from: NSNumber(value: value)) ?? "\(value)"
     }
 
+    /// Coarse relative age ("3w ago", "5mo ago").
+    ///
+    /// Coarse on purpose: it exists to separate a build from yesterday from one
+    /// from last spring in a list of otherwise identical rows, not to date it.
+    /// A fixed set of buckets also keeps the column from changing width as rows
+    /// scroll past.
+    static func age(_ date: Date, now: Date = Date()) -> String {
+        let seconds = max(0, now.timeIntervalSince(date))
+        let day = 86_400.0
+        switch seconds {
+        case ..<(2 * 3600): return "just now"
+        case ..<day: return "\(Int(seconds / 3600))h ago"
+        case ..<(14 * day): return "\(Int(seconds / day))d ago"
+        case ..<(60 * day): return "\(Int(seconds / (7 * day)))w ago"
+        case ..<(730 * day): return "\(Int(seconds / (30 * day)))mo ago"
+        default: return "\(Int(seconds / (365 * day)))y ago"
+        }
+    }
+
     static func rate(_ value: Double) -> String {
         if value >= 1000 {
             return String(format: "%.1fk/s", value / 1000)

@@ -28,7 +28,27 @@ final class ContainerController {
     private(set) var runningAction: String?
 
     var expandedImages: Set<String> = []
+    /// Image groups the user has opened. Collapsed by default: the point of
+    /// grouping is that forty rebuilds of one tag arrive as one line.
+    var expandedGroups: Set<String> = []
     private(set) var layerCache: [String: [CLayer]] = [:]
+
+    /// Images collapsed onto the identity they resolve to, largest first.
+    ///
+    /// The engine's own ordering is one row per image, which on a machine that
+    /// rebuilds the same handful of tags is hundreds of indistinguishable lines.
+    /// Grouping restores the question the view is meant to answer: which *tag*
+    /// is holding the space.
+    var imageGroups: [CImageGroup] {
+        let grouped = Dictionary(grouping: images, by: \.name)
+        return grouped
+            .map { CImageGroup(name: $0.key, images: $0.value.sorted { lhs, rhs in
+                // Newest first inside a group: the current build is the one the
+                // user is looking for, its predecessors trail behind it.
+                (lhs.created ?? .distantPast) > (rhs.created ?? .distantPast)
+            }) }
+            .sorted { $0.size > $1.size }
+    }
 
     private var engine: ContainerEngine?
     /// Superseded-load guard (same pattern as the Kubernetes and Cleanup modes):
@@ -45,7 +65,7 @@ final class ContainerController {
         state = .loading
         df = []; images = []; containers = []; volumes = []
         machineDisk = nil; lastTrimFreed = nil
-        expandedImages = []; layerCache = [:]
+        expandedImages = []; expandedGroups = []; layerCache = [:]
         actionError = nil
         runningAction = nil
         loadID += 1
@@ -85,6 +105,14 @@ final class ContainerController {
         } else {
             expandedImages.insert(image.id)
             loadLayersIfNeeded(image)
+        }
+    }
+
+    func toggle(group: CImageGroup) {
+        if expandedGroups.contains(group.id) {
+            expandedGroups.remove(group.id)
+        } else {
+            expandedGroups.insert(group.id)
         }
     }
 
