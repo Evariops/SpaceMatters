@@ -90,6 +90,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
         // Only the GUI claims the MCP rendezvous socket (SPEC-14 §3.5).
         MCPBridge.shared.enable()
+
+        // `NSToolTipManager` waits a second or more by default, which is fine
+        // for a hint and far too slow for a toolbar where the tooltip *is* the
+        // documentation. Put in the registration domain, the lowest-priority
+        // one, so anybody who has set `NSInitialToolTipDelay` themselves — or
+        // globally — still overrides this.
+        UserDefaults.standard.register(defaults: ["NSInitialToolTipDelay": 300])
     }
 
     func applicationWillTerminate(_ notification: Notification) {
