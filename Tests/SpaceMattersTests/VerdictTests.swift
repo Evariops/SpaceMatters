@@ -221,4 +221,70 @@ import simd
         #expect(c.annotate(path: caches, verdict: .safe, reason: "again") != nil)
         #expect(c.showVerdictsOnly)
     }
+
+    @Test func aRescanOfTheSameRootKeepsTheMarks() async throws {
+        // The marks *are* the work — refreshing what you are looking at, often
+        // right after deleting something, must not throw them away.
+        let root = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let c = await scanned(root)
+        #expect(c.annotate(path: root.appendingPathComponent("caches").path,
+                           verdict: .safe, reason: "regenerable") != nil)
+
+        c.rescan()
+        let deadline = Date().addingTimeInterval(5)
+        while c.phase == .scanning && Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+            await Task.yield()
+        }
+        #expect(c.verdictCount == 1)
+        let caches = try #require(c.root?.children.first { $0.name == "caches" })
+        #expect(c.verdict(for: caches)?.verdict == .safe)
+    }
+
+    @Test func goingHomeEndsTheAnalysis() async throws {
+        let root = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let c = await scanned(root)
+        #expect(c.annotate(path: root.appendingPathComponent("caches").path,
+                           verdict: .safe, reason: "x") != nil)
+        #expect(c.showVerdictsOnly)
+
+        c.goHome()
+        #expect(c.verdictCount == 0)
+        #expect(c.showVerdictsOnly == false)
+
+        // Re-picking the same disk starts clean, not a resumption.
+        let c2 = await scanned(root)
+        _ = c2
+        c.scan(url: root)
+        let deadline = Date().addingTimeInterval(5)
+        while c.phase == .scanning && Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+            await Task.yield()
+        }
+        #expect(c.verdictCount == 0)
+    }
+
+    @Test func scanningSomewhereElseDropsTheMarks() async throws {
+        let root = try fixture()
+        let other = try fixture()
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: other)
+        }
+        let c = await scanned(root)
+        #expect(c.annotate(path: root.appendingPathComponent("caches").path,
+                           verdict: .safe, reason: "x") != nil)
+
+        // Switching folders without going Home is still a different analysis.
+        c.scan(url: other)
+        let deadline = Date().addingTimeInterval(5)
+        while c.phase == .scanning && Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+            await Task.yield()
+        }
+        #expect(c.verdictCount == 0)
+        #expect(c.showVerdictsOnly == false)
+    }
 }

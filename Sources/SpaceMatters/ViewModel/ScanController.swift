@@ -432,6 +432,14 @@ final class ScanController {
         isHost: Bool,
         nodePaths: [ObjectIdentifier: String]
     ) {
+        // Verdicts belong to the analysis that produced them. A rescan of the
+        // same root keeps them — the user is refreshing what they are working
+        // on, and the marks are the work. Anything else (another disk, another
+        // folder, a fresh pick after Home) is a different analysis, and carrying
+        // stale colours into it would assert conclusions nobody drew about it.
+        // Checked here, before `rootPath` is overwritten below.
+        if displayPath.isEmpty || displayPath != rootPath { discardVerdicts() }
+
         // The old tree is being replaced: abort in-flight structural operations
         // (they re-check the epoch after each await), stop a sub-scan that would
         // otherwise keep re-scanning an orphaned subtree, and keep the outgoing
@@ -504,6 +512,9 @@ final class ScanController {
 
     /// Discard the current scan and return to the disk-selection splash.
     func goHome() {
+        // Leaving the analysis ends it: re-picking the same disk from the splash
+        // starts a fresh one, not a resumption of the last session's verdicts.
+        discardVerdicts()
         treeEpoch &+= 1
         activeSubScan?.cancel()
         let oldScanner = scanner
@@ -809,9 +820,20 @@ final class ScanController {
 
     func clearVerdicts() {
         guard !verdictPaths.isEmpty else { return }
+        discardVerdicts()
+    }
+
+    /// Forget every mark. Unlike `rebindVerdicts` this touches no nodes, so it is
+    /// safe to call mid-teardown, while the tree is being replaced.
+    private func discardVerdicts() {
+        guard !verdictPaths.isEmpty else { return }
         verdictPaths.removeAll()
+        verdictsByNode = [:]
+        verdictAncestry = []
+        verdictCount = 0
         didAutoFilter = false // the next run gets the same courtesy
-        rebindVerdicts()
+        showVerdictsOnly = false
+        verdictVersion &+= 1
     }
 
     /// Re-resolve every annotated path against the current tree. Cheap — there
