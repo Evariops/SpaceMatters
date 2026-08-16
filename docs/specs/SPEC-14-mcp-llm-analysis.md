@@ -1,7 +1,7 @@
 # SPEC-14 — LLM analysis: token-budgeted digests, an MCP server, and verdicts painted back onto the map
 
 > **Request**: let a Claude session do a *detailed* analysis of a scan. The app cannot spawn the session itself (`claude -p` is API-token-only, so subscription users have no headless path), so the flow inverts: **the user starts the session, and the session calls the app**.
-> **Status**: 🟢 **Phases 0–3 implemented** (branch `feat/llm-briefing`) — [TreeDigest](../../Sources/SpaceMatters/Model/TreeDigest.swift), the ⌘⇧C briefing, `ATTR_CMN_MODTIME` with max-propagated watermarks, [TreeQuery](../../Sources/SpaceMatters/Model/TreeQuery.swift), a read-only MCP server behind `--mcp` that attaches to the running app when it can, and verdicts painted onto both maps. Phase 4 (skill + one-click setup) remains specified only.
+> **Status**: 🟢 **Implemented** (branch `feat/llm-briefing`) — [TreeDigest](../../Sources/SpaceMatters/Model/TreeDigest.swift), the ⌘⇧C briefing, `ATTR_CMN_MODTIME` with max-propagated watermarks, [TreeQuery](../../Sources/SpaceMatters/Model/TreeQuery.swift), a read-only MCP server behind `--mcp` that attaches to the running app when it can, verdicts painted onto both maps, and a shipped skill with in-app setup.
 > **Guiding constraint**: the scanner measures, the LLM classifies. Everything here exists to hand a model the smallest payload that still supports a correct verdict — and to bring that verdict back into the map, where the user already is.
 
 ## 0. Phase 0 implementation result
@@ -53,6 +53,16 @@ Full Disk Access is simply **not granted to SpaceMatters on this machine**, whic
 - **Live-verified end to end.** App launched on this repo, session attached over the socket (`tools/list` returned all ten), three `annotate` calls accepted, a bad path refused with a usable message, `focus` selected the folder. Proof by A/B rather than by eye: mean colour of the map region was **(107, 158, 115)** with verdicts — a green bias of **+51** over red — and **(117, 120, 116)** after "Clear 3 LLM Verdicts", a bias of **+3**. Quitting the app removes the socket file.
 - **A false alarm the smoke test exposed**: the access caveat fired on a scan where *nothing* had been denied, because it was gated on the FDA permission rather than on what happened. Now gated on `errors > 0` — crying wolf on a clean scoped scan teaches a model to ignore the warning on the scan where it matters.
 - **Tests**: 7 in [VerdictTests](../../Tests/SpaceMattersTests/VerdictTests.swift) driving a real controller over a real scan (region inheritance, nearest-ancestor precedence, survival across `invalidate`, refusal outside the tree, clearing, distinct tints) + 2 more protocol tests. Full suite **181 green**.
+
+## 0e. Phase 4 implementation result
+
+- **The skill** — [Packaging/skills/space](../../Packaging/skills/space/SKILL.md): the procedure (`overview` first, `find` *before* drilling, `aged` on every candidate, `explain` before proposing, `annotate` as you go), how to read the numbers a scan produces, and the safety rules. Its `references/directories.md` carries what the model cannot infer from bytes and dates — which caches regenerate, which directories **look** like caches and hold unrecoverable state (`IndexedDB`, `Local Storage`, browser profiles), what is never "safe" (photo libraries, `.git`, Time Machine snapshots), and which sizes are sparse and therefore lie. Copied into the bundle by `bundle.sh`.
+- **Setup lives in the analysis, not in a dialog.** First cut was an `NSAlert`; the user's verdict was "trop intrusif", and they were right — handing a scan to an assistant is an *option*, not a step in using the app. Replaced by a `sparkles` icon in the results toolbar beside the reconciliation "?" and the theme toggle, opening a 340 pt popover ([AssistantPanel](../../Sources/SpaceMatters/Views/AssistantPanel.swift)): copy-briefing on top, then the Claude Code state — checking / connected / not set up — with **the exact lines it will write and run** shown before either button is pressed. No modal anywhere.
+- **`sparkles`, not Claude's own mark.** Naming the tool is fine; shipping a third party's logo in an unaffiliated app is not.
+- **Registration goes through `claude mcp add -s user`**, never by editing `~/.claude.json`: that file is the CLI's business, its shape can change, and a GUI app rewriting it is how someone loses their MCP setup. The default scope is `local` (per-directory) — wrong for a disk analyser, hence the explicit `-s user`. Syntax verified against the real CLI with a throwaway entry, then removed. Failures report **what the CLI actually said**: "already exists" and a broken install need different responses.
+- **The CLI is looked for at its install paths**, not resolved through the shell — a GUI app inherits a minimal `PATH`. Not found → the skill still installs and the command is shown to copy.
+- **Live-verified in the bundled app**: the icon sits in the toolbar, the popover resolves the skill out of `Contents/Resources/skills/space` and finds the CLI, and dismissing it wrote nothing (`~/.claude/skills` untouched, `claude mcp list` still empty).
+- **Tests**: 3 in [ClaudeIntegrationTests](../../Tests/SpaceMattersTests/ClaudeIntegrationTests.swift) — user scope, the `--` separator, quoting of executable paths containing spaces (an unquoted copy-pasted command would register a server that can never start), and that the shipped skill still has its frontmatter and reference file. Full suite **184 green**.
 
 ## 1. Objective
 
@@ -214,6 +224,6 @@ It is twenty lines on top of §3.1, it needs no MCP install and no `--mcp` mode,
 | 1 — `ATTR_CMN_MODTIME` + subtree type estimate ✅ | 0.5 d | — |
 | 2 — MCP server, detached, read-only ✅ | 1.5–2 d | 0, 1 |
 | 3 — Connected mode, `annotate`, `focus` ✅ | 2 d | 2, SPEC-09/10/13 (shipped) |
-| 4 — Skill + one-click setup | 0.5 d | 2 |
+| 4 — Skill + one-click setup ✅ | 0.5 d | 2 |
 
 **Total ~5–6 d**, shippable in four independently useful increments. Phase 0 alone delivers most of the user-visible value; Phase 3 is what makes it a feature no other disk analyser has.

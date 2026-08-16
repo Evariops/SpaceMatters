@@ -420,6 +420,13 @@ private struct ToolbarBar: View {
                 ReconciliationButton(controller: controller)
             }
 
+            // Hand the scan to an assistant (SPEC-14). An option, not a step, so
+            // it sits with the other optional explanations rather than greeting
+            // anyone with a dialog.
+            if controller.root != nil && !controller.isScanning {
+                AssistantButton(app: app)
+            }
+
             Button { isDark.toggle() } label: {
                 Image(systemName: isDark ? "sun.max.fill" : "moon.fill")
             }
