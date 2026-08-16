@@ -44,7 +44,9 @@ claude mcp add spacematters -- /Applications/SpaceMatters.app/Contents/MacOS/Spa
 
 The session gets `overview`, `tree`, `top`, `types`, `find`, `aged`, `explain` and `cleanup_targets`. `find` is the one with no cheap shell equivalent — "19 `node_modules`, 6.7 GiB between them" is a single walk over the scan and a `find | xargs du` storm otherwise. `aged` answers the other half of any delete decision: regenerable *and* untouched for a year.
 
-The server scans once on the first call (`$HOME` by default, or pass a path) and answers from memory after that. **It cannot delete anything** — no such tool exists. Its output is a plan; the cleanup pass in the app is what acts on it, fenced and journalled. Without Full Disk Access it says so in its answers rather than quietly under-reporting.
+**If SpaceMatters is open, the session attaches to it** — no second scan, and it sees exactly the tree on your screen. Two more tools appear: `focus` moves the app to the folder being discussed, and `annotate` paints a verdict onto the treemap and the sunburst. Mark a folder `safe`, `review` or `keep` and its whole region takes that colour, with the reason on hover — a colour alone is never the argument, so the sentence behind it is required. Edit › Clear LLM Verdicts undoes the lot. Close the app and the same command falls back to scanning on its own.
+
+The server scans once on the first call (`$HOME` by default, or pass a path) and answers from memory after that. **It cannot delete anything** — no such tool exists. Its output is a plan; the cleanup pass in the app is what acts on it, fenced and journalled. Anything it could not read, it says so rather than quietly under-reporting.
 
 ## Download
 

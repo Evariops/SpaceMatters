@@ -49,6 +49,7 @@ struct TreemapView: View {
                 selectedExt: controller.selectedExt,
                 searchMatchIDs: controller.searchMatchIDs,
                 highlightVersion: controller.highlightVersion,
+                verdictVersion: controller.verdictVersion,
                 isDark: theme.isDark,
                 onHover: { [hoverModel] in hoverModel.info = $0 }
             )
@@ -78,6 +79,7 @@ private struct TreemapRepresentable: NSViewRepresentable {
     let selectedExt: ExtKey?
     let searchMatchIDs: Set<ObjectIdentifier>
     let highlightVersion: Int
+    let verdictVersion: Int
     let isDark: Bool
     let onHover: (HoverInfo?) -> Void
 
@@ -87,7 +89,7 @@ private struct TreemapRepresentable: NSViewRepresentable {
         view.apply(controller: controller, theme: theme, version: version, zoomRoot: zoomRoot,
                    zoomRequestID: zoomRequestID, selection: selection,
                    selectedExt: selectedExt, searchMatchIDs: searchMatchIDs,
-                   highlightVersion: highlightVersion)
+                   highlightVersion: highlightVersion, verdictVersion: verdictVersion)
         return view
     }
 
@@ -96,7 +98,7 @@ private struct TreemapRepresentable: NSViewRepresentable {
         view.apply(controller: controller, theme: theme, version: version, zoomRoot: zoomRoot,
                    zoomRequestID: zoomRequestID, selection: selection,
                    selectedExt: selectedExt, searchMatchIDs: searchMatchIDs,
-                   highlightVersion: highlightVersion)
+                   highlightVersion: highlightVersion, verdictVersion: verdictVersion)
     }
 }
 
@@ -121,6 +123,7 @@ final class TreemapNSView: NSView, CALayerDelegate {
     private var selectedExt: ExtKey?
     private var searchMatchIDs: Set<ObjectIdentifier> = []
     private var highlightVersion: Int = .min
+    private var verdictVersion: Int = .min
     private var isDark = true
 
     // The world and the camera (SPEC-10).
@@ -312,7 +315,8 @@ final class TreemapNSView: NSView, CALayerDelegate {
 
     func apply(controller: ScanController, theme: Theme, version: UInt64, zoomRoot: FSNode?,
                zoomRequestID: Int, selection: FSNode?, selectedExt: ExtKey?,
-               searchMatchIDs: Set<ObjectIdentifier>, highlightVersion: Int) {
+               searchMatchIDs: Set<ObjectIdentifier>, highlightVersion: Int,
+               verdictVersion: Int) {
         self.controller = controller
 
         let themeChanged = isDark != theme.isDark
@@ -330,6 +334,9 @@ final class TreemapNSView: NSView, CALayerDelegate {
         let firstApply = self.zoomRequestID == .min
         let highlightChanged = selectedExt != self.selectedExt
             || highlightVersion != self.highlightVersion || searchMatchIDs != self.searchMatchIDs
+            // A verdict change is a recolour, not a relayout — it rides the same
+            // repack path as search and type highlighting.
+            || verdictVersion != self.verdictVersion
         let selectionChanged = selection !== self.selection
 
         self.version = version
@@ -338,6 +345,7 @@ final class TreemapNSView: NSView, CALayerDelegate {
         self.selectedExt = selectedExt
         self.searchMatchIDs = searchMatchIDs
         self.highlightVersion = highlightVersion
+        self.verdictVersion = verdictVersion
         self.selection = selection
         self.scanRoot = root
 
@@ -597,8 +605,22 @@ final class TreemapNSView: NSView, CALayerDelegate {
             instances.append(TileInstance(
                 origin: SIMD4<Float>(Float(r.minX - rebaseOrigin.x), 0, Float(r.minY - rebaseOrigin.y), 0),
                 size: SIMD4<Float>(Float(r.width), 0, Float(r.height), dim),
-                color: tileColor(for: tile, weight: weight)))
+                color: verdictTinted(tileColor(for: tile, weight: weight), tile.node)))
         }
+    }
+
+    /// Blend a tile toward its verdict (SPEC-14 §3.5). Applied *after* the
+    /// palette LUT so a verdict never poisons the cached type colours, and only
+    /// when verdicts exist — the common case pays one dictionary-empty check.
+    private func verdictTinted(_ color: SIMD4<Float>, _ node: FSNode) -> SIMD4<Float> {
+        guard let controller, let note = controller.verdict(for: node) else { return color }
+        let tint = note.verdict.tint
+        let k = Verdict.tintStrength
+        return SIMD4<Float>(
+            color.x + (tint.x - color.x) * k,
+            color.y + (tint.y - color.y) * k,
+            color.z + (tint.z - color.z) * k,
+            color.w)
     }
 
     /// Highlight/search change: same tiles, new dims — repack and re-upload.
@@ -1021,7 +1043,8 @@ final class TreemapNSView: NSView, CALayerDelegate {
         return HoverInfo(title: hoverPath(node), isDirectory: node.isDirectory,
                          sizeText: Self.sizeText(
                             onDisk: tile.isFileBlock ? node.directFilesPhysical : node.sizeOnDisk,
-                            divergence: divergence))
+                            divergence: divergence),
+                         verdict: controller?.verdict(for: node))
     }
 
     /// "75 MB · 512 GB apparent (sparse)" when the tile hides a divergence;

@@ -750,6 +750,63 @@ final class ScanController {
         return (base == "/" ? "/" : base + "/") + file.name
     }
 
+    // MARK: LLM verdicts (SPEC-14 §3.5)
+
+    /// Verdicts keyed by node, for the renderers — rebuilt from `verdictPaths`
+    /// whenever the tree changes.
+    @ObservationIgnored private(set) var verdictsByNode: [ObjectIdentifier: VerdictNote] = [:]
+    /// The source of truth. Paths survive what node identity does not: SPEC-02
+    /// `invalidate` rebuilds a subtree as *fresh objects*, and a verdict that
+    /// silently migrated to the wrong node would be worse than losing it.
+    @ObservationIgnored private var verdictPaths: [String: VerdictNote] = [:]
+    /// Bumped so views redraw; separate from `version`, which means "the tree
+    /// changed" and would re-run layout for a recolour.
+    private(set) var verdictVersion = 0
+    /// Observable so the menu can enable "Clear" without reaching into the map.
+    private(set) var verdictCount = 0
+
+    /// A node's verdict, inherited from the nearest annotated ancestor: marking
+    /// `~/Library/Caches` has to paint the region, not one tile inside it.
+    func verdict(for node: FSNode) -> VerdictNote? {
+        guard !verdictsByNode.isEmpty else { return nil }
+        var current: FSNode? = node
+        while let n = current {
+            if let note = verdictsByNode[ObjectIdentifier(n)] { return note }
+            current = n.parent
+        }
+        return nil
+    }
+
+    /// Returns the resolved path, or `nil` when it isn't in the scanned tree —
+    /// the caller reports that rather than annotating nothing silently.
+    @discardableResult
+    func annotate(path: String, verdict: Verdict, reason: String) -> String? {
+        guard let node = nearestNode(toPath: path), let resolved = self.path(for: node),
+              resolved == Self.canonical(path) || resolved == path else { return nil }
+        verdictPaths[resolved] = VerdictNote(verdict: verdict, reason: reason)
+        rebindVerdicts()
+        return resolved
+    }
+
+    func clearVerdicts() {
+        guard !verdictPaths.isEmpty else { return }
+        verdictPaths.removeAll()
+        rebindVerdicts()
+    }
+
+    /// Re-resolve every annotated path against the current tree. Cheap — there
+    /// are tens of verdicts, not thousands — so it runs on every tree bump
+    /// rather than trying to detect which subtree moved.
+    private func rebindVerdicts() {
+        var resolved: [ObjectIdentifier: VerdictNote] = [:]
+        for (path, note) in verdictPaths {
+            if let node = node(at: path) { resolved[ObjectIdentifier(node)] = note }
+        }
+        verdictsByNode = resolved
+        verdictCount = verdictPaths.count
+        verdictVersion &+= 1
+    }
+
     // MARK: LLM briefing (SPEC-14 §3.7)
 
     /// Markdown digest of what the user is currently looking at — the zoom root,
@@ -2013,6 +2070,9 @@ final class ScanController {
             } else {
                 phase = .finished
                 scanDate = Date()
+                // Open the MCP socket only now: a session that attaches finds a
+                // finished tree rather than an empty controller (SPEC-14 §3.5).
+                MCPBridge.shared.startIfNeeded(controller: self)
                 startWatching() // begin watching the disk for changes (SPEC-04)
                 // Capture the budget baseline *after* startWatching — it resets
                 // watch state (including the baseline) on entry (issue #14).
@@ -2028,5 +2088,8 @@ final class ScanController {
 
     private func bump() {
         version &+= 1
+        // The tree may have been rebuilt under the verdicts (SPEC-02 invalidate
+        // replaces nodes with fresh objects); re-resolve them by path.
+        if !verdictPaths.isEmpty { rebindVerdicts() }
     }
 }

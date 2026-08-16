@@ -1,7 +1,7 @@
 # SPEC-14 — LLM analysis: token-budgeted digests, an MCP server, and verdicts painted back onto the map
 
 > **Request**: let a Claude session do a *detailed* analysis of a scan. The app cannot spawn the session itself (`claude -p` is API-token-only, so subscription users have no headless path), so the flow inverts: **the user starts the session, and the session calls the app**.
-> **Status**: 🟡 **Phases 0–2 implemented** (branch `feat/llm-briefing`) — [TreeDigest](../../Sources/SpaceMatters/Model/TreeDigest.swift), the ⌘⇧C briefing, `ATTR_CMN_MODTIME` with max-propagated watermarks, [TreeQuery](../../Sources/SpaceMatters/Model/TreeQuery.swift), and a read-only MCP stdio server ([MCPServer](../../Sources/SpaceMatters/App/MCP/MCPServer.swift)) behind `--mcp`. Phases 3–4 remain specified only.
+> **Status**: 🟢 **Phases 0–3 implemented** (branch `feat/llm-briefing`) — [TreeDigest](../../Sources/SpaceMatters/Model/TreeDigest.swift), the ⌘⇧C briefing, `ATTR_CMN_MODTIME` with max-propagated watermarks, [TreeQuery](../../Sources/SpaceMatters/Model/TreeQuery.swift), a read-only MCP server behind `--mcp` that attaches to the running app when it can, and verdicts painted onto both maps. Phase 4 (skill + one-click setup) remains specified only.
 > **Guiding constraint**: the scanner measures, the LLM classifies. Everything here exists to hand a model the smallest payload that still supports a correct verdict — and to bring that verdict back into the map, where the user already is.
 
 ## 0. Phase 0 implementation result
@@ -41,6 +41,18 @@ Full Disk Access is simply **not granted to SpaceMatters on this machine**, whic
 - **`--mcp [path]` defaults to the home directory**, not `/`: that is where the actionable bytes are, and scanning `/` would spend the session's first minute on system files nobody may delete.
 - **Measured, real session** — `overview` → `find node_modules` → `aged 1y` → `cleanup_targets` → `tree ~/Library`: scan of `$HOME` is **190 GiB / 1 904 295 files / 335 132 dirs in 13,6 s**, paid once; the five tool results total **1 527 words ≈ 2 100 tokens**, against §5's ≤ 15 k budget. `find` produced the finding the tool exists for: *19 `node_modules`, 6,67 GiB between them*, several marked `cold:6mo`.
 - **Tests**: 8 in [MCPProtocolTests](../../Tests/SpaceMattersTests/MCPProtocolTests.swift) (parse survives garbage, string ids survive, every schema is valid and JSON-encodable, required keys are declared, no tool name reads as a mutation) + 14 in [TreeQueryTests](../../Tests/SpaceMattersTests/TreeQueryTests.swift) (the fence, nested-match dedup, outermost-cold-only, size/duration parsing). Full suite **172 green**.
+
+## 0d. Phase 3 implementation result
+
+**The payoff phase: the scanner measures, the model classifies, and the map is where they meet.**
+
+- **Connected mode** — [MCPSocketServer](../../Sources/SpaceMatters/App/MCP/MCPSocketServer.swift) listens on `~/Library/Application Support/SpaceMatters/mcp.sock` (mode `0600`, opened only once a scan has finished so an attaching session always finds a tree), and [MCPRelay](../../Sources/SpaceMatters/App/MCP/MCPRelay.swift) makes `--mcp` try that socket first and fall back to a scan of its own. The user never chooses: one config line works with or without the app open, which is the only way an MCP entry can be reliable.
+- **The tools were written once.** [MCPScanSource](../../Sources/SpaceMatters/App/MCP/MCPScanSource.swift) abstracts "a scan", `MCPServer.respond(to:)` returns the response object instead of writing it, and the two transports differ only in where that object goes. `annotate`/`focus` are advertised **only when an app is attached** — offering them against a standalone scan would earn the model an error per call.
+- **The socket thread reads the tree directly.** Only the handle is taken on the main actor; the walk runs on the socket thread over `FSNode`, whose atomics and `gTreeLock` exist precisely so a reader outside the UI is safe. Mutations hop back to main.
+- **Verdicts** — `safe` / `review` / `keep` with a **mandatory reason** (a colour is not an argument for deleting something; the sentence shows on hover). Stored by path on `ScanController`, re-resolved to nodes on every tree bump, inherited by descendants so marking a folder paints its region. The tint is blended *after* the palette LUT in both renderers, so a verdict never poisons the cached type colours, and it rides the existing highlight-repack path — a recolour, not a relayout.
+- **Live-verified end to end.** App launched on this repo, session attached over the socket (`tools/list` returned all ten), three `annotate` calls accepted, a bad path refused with a usable message, `focus` selected the folder. Proof by A/B rather than by eye: mean colour of the map region was **(107, 158, 115)** with verdicts — a green bias of **+51** over red — and **(117, 120, 116)** after "Clear 3 LLM Verdicts", a bias of **+3**. Quitting the app removes the socket file.
+- **A false alarm the smoke test exposed**: the access caveat fired on a scan where *nothing* had been denied, because it was gated on the FDA permission rather than on what happened. Now gated on `errors > 0` — crying wolf on a clean scoped scan teaches a model to ignore the warning on the scan where it matters.
+- **Tests**: 7 in [VerdictTests](../../Tests/SpaceMattersTests/VerdictTests.swift) driving a real controller over a real scan (region inheritance, nearest-ancestor precedence, survival across `invalidate`, refusal outside the tree, clearing, distinct tints) + 2 more protocol tests. Full suite **181 green**.
 
 ## 1. Objective
 
@@ -190,7 +202,7 @@ It is twenty lines on top of §3.1, it needs no MCP install and no `--mcp` mode,
 - ~~**TCC / Full Disk Access in detached mode is the big unknown.**~~ **Measured in phase 2 — see §0c.** FDA turns out not to be granted to the app at all on the development machine, so the transfer question stays open, but detached mode is no blinder than the GUI the user already runs. Mitigation shipped: `FullDiskAccess.isGranted` gates a caveat carried on every tool response (full text on `overview`, one line elsewhere). **Still to settle**: whether a granted bundle's FDA follows a binary spawned by Claude Code. If it does not, connected mode (phase 3) becomes the only way to reach protected locations, which raises its priority above the verdict work.
 - **Scan cost per session.** 33 s on the first tool call is acceptable once; it is not acceptable if the model opens a second server or the session restarts. Connected mode is the real answer; detached should at minimum print its scan scope so a session doesn't re-request it.
 - **Prompt injection through the filesystem.** Directory names are attacker-controllable in the general case (a downloaded archive can contain a folder named to look like an instruction). Digest output must be clearly framed as data, names truncated to a sane length, and control characters stripped. Low severity given the read-only surface — but the surface is read-only *partly for this reason*, and that ordering should not be reversed later.
-- **Verdict staleness.** Annotations key on `ObjectIdentifier`, and [invalidate](../../Sources/SpaceMatters/ViewModel/ScanController.swift) rebuilds subtrees as fresh objects (SPEC-02). Verdicts must be re-bound by path on invalidation, or dropped — a verdict silently migrating to the wrong node is worse than losing it.
+- ~~**Verdict staleness.**~~ **Resolved in phase 3**: paths are the source of truth and the node map is re-resolved from them on every `bump()`, so a verdict follows a rebuilt subtree. Locked by `verdictsSurviveTheTreeBeingRebuilt`, which asserts the fixture actually produced fresh objects before checking the verdict survived — a test that would otherwise pass for the wrong reason.
 - **`find`'s glob is over directory names only.** Files are not objects ([FSNode.swift:6](../../Sources/SpaceMatters/Model/FSNode.swift#L6)), so `find "*.raw"` cannot be answered from the tree — only from the extension rollup, at aggregate granularity. The tool schema must say so, or a model will conclude the disk has no `.raw` files.
 - **`max_nodes` is advisory to the model.** Nothing stops a session from calling `tree` with a huge budget twenty times. The server should cap `max_nodes` (≈ 1000) and note the cap in the response.
 
@@ -201,7 +213,7 @@ It is twenty lines on top of §3.1, it needs no MCP install and no `--mcp` mode,
 | 0 — `TreeDigest` + clipboard briefing ✅ | 0.5 d | — |
 | 1 — `ATTR_CMN_MODTIME` + subtree type estimate ✅ | 0.5 d | — |
 | 2 — MCP server, detached, read-only ✅ | 1.5–2 d | 0, 1 |
-| 3 — Connected mode, `annotate`, `focus` | 2 d | 2, SPEC-09/10/13 (shipped) |
+| 3 — Connected mode, `annotate`, `focus` ✅ | 2 d | 2, SPEC-09/10/13 (shipped) |
 | 4 — Skill + one-click setup | 0.5 d | 2 |
 
 **Total ~5–6 d**, shippable in four independently useful increments. Phase 0 alone delivers most of the user-visible value; Phase 3 is what makes it a feature no other disk analyser has.

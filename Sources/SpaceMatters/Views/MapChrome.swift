@@ -19,6 +19,10 @@ struct HoverInfo: Equatable {
     let title: String
     let isDirectory: Bool
     let sizeText: String
+    /// An assistant's verdict on this folder (SPEC-14 §3.5). Carried here so the
+    /// reason travels with the colour: a tint alone is not an argument for
+    /// deleting something.
+    var verdict: VerdictNote?
 }
 
 /// Isolates the hover state so a mouse move only re-evaluates the pill
@@ -34,7 +38,8 @@ struct HoverPill: View {
     let model: HoverModel
     var body: some View {
         if let hover = model.info {
-            HoverLabel(title: hover.title, isDirectory: hover.isDirectory, sizeText: hover.sizeText)
+            HoverLabel(title: hover.title, isDirectory: hover.isDirectory,
+                       sizeText: hover.sizeText, verdict: hover.verdict)
                 .padding(8).allowsHitTesting(false)
         }
     }
@@ -44,18 +49,36 @@ private struct HoverLabel: View {
     let title: String
     let isDirectory: Bool
     let sizeText: String
+    var verdict: VerdictNote?
     @Environment(\.theme) private var theme
 
     var body: some View {
-        HStack(spacing: 6) {
-            Image(systemName: isDirectory ? "folder.fill" : "doc.fill")
-                .foregroundStyle(theme.accent)
-            Text(title)
-                .foregroundStyle(theme.textPrimary)
-                .lineLimit(1)
-                .truncationMode(.head)
-            Text(sizeText)
-                .foregroundStyle(theme.textSecondary)
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 6) {
+                Image(systemName: isDirectory ? "folder.fill" : "doc.fill")
+                    .foregroundStyle(theme.accent)
+                Text(title)
+                    .foregroundStyle(theme.textPrimary)
+                    .lineLimit(1)
+                    .truncationMode(.head)
+                Text(sizeText)
+                    .foregroundStyle(theme.textSecondary)
+            }
+            if let verdict {
+                HStack(alignment: .firstTextBaseline, spacing: 5) {
+                    Circle()
+                        .fill(Color(verdict.verdict.tint))
+                        .frame(width: 7, height: 7)
+                    Text(verdict.verdict.label)
+                        .foregroundStyle(theme.textPrimary)
+                    // The model's sentence, not just its colour — the reason is
+                    // what the user is actually deciding on.
+                    Text(verdict.reason)
+                        .foregroundStyle(theme.textSecondary)
+                        .lineLimit(2)
+                }
+                .frame(maxWidth: 380, alignment: .leading)
+            }
         }
         .font(.system(size: 11, weight: .medium))
         .padding(.horizontal, 9)
@@ -65,6 +88,14 @@ private struct HoverLabel: View {
                 .fill(theme.panelBackground.opacity(0.95))
                 .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(theme.separator))
         )
+    }
+}
+
+extension Color {
+    /// The verdict tints are defined once, in sRGB, next to the verdicts
+    /// themselves — the map and the chrome must agree.
+    init(_ tint: SIMD3<Float>) {
+        self.init(.sRGB, red: Double(tint.x), green: Double(tint.y), blue: Double(tint.z))
     }
 }
 

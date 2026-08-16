@@ -42,9 +42,10 @@ import Foundation
 
     // MARK: Tool schemas
 
-    @Test func everyToolHasAValidSerialisableSchema() throws {
-        let tools = MCPServer.Tools.all
-        #expect(tools.count == 8)
+    @Test(arguments: [false, true])
+    func everyToolHasAValidSerialisableSchema(mapTools: Bool) throws {
+        let tools = MCPServer.Tools.all(mapTools: mapTools)
+        #expect(tools.count == (mapTools ? 10 : 8))
         for tool in tools {
             let name = try #require(tool["name"] as? String)
             #expect(!(tool["description"] as? String ?? "").isEmpty, "\(name) has no description")
@@ -60,20 +61,43 @@ import Foundation
             // a runtime failure at handshake time, i.e. the worst moment.
             #expect(JSONSerialization.isValidJSONObject(tool), "\(name) is not JSON-encodable")
         }
-        #expect(Set(tools.compactMap { $0["name"] as? String })
-            == ["overview", "tree", "top", "types", "find", "aged", "explain", "cleanup_targets"])
+        var expected: Set<String> = ["overview", "tree", "top", "types", "find", "aged",
+                                     "explain", "cleanup_targets"]
+        if mapTools { expected.formUnion(["annotate", "focus"]) }
+        #expect(Set(tools.compactMap { $0["name"] as? String }) == expected)
+    }
+
+    @Test func mapToolsAreOfferedOnlyWhenAnAppIsAttached() {
+        // Advertising annotate/focus against a standalone scan would earn the
+        // model an error per call and teach it the wrong thing about the server.
+        let standalone = MCPServer.Tools.all(mapTools: false).compactMap { $0["name"] as? String }
+        #expect(!standalone.contains("annotate"))
+        #expect(!standalone.contains("focus"))
     }
 
     @Test func noToolCanMutateTheDisk() {
         // The read-only boundary is the reason this server is installable without
         // a security conversation. A future tool that deletes must be a
         // deliberate decision, not something that slips in with a rename.
-        let names = MCPServer.Tools.all.compactMap { $0["name"] as? String }
+        // annotate/focus mutate the *app's view*, never the filesystem.
+        let names = MCPServer.Tools.all(mapTools: true).compactMap { $0["name"] as? String }
         let forbidden = ["delete", "remove", "clean", "empty", "trash", "rm", "write", "move"]
         for name in names {
             #expect(!forbidden.contains { name.contains($0) && name != "cleanup_targets" },
                     "\(name) looks like a mutation")
         }
+    }
+
+    @Test func annotateRequiresAReason() throws {
+        // A colour on the map is not an argument for deleting something, so the
+        // schema makes the sentence behind it mandatory.
+        let annotate = try #require(MCPServer.Tools.all(mapTools: true)
+            .first { $0["name"] as? String == "annotate" })
+        let schema = try #require(annotate["inputSchema"] as? [String: Any])
+        #expect(Set(schema["required"] as? [String] ?? []) == ["path", "verdict", "reason"])
+        let properties = try #require(schema["properties"] as? [String: Any])
+        let verdict = try #require(properties["verdict"] as? [String: Any])
+        #expect(Set(verdict["enum"] as? [String] ?? []) == ["safe", "review", "keep"])
     }
 
     @Test func instructionsTellTheModelHowToStartAndWhatNotToTrust() {

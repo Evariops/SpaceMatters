@@ -36,7 +36,7 @@ enum Entry {
             // system files nobody is allowed to delete anyway.
             let next = idx + 1 < args.count ? args[idx + 1] : nil
             let root = (next?.hasPrefix("-") == false ? next : nil) ?? NSHomeDirectory()
-            exit(MCPServer(rootPath: root).run())
+            exit(MCPRelay.run(rootPath: root))
         }
         if let idx = args.firstIndex(of: "--briefing") {
             guard idx + 1 < args.count else {
@@ -75,6 +75,10 @@ struct SpaceMattersApp: App {
                 Button("Copy LLM Briefing") { app.copyBriefing() }
                     .keyboardShortcut("c", modifiers: [.command, .shift])
                     .disabled(!app.canCopyBriefing)
+                Button(app.filesystem.verdictCount > 0
+                       ? "Clear \(app.filesystem.verdictCount) LLM Verdicts"
+                       : "Clear LLM Verdicts") { app.filesystem.clearVerdicts() }
+                    .disabled(app.filesystem.verdictCount == 0)
             }
         }
     }
@@ -84,6 +88,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        // Leave no socket file behind: a stale one makes the next `--mcp` try to
+        // connect to nothing before falling back, and clutters the support dir.
+        MCPBridge.shared.stop()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
