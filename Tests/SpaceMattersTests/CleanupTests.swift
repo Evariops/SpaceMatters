@@ -60,9 +60,9 @@ import Foundation
     /// (IndexedDB), offline attachments (File System), the session (Cookies) —
     /// so widening the paths by one directory turns a regenerable cache into
     /// data loss. Pinned by name: a future edit has to break this to ship.
-    @Test func notionTargetTouchesOnlyCaches() {
+    @Test func notionTargetTouchesOnlyCaches() throws {
         let home = NSHomeDirectory()
-        let notion = try! #require(CleanupEngine.catalog().first { $0.id == "notion" })
+        let notion = try #require(CleanupEngine.catalog().first { $0.id == "notion" })
         let partition = home + "/Library/Application Support/Notion/Partitions/notion/"
 
         #expect(notion.paths == [partition + "Service Worker/CacheStorage",
