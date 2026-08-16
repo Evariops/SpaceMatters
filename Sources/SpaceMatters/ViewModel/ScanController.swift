@@ -255,6 +255,15 @@ final class ScanController {
     /// something changed that the watcher didn't see (another user, an
     /// unscannable area…). Above the budget, the banner proposes a Refresh.
     private(set) var driftBytes: Int64 = 0
+    /// The drift reason currently holds the banner up (see `updateDriftLatch`).
+    @ObservationIgnored private var driftLatched = false
+    /// When the drift first crossed the budget without falling back under it.
+    @ObservationIgnored private var driftOverBudgetSince: Date?
+    @ObservationIgnored private var driftSettleScheduled = false
+    /// How long an unexplained drift must hold before it's worth a banner —
+    /// long enough to outlive a reconcile cycle and APFS's lazy free-space
+    /// accounting. Instance-level so tests don't have to wait it out.
+    @ObservationIgnored var driftSettleDelay: TimeInterval = 5
 
     /// Record a physical-bytes change the tree now reflects (either sign).
     private func noteAppliedPhysical(_ delta: Int64) {
@@ -269,6 +278,8 @@ final class ScanController {
         appliedPhysicalDelta = 0
         changedBytes = 0
         driftBytes = 0
+        driftLatched = false
+        driftOverBudgetSince = nil
     }
 
     @ObservationIgnored private var reconcileRunning = false
@@ -1201,6 +1212,8 @@ final class ScanController {
         diskChanged = false
         changedBytes = 0
         driftBytes = 0
+        driftLatched = false
+        driftOverBudgetSince = nil
         appliedPhysicalDelta = 0
         baselineFreeBytes = nil
     }
@@ -1256,11 +1269,79 @@ final class ScanController {
     /// pending to explain it). Ordinary changes reconcile silently — the map
     /// just breathes.
     private func updateBannerState() {
-        let unexplained = dirtyNeeds.isEmpty && abs(driftBytes) >= diskChangeBudget
-        let show = watchRootChanged || !pendingConsentPaths.isEmpty || unexplained
+        updateDriftLatch()
+        let show = watchRootChanged || !pendingConsentPaths.isEmpty || driftLatched
         if show != diskChanged {
             diskChanged = show
             bump()
+        }
+    }
+
+    /// The drift condition is sampled twice per cycle — on every FSEvents batch
+    /// (dirty set non-empty → "explained", banner off) and again when the
+    /// reconciler drains it (dirty set empty → "unexplained", banner on). On a
+    /// busy volume those two states alternate at FSEvents' cadence, which made
+    /// the banner blink on and off continuously after a large delete (statfs
+    /// hasn't handed the blocks back yet, so a real drift sits above the budget
+    /// the whole time). So the drift reason is *latched* instead of sampled:
+    ///
+    /// - it lights only after the drift has held over the budget for
+    ///   `driftSettleDelay` **and** nothing dirty is left to explain it — which
+    ///   also gives APFS time to return the freed blocks, killing the delete
+    ///   false-positive outright;
+    /// - once lit it stays lit through incoming churn, and only drops when the
+    ///   drift really collapses (hysteresis at a quarter of the budget) or a
+    ///   refresh re-baselines the accounting.
+    private func updateDriftLatch() {
+        let before = driftOverBudgetSince
+        (driftLatched, driftOverBudgetSince) = Self.driftLatch(
+            latched: driftLatched,
+            drift: driftBytes,
+            budget: diskChangeBudget,
+            dirtyPending: !dirtyNeeds.isEmpty,
+            overBudgetSince: before,
+            settleDelay: driftSettleDelay,
+            now: Date()
+        )
+        // The clock just started: nothing else will re-measure the drift on a
+        // quiet disk, so arm the one-shot that closes the window.
+        if before == nil, driftOverBudgetSince != nil { scheduleDriftSettleCheck() }
+    }
+
+    /// Pure latch policy (see `updateDriftLatch`) — arm after `settleDelay` over
+    /// the budget with nothing pending, disarm only under a quarter of it.
+    static func driftLatch(
+        latched: Bool,
+        drift: Int64,
+        budget: Int64,
+        dirtyPending: Bool,
+        overBudgetSince: Date?,
+        settleDelay: TimeInterval,
+        now: Date
+    ) -> (latched: Bool, overBudgetSince: Date?) {
+        guard abs(drift) >= budget else {
+            return (latched && abs(drift) >= budget / 4, nil)
+        }
+        guard !latched else { return (true, overBudgetSince) }
+        let since = overBudgetSince ?? now
+        let settled = !dirtyPending && now.timeIntervalSince(since) >= settleDelay
+        return (settled, since)
+    }
+
+    /// Re-measure the drift once the settle window has passed. Without it a
+    /// drift that appears between two FSEvents batches would wait for the next
+    /// batch to be re-evaluated — and on a quiet disk that batch never comes.
+    private func scheduleDriftSettleCheck() {
+        guard !driftSettleScheduled else { return }
+        driftSettleScheduled = true
+        let delay = driftSettleDelay
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard let self else { return }
+            self.driftSettleScheduled = false
+            guard self.isHostScan, self.phase == .finished, !self.isRefreshing else { return }
+            self.refreshDriftBytes()
+            self.updateBannerState()
         }
     }
 

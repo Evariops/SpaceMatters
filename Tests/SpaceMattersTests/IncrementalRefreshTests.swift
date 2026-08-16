@@ -431,6 +431,47 @@ import Foundation
         #expect(c.changedBytes == 0)
     }
 
+    /// The drift banner must not blink: on a busy volume the dirty set empties
+    /// and refills at FSEvents' cadence, and sampling the drift raw made the
+    /// banner flap on and off after a big delete (real drift, statfs lagging).
+    /// The latch arms once, then rides through the churn.
+    @Test func driftLatchDoesNotFlapWithTheDirtySet() {
+        let budget: Int64 = 128 * 1024 * 1024
+        let over = budget * 4
+        let t0 = Date()
+        func latch(_ latched: Bool, _ drift: Int64, dirty: Bool, since: Date?, at: TimeInterval)
+            -> (latched: Bool, overBudgetSince: Date?) {
+            ScanController.driftLatch(latched: latched, drift: drift, budget: budget,
+                                      dirtyPending: dirty, overBudgetSince: since,
+                                      settleDelay: 5, now: t0.addingTimeInterval(at))
+        }
+
+        // Crossing the budget only starts the clock — no banner yet.
+        var s = latch(false, over, dirty: false, since: nil, at: 0)
+        #expect(!s.latched)
+        #expect(s.overBudgetSince == t0)
+        // Still inside the settle window: nothing.
+        s = latch(s.latched, over, dirty: false, since: s.overBudgetSince, at: 2)
+        #expect(!s.latched)
+        // Window elapsed but work is pending — it may yet explain the drift.
+        s = latch(s.latched, over, dirty: true, since: s.overBudgetSince, at: 6)
+        #expect(!s.latched)
+        #expect(s.overBudgetSince == t0)  // the clock keeps running under churn
+        // Settled and nothing pending: the banner earns its place.
+        s = latch(s.latched, over, dirty: false, since: s.overBudgetSince, at: 7)
+        #expect(s.latched)
+        // …and a new FSEvents batch (dirty again) must not take it away.
+        s = latch(s.latched, over, dirty: true, since: s.overBudgetSince, at: 8)
+        #expect(s.latched)
+        // A wobble just under the budget doesn't either (hysteresis).
+        s = latch(s.latched, budget - 1, dirty: false, since: s.overBudgetSince, at: 9)
+        #expect(s.latched)
+        // A real collapse does.
+        s = latch(s.latched, budget / 8, dirty: false, since: s.overBudgetSince, at: 10)
+        #expect(!s.latched)
+        #expect(s.overBudgetSince == nil)
+    }
+
     /// A *leaf* directory whose extension table a re-stat snapshotted is fully
     /// known — when it vanishes, its File-types contribution is subtracted
     /// exactly and no drift is ever marked (the watched-download-vanishing QA
