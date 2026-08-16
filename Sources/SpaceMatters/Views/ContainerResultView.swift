@@ -12,6 +12,7 @@ struct ContainerResultView: View {
     private enum PruneKind: Identifiable { case images, containers, volumes; var id: Int { hashValue } }
     @State private var confirmPrune: PruneKind?
     @State private var confirmRemove: CImage?
+    @State private var confirmTrim = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -34,6 +35,18 @@ struct ContainerResultView: View {
         }
         .background(theme.windowBackground)
         .alert(item: $confirmPrune) { kind in pruneAlert(kind) }
+        .alert("Return free space to the Mac?", isPresented: $confirmTrim) {
+            Button("Reclaim") { controller.trimMachineDisk() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            // Non-destructive, and the message says so plainly: `fstrim` only
+            // tells the host which blocks the guest already considers free.
+            // Nothing inside the VM is removed — that is what the prune buttons
+            // are for, and doing them first is what makes this worth running.
+            Text("Nothing inside the VM is deleted. This tells the Mac which blocks the "
+                 + "machine has already freed, so its disk image can shrink.\n\n"
+                 + "Prune images and volumes first — this only hands back what is already free.")
+        }
         .alert(item: $confirmRemove) { image in removeAlert(image) }
         .alert("Action failed", isPresented: actionErrorShown) {
             Button("OK", role: .cancel) { controller.clearActionError() }
@@ -90,10 +103,65 @@ struct ContainerResultView: View {
             summaryCard(controller.imagesRow, title: "Images", prune: .images)
             summaryCard(controller.containersRow, title: "Containers", prune: .containers)
             summaryCard(controller.volumesRow, title: "Volumes", prune: .volumes)
+            if let disk = controller.machineDisk { hostDiskCard(disk) }
             Spacer()
         }
         .padding(.horizontal, 14).padding(.vertical, 10)
         .background(theme.panelBackground)
+    }
+
+    /// The fourth card is not a fourth kind of thing to prune — it is the other
+    /// side of the same bytes. The three cards to its left count space *inside*
+    /// the VM; this one counts what the VM's disk image occupies on the Mac,
+    /// which is what the user actually came to reclaim. Keeping them adjacent is
+    /// the point: it is the only place the app can show that pruning 15 GB of
+    /// images moved nothing on the host yet.
+    private func hostDiskCard(_ disk: CMachineDisk) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("ON THIS MAC")
+                    .font(.system(size: 9, weight: .bold)).foregroundStyle(theme.textSecondary)
+                Spacer()
+                Text(disk.machine)
+                    .font(.system(size: 9, weight: .bold)).foregroundStyle(theme.textSecondary)
+                    .lineLimit(1).truncationMode(.middle)
+            }
+            Text(Format.bytes(disk.onDisk))
+                .font(.system(size: 17, weight: .semibold).monospacedDigit())
+                .foregroundStyle(theme.textPrimary)
+            Button { confirmTrim = true } label: {
+                Text(controller.runningAction == "Reclaim host disk" ? "Reclaiming…" : "Reclaim host disk")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 7).padding(.vertical, 3)
+                    .background(Capsule().fill(Color(hex: 0xE0915A)))
+            }
+            .buttonStyle(.plain)
+            .disabled(controller.runningAction != nil)
+            .opacity(controller.runningAction != nil ? 0.5 : 1)
+
+            Text(trimFootnote(disk))
+                .font(.system(size: 9)).foregroundStyle(theme.textSecondary.opacity(0.8))
+                .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(width: 170, alignment: .leading)
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 10).fill(theme.windowBackground))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(theme.separator))
+        .help("\(disk.imagePath)\nDeclared \(Format.bytes(disk.apparent)), allocated "
+              + "\(Format.bytes(disk.onDisk)). Only the allocated figure is real disk usage.")
+    }
+
+    /// After a trim, the measured result — including zero, which is a real and
+    /// common answer (nothing was deleted inside since the last trim) and must
+    /// not be dressed up as a failure. Otherwise, the sparse gap.
+    private func trimFootnote(_ disk: CMachineDisk) -> String {
+        if let freed = controller.lastTrimFreed {
+            return freed > 0
+                ? "returned \(Format.bytes(freed)) to the Mac"
+                : "already trimmed — prune inside first"
+        }
+        return "of \(Format.bytes(disk.apparent)) declared"
     }
 
     private func summaryCard(_ row: CDFRow?, title: String, prune: PruneKind) -> some View {

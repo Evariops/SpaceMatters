@@ -58,10 +58,12 @@ struct CleanupResultView: View {
         let names = controller.selectedRows.map(\.item.name).joined(separator: ", ")
         var message = "\(names) — about \(Format.bytes(controller.totalSelected)) will be reclaimed. "
             + "Caches are re-downloaded or rebuilt on demand."
-        // The Trash is the one selected target that is user data, not a cache —
-        // its warning appears exactly when it applies, so it is never diluted.
-        if controller.selectedRows.contains(where: { $0.id == "trash" }) {
-            message += "\n\n⚠️ The Trash is not a cache: emptying it permanently deletes those files."
+        // Targets whose bytes do not come back are named one by one rather than
+        // covered by a blanket sentence: the warning appears exactly when it
+        // applies, so it is never diluted into background noise.
+        let permanent = controller.selectedRows.filter { !$0.item.regenerable }
+        for row in permanent {
+            message += "\n\n⚠️ \(row.item.name) is not a cache: \(row.item.note)"
         }
         let tools = activeWarnings.values.reduce(into: Set<String>()) { $0.formUnion($1) }
         if !tools.isEmpty {
@@ -225,7 +227,14 @@ struct CleanupResultView: View {
                 Text("Cleaning…")
                     .font(.system(size: 12)).foregroundStyle(theme.textSecondary)
             } else {
-                Text("Everything here is safe to remove: caches are re-downloaded or rebuilt when needed.")
+                // Not all of it is a cache any more: build output and orphaned
+                // editor state are offered too, and the footer must not promise
+                // that everything listed comes back on its own.
+                Text(controller.rows.allSatisfy(\.item.regenerable)
+                     ? "Everything here is safe to remove: caches and build output are "
+                       + "re-downloaded or rebuilt when needed."
+                     : "Safe to remove — though the rows marked below are not caches and "
+                       + "will not come back. Select those one by one.")
                     .font(.system(size: 11)).foregroundStyle(theme.textSecondary)
             }
             Spacer()
@@ -310,6 +319,20 @@ private struct CleanupRowView: View {
                 .lineLimit(1)
                 .layoutPriority(1)
 
+            // The one distinction the row must carry on its face: these bytes
+            // do not come back. It is also why select-all skips the row, so the
+            // badge explains an absence the user would otherwise have to notice.
+            if !row.item.regenerable {
+                Text("not a cache")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(Color(hex: 0xE0915A))
+                    .padding(.horizontal, 5).padding(.vertical, 1)
+                    .background(Capsule().fill(Color(hex: 0xE0915A).opacity(0.14)))
+                    .layoutPriority(1)
+                    .help("Deleting this frees space permanently — nothing regenerates it, "
+                          + "so it is never included in Select all.")
+            }
+
             if let native = row.nativeLabel {
                 Text("via \(native)")
                     .font(.system(size: 9, weight: .medium))
@@ -321,11 +344,16 @@ private struct CleanupRowView: View {
 
             Spacer(minLength: 8)
 
-            Text(row.item.paths.map(abbreviate).joined(separator: " · "))
+            // Discovered targets carry hundreds of paths; listing them would be
+            // a truncated smear, so they summarise instead. The full list is
+            // still in the tooltip and in the journal.
+            Text(row.item.locationLabel ?? row.item.paths.map(abbreviate).joined(separator: " · "))
                 .font(.system(size: 10))
                 .foregroundStyle(theme.textSecondary.opacity(0.7))
                 .lineLimit(1).truncationMode(.middle)
                 .frame(maxWidth: 260, alignment: .trailing)
+                .help(row.item.paths.prefix(40).map(abbreviate).joined(separator: "\n")
+                      + (row.item.paths.count > 40 ? "\n… and \(row.item.paths.count - 40) more" : ""))
 
             sizeLabel
                 .frame(width: 80, alignment: .trailing)

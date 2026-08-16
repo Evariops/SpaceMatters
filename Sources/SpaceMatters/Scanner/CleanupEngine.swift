@@ -7,25 +7,79 @@ import AppKit
 /// contents are regenerable by design (package/build caches) or explicitly
 /// disposable (the Trash). Paths are absolute; only existing ones are shown.
 struct Cleanable: Identifiable, Equatable, Sendable {
+
+    /// What deleting the target means at the filesystem level.
+    enum Removal: Equatable, Sendable {
+        /// Empty the directory, keep it — the shape every *cache* wants: tools
+        /// expect their cache root to exist, and recreating it is not their job.
+        case children
+        /// Remove the directory itself. Correct only where the directory is the
+        /// artifact rather than a container for one (a `bin/` MSBuild recreates,
+        /// a workspace-state folder whose workspace is gone) — a cache cleaned
+        /// this way would come back as a missing-directory error in some tool.
+        case directory
+    }
+
     let id: String
     let name: String
     let category: String
     let icon: String
     /// What deleting costs the user ("re-downloaded on next install", …).
     let note: String
-    let paths: [String]
+    var paths: [String]
+    var removal: Removal = .children
+    /// False when the bytes do not come back on their own: the Trash, and
+    /// editor state for a workspace that no longer exists. Such a target is
+    /// still offered — it is safe in the sense that nothing breaks — but it is
+    /// never swept up by select-all, and the confirmation says what it is.
+    /// Everything else is a cache that a re-download or a rebuild restores.
+    var regenerable = true
+    /// Bundle identifier of the desktop app that owns these files, when one
+    /// does. While it runs the target is blocked: a running app holds its cache
+    /// open, so unlinking underneath it frees nothing until quit and can leave
+    /// the app's own index describing entries that no longer exist. See
+    /// `appIsRunning` — this is the generalisation of the original Notion case.
+    var ownerBundleID: String?
+    /// Overrides the path column when listing every path would be noise
+    /// ("1,722 folders under ~/sources"). Set by discovery, which is the only
+    /// producer of targets with more paths than a row can show.
+    var locationLabel: String?
+
+    init(id: String, name: String, category: String, icon: String, note: String,
+         paths: [String], removal: Removal = .children, regenerable: Bool = true,
+         ownerBundleID: String? = nil, locationLabel: String? = nil) {
+        self.id = id
+        self.name = name
+        self.category = category
+        self.icon = icon
+        self.note = note
+        self.paths = paths
+        self.removal = removal
+        self.regenerable = regenerable
+        self.ownerBundleID = ownerBundleID
+        self.locationLabel = locationLabel
+    }
 }
 
 /// Catalog, sizing and cleaning for the Low-Hanging Fruits mode.
 ///
 /// Safety model (same spirit as `ScanController.remove`, J4.4):
-/// - the catalog is hand-picked — nothing is discovered dynamically;
 /// - every operation is fenced inside `allowedRoot` (the user's home), so a
 ///   mis-built `Cleanable` can never reach outside it;
-/// - cleaning deletes the *children* of a cache directory, never the directory
-///   itself, and never follows symlinks: a link inside a cache is removed as a
-///   link, its target is left untouched; a cache root that *is* a symlink is
-///   refused outright rather than resolved.
+/// - cleaning a cache deletes its *children*, never the directory itself, and
+///   never follows symlinks: a link inside a cache is removed as a link, its
+///   target is left untouched; a cache root that *is* a symlink is refused
+///   outright rather than resolved.
+///
+/// Two kinds of target reach this engine, and they earn their safety
+/// differently:
+/// - the **catalog** below is hand-picked. Every path is a constant, so the
+///   argument for each one is made once, here, in prose;
+/// - **discovered** targets (`CleanupDiscovery`) cannot be: their paths depend
+///   on what is on the disk. They substitute a *structural* proof for the
+///   hand-written one — a `bin/` is only offered next to a project file that
+///   explains it, a workspace-state folder only once its workspace is gone.
+///   Discovery never widens the fence; it only decides which paths enter it.
 enum CleanupEngine {
 
     // MARK: Catalog
@@ -37,7 +91,7 @@ enum CleanupEngine {
             Cleanable(
                 id: "trash", name: "Trash", category: "System", icon: "trash.fill",
                 note: "Files you already deleted. Emptying is permanent.",
-                paths: [home + "/.Trash"]),
+                paths: [home + "/.Trash"], regenerable: false),
             // Notion's service worker never evicts: it keeps one full asset
             // bucket per app release it has ever run (`notion-swv2-<version>`
             // in CacheStorage/*/index.txt), so the directory grows by a few
@@ -54,6 +108,33 @@ enum CleanupEngine {
                 paths: [
                     home + "/Library/Application Support/Notion/Partitions/notion/Service Worker/CacheStorage",
                     home + "/Library/Application Support/Notion/Partitions/notion/Cache",
+                ],
+                ownerBundleID: "notion.id"),
+            // `~/Library/Caches/<bundle-id>` is macOS's own per-app cache
+            // container: URL caches, thumbnails, downloaded assets. Named app by
+            // app rather than swept, because the convention is a convention —
+            // plenty of apps park recoverable-only-by-re-login state in there,
+            // and `~/Library/Caches` also holds CloudKit and other system state
+            // that is not an app cache at all.
+            Cleanable(
+                id: "slack", name: "Slack cache", category: "Apps", icon: "bubble.left.and.bubble.right.fill",
+                note: "Downloaded files and images, re-fetched — quit Slack first.",
+                paths: [home + "/Library/Caches/com.tinyspeck.slackmacgap"],
+                ownerBundleID: "com.tinyspeck.slackmacgap"),
+            Cleanable(
+                id: "zoom", name: "Zoom cache", category: "Apps", icon: "video.fill",
+                note: "Web view and asset caches, re-fetched — quit Zoom first.",
+                paths: [home + "/Library/Caches/us.zoom.xos"],
+                ownerBundleID: "us.zoom.xos"),
+            // Updater downloads: installers kept after the update was applied.
+            // Nothing reads them again — the next update downloads its own.
+            Cleanable(
+                id: "app-updaters", name: "App updater downloads", category: "Apps", icon: "arrow.down.circle.fill",
+                note: "Installers kept after updating. Nothing reads them again.",
+                paths: [
+                    home + "/Library/Caches/bitwarden-updater",
+                    home + "/Library/Caches/podman-desktop-updater",
+                    home + "/Library/Application Support/Caches/bitwarden-updater",
                 ]),
             Cleanable(
                 id: "derived-data", name: "Xcode DerivedData", category: "Apple development", icon: "hammer.fill",
@@ -67,10 +148,39 @@ enum CleanupEngine {
                 id: "cocoapods", name: "CocoaPods cache", category: "Apple development", icon: "cube.fill",
                 note: "Downloaded pod specs and archives, re-fetched on next install.",
                 paths: [home + "/Library/Caches/CocoaPods"]),
+            // `_npx` is a sibling of `_cacache` and routinely the larger of the
+            // two: npm installs a throwaway tree per `npx <pkg>` invocation and
+            // never evicts one. Same regenerability, so it belongs to the same
+            // target rather than to one of its own.
             Cleanable(
                 id: "npm", name: "npm cache", category: "JavaScript", icon: "shippingbox",
-                note: "Package tarballs, re-downloaded on next install.",
-                paths: [home + "/.npm/_cacache"]),
+                note: "Package tarballs and one-off npx installs, re-downloaded on demand.",
+                paths: [home + "/.npm/_cacache", home + "/.npm/_npx"]),
+            Cleanable(
+                id: "node-gyp", name: "node-gyp headers", category: "JavaScript", icon: "shippingbox",
+                note: "Node headers per version, re-downloaded when a native module builds.",
+                paths: [home + "/Library/Caches/node-gyp"]),
+            Cleanable(
+                id: "bun", name: "Bun cache", category: "JavaScript", icon: "shippingbox",
+                note: "Package cache, re-downloaded on next install.",
+                paths: [home + "/.bun/install/cache"]),
+            Cleanable(
+                id: "electron", name: "Electron downloads", category: "JavaScript", icon: "shippingbox",
+                note: "Prebuilt Electron zips, re-downloaded on next install.",
+                paths: [home + "/Library/Caches/electron"]),
+            Cleanable(
+                id: "typescript", name: "TypeScript type acquisition", category: "JavaScript", icon: "shippingbox",
+                note: "Auto-acquired @types packages, re-fetched by the editor.",
+                paths: [home + "/Library/Caches/typescript"]),
+            // Deliberately *not* worded like the caches above. These are browser
+            // binaries, not build artifacts: nothing re-downloads them on demand,
+            // and every e2e run fails until `npx playwright install` is run by
+            // hand. Regenerable, but not automatically — the note has to say so,
+            // or the row promises something the target cannot deliver.
+            Cleanable(
+                id: "playwright", name: "Playwright browsers", category: "JavaScript", icon: "theatermasks.fill",
+                note: "Browser binaries — needs an explicit `npx playwright install` before e2e tests run again.",
+                paths: [home + "/Library/Caches/ms-playwright"]),
             Cleanable(
                 id: "yarn", name: "Yarn cache", category: "JavaScript", icon: "shippingbox",
                 note: "Package tarballs, re-downloaded on next install.",
@@ -137,8 +247,9 @@ enum CleanupEngine {
         catalog.compactMap { item in
             let existing = item.paths.filter { passesFence($0, allowedRoot: allowedRoot) }
             guard !existing.isEmpty else { return nil }
-            return Cleanable(id: item.id, name: item.name, category: item.category,
-                             icon: item.icon, note: item.note, paths: existing)
+            var kept = item
+            kept.paths = existing
+            return kept
         }
     }
 
@@ -207,12 +318,14 @@ enum CleanupEngine {
         var refused = 0
     }
 
-    /// Delete the *children* of each of the item's paths. The paths themselves
-    /// survive (tools expect their cache directory to exist). Every path must
-    /// live strictly inside `allowedRoot` **once fully resolved** and be a real
-    /// directory — a symlinked root, a symlinked *intermediate* component
-    /// (`~/.gradle` → an external volume) or a `..` escape are all refused, so
-    /// a cache relocated elsewhere is never chased.
+    /// Delete each of the item's paths, or their children, per `item.removal`.
+    /// For a cache the paths themselves survive (tools expect their cache
+    /// directory to exist); for a `.directory` target the path is the artifact
+    /// and goes with it. Every path must live strictly inside `allowedRoot`
+    /// **once fully resolved** and be a real directory — a symlinked root, a
+    /// symlinked *intermediate* component (`~/.gradle` → an external volume) or
+    /// a `..` escape are all refused, so a cache relocated elsewhere is never
+    /// chased.
     ///
     /// Concurrency note: the checks and the removals are separate syscalls
     /// (TOCTOU). The fence defends against catalog bugs and relocated caches —
@@ -232,6 +345,18 @@ enum CleanupEngine {
             }
             guard passesFence(root, allowedRoot: allowedRoot) else {
                 result.refused += 1
+                continue
+            }
+            if item.removal == .directory {
+                // The fence has already established that `root` is a real
+                // directory inside the home, reached without crossing a
+                // symlink; removeItem then never escapes it.
+                do {
+                    try fm.removeItem(atPath: root)
+                    result.removed += 1
+                } catch {
+                    result.failed += 1
+                }
                 continue
             }
             guard let children = try? fm.contentsOfDirectory(atPath: root) else {
@@ -260,10 +385,12 @@ enum CleanupEngine {
         return result
     }
 
-    /// The full fence, shared by `detect` and `clean` so both always agree:
-    /// textual prefix (cheap, fail-closed), a real non-symlink directory, and a
-    /// fully-resolved form still strictly inside the resolved fence.
-    private static func passesFence(_ root: String, allowedRoot: String) -> Bool {
+    /// The full fence, shared by `detect`, `clean` and `CleanupDiscovery` so
+    /// they always agree: textual prefix (cheap, fail-closed), a real
+    /// non-symlink directory, and a fully-resolved form still strictly inside
+    /// the resolved fence. Discovery calls it too — a discovered path gets no
+    /// weaker a check than a hand-written one.
+    static func passesFence(_ root: String, allowedRoot: String) -> Bool {
         let fence = allowedRoot.hasSuffix("/") ? allowedRoot : allowedRoot + "/"
         return root.hasPrefix(fence) && root != fence && isRealDirectory(root)
             && staysInsideFence(root, allowedRoot: allowedRoot)
@@ -289,26 +416,60 @@ enum CleanupEngine {
         return false
     }
 
-    /// Notion's bundle identifier, and the helpers it spawns under it.
-    static let notionBundleID = "notion.id"
+    /// Why this target must not be offered on this machine right now, or nil.
+    ///
+    /// The whole rule in one place, and injectable, because it is the only
+    /// thing standing between the user and a cache emptied underneath the app
+    /// that owns it. `CleanupController` uses this as its default; tests drive
+    /// it directly rather than needing Chrome to be running.
+    static func blockedReason(
+        for item: Cleanable, home: String = NSHomeDirectory(),
+        isRunning: (String) -> Bool = { appIsRunning($0) }
+    ) -> String? {
+        // A target whose vendor command is the only viable path is blocked when
+        // that command is missing, rather than offered a file removal that would
+        // fail on every entry (go-mod). Checked first: it is a property of the
+        // target, not of this machine's state.
+        if let missing = NativeCleaner.missingRequirement(for: item.id, home: home) {
+            return missing
+        }
+        // The app that owns the files is running: one rule for every app cache,
+        // declared on the target rather than special-cased per app.
+        if let bundleID = item.ownerBundleID, isRunning(bundleID) {
+            let app = item.name
+                .replacingOccurrences(of: " cache", with: "")
+                .replacingOccurrences(of: " orphaned workspace state", with: "")
+            return "\(app) is running — quit it first, or it keeps writing to these files"
+        }
+        if item.id == "uv", uvSymlinkMode(home: home) {
+            return "uv link-mode is \"symlink\" — cleaning would break your virtualenvs"
+        }
+        return nil
+    }
 
-    /// True while Notion is running — the target must not be offered then.
+    /// True while the app owning a target is running — the target must not be
+    /// offered then.
     ///
     /// This is the difference between an app cache and a package cache, and why
     /// the catalog names apps one by one instead of sweeping every Electron
-    /// directory: a package manager is invoked and exits, a desktop app holds
-    /// its cache open for hours. Unlinking underneath it is not a crash on
-    /// macOS (the inode outlives the last close), but the service worker keeps
-    /// writing into files nothing can reach any more — the space is not
-    /// actually freed until quit, and the cache index can be left describing
-    /// entries that no longer exist. Quitting first makes both go away.
+    /// directory or all of `~/Library/Caches`: a package manager is invoked and
+    /// exits, a desktop app holds its cache open for hours. Unlinking
+    /// underneath it is not a crash on macOS (the inode outlives the last
+    /// close), but the app keeps writing into files nothing can reach any more
+    /// — the space is not actually freed until quit, and the cache index can be
+    /// left describing entries that no longer exist. Quitting first makes both
+    /// go away.
+    ///
+    /// The counterpart for command-line tools is `ToolActivity`, which warns
+    /// rather than blocks: a build that fails can simply be re-run, where a
+    /// half-emptied browser cache is a corrupt one.
     ///
     /// Fails closed: when the running-app list cannot be consulted at all, the
     /// target is treated as busy rather than assumed idle.
-    static func notionIsRunning() -> Bool {
+    static func appIsRunning(_ bundleID: String) -> Bool {
         #if canImport(AppKit)
         return !NSRunningApplication.runningApplications(
-            withBundleIdentifier: notionBundleID).isEmpty
+            withBundleIdentifier: bundleID).isEmpty
         #else
         return true
         #endif

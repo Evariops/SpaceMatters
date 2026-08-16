@@ -46,6 +46,31 @@ struct CVolume: Identifiable {
     var id: String { name }
 }
 
+/// The host-side disk image backing a Podman machine, and what it actually
+/// occupies.
+///
+/// A Podman machine's disk is a sparse file: it declares its full configured
+/// size and allocates blocks as the guest writes them. Deleting things inside
+/// the guest frees guest space but leaves those host blocks allocated — which
+/// is why a `system prune` that reclaims 15 GB inside can leave the `.raw`
+/// exactly as large as before, and why the usual advice ("podman disks never
+/// shrink, recreate the machine") gets written.
+///
+/// It is wrong: applehv's virtio-blk advertises discard, and Fedora CoreOS runs
+/// `fstrim.timer` weekly. The blocks do come back — just up to a week late.
+/// `ContainerActions.trim` is that timer, on demand.
+struct CMachineDisk {
+    let machine: String
+    let imagePath: String
+    /// Blocks actually allocated on the host (`st_blocks`) — what deleting the
+    /// file would free, and the only number that moves when the guest is
+    /// trimmed.
+    let onDisk: Int64
+    /// The size the guest sees, and the file's apparent length. Always ≥
+    /// `onDisk`; quoting it as reclaimable is the classic sparse-file error.
+    let apparent: Int64
+}
+
 /// A row of `system df` (authoritative sizes, deduped across shared layers).
 struct CDFRow: Identifiable {
     let type: String
@@ -94,10 +119,53 @@ enum ContainerQueries {
         var images: [CImage] = []
         var containers: [CContainer] = []
         var volumes: [CVolume] = []
+        /// Podman only, and only when the image file can be located.
+        var machineDisk: CMachineDisk?
     }
 
     static func fetchAll(_ engine: ContainerEngine) -> Snapshot {
-        Snapshot(df: df(engine), images: images(engine), containers: containers(engine), volumes: volumes(engine))
+        Snapshot(df: df(engine), images: images(engine), containers: containers(engine),
+                 volumes: volumes(engine), machineDisk: machineDisk(engine))
+    }
+
+    /// The running machine's disk image, measured on the host.
+    ///
+    /// Podman does not report the image path, so it is derived from the one
+    /// machine path it does report — `SSHConfig.IdentityPath`, which sits in the
+    /// machine root next to the per-provider directories. The file is then found
+    /// by name rather than by guessing the provider and the architecture suffix.
+    /// Nothing here is fatal: no path found simply means no reclaim row.
+    static func machineDisk(_ engine: ContainerEngine) -> CMachineDisk? {
+        guard engine.kind == .podman,
+              let arr = jsonArray(engine, ["machine", "inspect"]),
+              let machine = arr.first(where: { ($0["State"] as? String) == "running" }),
+              let name = machine["Name"] as? String,
+              let ssh = machine["SSHConfig"] as? [String: Any],
+              let identity = ssh["IdentityPath"] as? String
+        else { return nil }
+
+        let machineRoot = (identity as NSString).deletingLastPathComponent
+        guard let path = findDiskImage(machineRoot: machineRoot, name: name) else { return nil }
+        var st = stat()
+        guard stat(path, &st) == 0 else { return nil }
+        return CMachineDisk(machine: name, imagePath: path,
+                            onDisk: Int64(st.st_blocks) * 512, apparent: Int64(st.st_size))
+    }
+
+    /// `<machineRoot>/<provider>/<name>*.raw`. Internal for tests — the layout
+    /// is podman's, not ours, and a provider rename must fail loudly in CI
+    /// rather than quietly drop the reclaim row.
+    static func findDiskImage(machineRoot: String, name: String,
+                              fm: FileManager = .default) -> String? {
+        guard let providers = try? fm.contentsOfDirectory(atPath: machineRoot) else { return nil }
+        for provider in providers {
+            let dir = machineRoot + "/" + provider
+            guard let entries = try? fm.contentsOfDirectory(atPath: dir) else { continue }
+            if let image = entries.first(where: { $0.hasPrefix(name) && $0.hasSuffix(".raw") }) {
+                return dir + "/" + image
+            }
+        }
+        return nil
     }
 
     static func df(_ engine: ContainerEngine) -> [CDFRow] {

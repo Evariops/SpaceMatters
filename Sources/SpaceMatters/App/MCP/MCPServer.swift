@@ -36,6 +36,10 @@ final class MCPServer: @unchecked Sendable {
 
     private let source: any MCPScanSource
     private let detachedReason: DetachedReason?
+    /// Memoized `CleanupDiscovery.all()` — the walk costs seconds, and only
+    /// `cleanup_targets` needs it. Filled on first use, then reused for the
+    /// lifetime of the server.
+    private var discoveredTargets: [Cleanable]?
 
     init(source: any MCPScanSource, detachedReason: DetachedReason? = nil) {
         self.source = source
@@ -328,24 +332,51 @@ final class MCPServer: @unchecked Sendable {
                 + "SpaceMatters cleans this itself, fenced and journalled; do not propose a "
                 + "shell command for it.\n"
         }
+        // Targets whose paths are discovered rather than listed. Both answers
+        // are worth printing: the ones the app will clean, and the ones it
+        // deliberately refuses — a `bin/` with no project beside it, a workspace
+        // whose folder is still there. Those refusals are the advice that a
+        // size table alone would get wrong.
+        switch CleanupDiscovery.classify(path) {
+        case .cleanable(let name, let note):
+            out += "Known cleanup target \"\(name)\" (discovered) — \(note) SpaceMatters cleans "
+                + "this itself, fenced and journalled; do not propose a shell command for it.\n"
+        case .protected(let reason):
+            out += "NOT a cleanup target — \(reason)\n"
+        case nil:
+            break
+        }
         return out
     }
 
     private func cleanupTool(_ index: TreeQuery.Index) -> String {
-        let detected = CleanupEngine.detect(CleanupEngine.catalog())
+        // The discovery walk takes seconds, so it runs once per server rather
+        // than per call — this tool is the only caller, and the disk does not
+        // change shape between two calls in one conversation.
+        if discoveredTargets == nil { discoveredTargets = CleanupDiscovery.all() }
+        let detected = CleanupEngine.detect(CleanupEngine.catalog() + (discoveredTargets ?? []))
         guard !detected.isEmpty else {
             return caveat(full: false) + "no known cleanup target exists on this machine."
         }
         var out = caveat(full: false) + """
-        Locations SpaceMatters can safely empty itself (regenerable by design). Sizes come from \
-        this scan and are blank for anything outside its root — they are not re-measured here.
+        Locations SpaceMatters can safely empty itself. Sizes come from this scan and are blank \
+        for anything outside its root — they are not re-measured here.
 
         """
         for item in detected {
             let sizes = item.paths.compactMap { index.node(at: $0)?.sizeOnDisk }
             let measured = sizes.isEmpty ? "—" : Format.bytes(sizes.reduce(0, +))
-            out += "\(measured)  [\(item.id)] \(item.name) · \(item.category) — \(item.note)\n"
-            for path in item.paths { out += "    \(path)\n" }
+            let permanence = item.regenerable ? "" : " NOT REGENERABLE — this is state, not a cache."
+            out += "\(measured)  [\(item.id)] \(item.name) · \(item.category) — "
+                + "\(item.note)\(permanence)\n"
+            // A discovered target can carry hundreds of paths; a token budget is
+            // better spent on the count and a sample than on the full list.
+            if item.paths.count > 6 {
+                out += "    \(item.paths.count) locations, e.g.\n"
+                for path in item.paths.prefix(3) { out += "    \(path)\n" }
+            } else {
+                for path in item.paths { out += "    \(path)\n" }
+            }
         }
         return out
     }

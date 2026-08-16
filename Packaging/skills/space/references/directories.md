@@ -19,17 +19,49 @@ that matters.
 | `~/Library/Caches/pip`, `~/Library/Caches/uv` | Python wheel caches | Re-download. |
 | `~/Library/Developer/Xcode/DerivedData` | Per-project build products, indexes | Rebuild, and the first build after is slow. |
 | `~/Library/Caches/org.swift.swiftpm`, `~/Library/Caches/CocoaPods` | Dependency caches | Re-download. |
+| `~/.npm/_npx` | Throwaway install tree per `npx <pkg>`, never evicted | Re-download. Routinely larger than `_cacache` — check both. |
 | `node_modules`, `.venv`, `target`, `build`, `bin`, `obj`, `__pycache__`, `.next`, `dist` | Per-project build/dependency trees | Reinstall or rebuild. Individually small, collectively often the single largest finding — always `find` them. |
+
+### `bin/` and `obj/` are not safe by name
+
+On a .NET machine these are usually the largest single finding — 20 GiB across
+1,722 folders on a real disk. They are also the most dangerous name to sweep: a
+Python virtualenv keeps its interpreter, `pip` and `activate` in `bin/`, and Go
+projects keep compiled binaries there. A bare
+`find ~ -type d -name bin -exec rm -rf {} +` destroys every virtualenv on the
+disk.
+
+What makes one safe is a **sibling project file** — `*.csproj`, `*.fsproj`,
+`*.sln` next to the `bin/`, `Cargo.toml` next to a `target/`. Run `explain` on
+any such folder: SpaceMatters applies exactly that rule and tells you which side
+the folder falls on. It cleans the qualifying ones itself.
+
+Do **not** recommend `dotnet clean` as the tidy alternative. It cleans one
+configuration of one project, leaves `Release/` and `project.assets.json` in
+place (measured: 28% of `bin`+`obj` freed on a two-configuration build), needs a
+restore, and fails outright when a `global.json` pins an SDK that is not
+installed. Removing the directory is both more complete and faster.
 
 ## Grows without bound, nobody notices
 
 - **`~/Library/Application Support/Code/User/workspaceStorage`** — one folder per
-  workspace VS Code has ever opened, keyed by a hash. Holds editor state, chat
-  sessions (`chatSessions`, `.jsonl`) and per-extension databases (`.vscdb`).
-  **It keeps folders for repositories deleted years ago** and never prunes them.
-  Frequently gigabytes. Deleting a hash folder loses that workspace's local
-  history and chat transcripts, not the code — that is the real trade-off to
-  present, not "it's a cache".
+  workspace VS Code has ever opened, keyed by a hash. Frequently gigabytes, and
+  the single most misjudged directory on this list. Two things are true at once
+  and both get missed:
+
+  1. **The bulk of it is AI chat transcripts.** On a real machine: 7.9 GiB
+     `chatSessions` + 1.2 GiB `chatEditingSessions` out of 10.7 GiB — 85%.
+     Nothing regenerates those. "It only costs editor layout and undo history"
+     is simply false; never write it.
+  2. **Most folders are still live.** The folder does keep state for deleted
+     repositories, but far less than it looks: 9 of 192 on the same machine,
+     0.11 GiB of the 10.7. "Most of these belong to repos you deleted long ago"
+     is an assumption, and measuring it takes one read per folder.
+
+  Each hash folder holds a `workspace.json` naming the project it belongs to, so
+  orphan status is *decidable*, not a guess. Run `explain` on the directory —
+  SpaceMatters counts live vs orphaned workspaces for you — and never propose
+  emptying the whole thing. The app offers the orphaned folders only.
 - **`~/Library/Caches/JetBrains/<Product><Version>`** — one tree per IDE version
   ever installed. Old versions are pure waste once uninstalled; the current one
   regenerates but reindexing is slow. `~/Library/Application Support/JetBrains`
@@ -42,6 +74,25 @@ that matters.
 - **Electron app caches** (`Slack`, `Notion`, `Discord`, …) under
   `Application Support/<app>/{Cache, Code Cache, GPUCache, Service Worker}` —
   refetched. Their siblings are not: see below.
+- **`~/Library/Caches` as a whole is not one thing.** It mixes three
+  populations: per-app caches keyed by bundle id (`us.zoom.xos`,
+  `com.tinyspeck.slackmacgap`), developer tool caches with plain names
+  (`colima`, `trivy`, `goimports`, `ms-playwright`), and system state that is
+  not an app cache at all (`CloudKit`, `com.apple.*`). Never recommend emptying
+  the directory; name the subdirectories.
+
+  **Check whether the owning app is running before recommending its cache.** A
+  desktop app holds its cache open for hours, so unlinking underneath it frees
+  nothing until quit and can leave the app's own index pointing at files that no
+  longer exist. This is a real case, not a hypothetical: Chrome, Firefox, Slack
+  and Zoom caches are often several GB and those apps are usually open.
+  SpaceMatters blocks such a target while its app runs — recommend quitting
+  first, or point at the app's cleanup pass.
+
+  `ms-playwright` deserves its own wording: it is browser *binaries*, not
+  fetched assets. Nothing re-downloads them on demand, and every e2e test fails
+  until `npx playwright install` is run by hand. Regenerable, but not
+  automatically — say so.
 
 ## Looks like a cache, holds state
 
@@ -84,3 +135,23 @@ bundles, `.ext4`/`.raw`/`.qcow2` files. `explain` reports the gap. Deleting
 frees the on-disk figure, not the apparent one — and the tool's own reclaim
 command (`docker system prune`, `podman system prune`, `colima delete`) is
 almost always the better answer than removing files under it.
+
+**Pruning inside a VM does not shrink its disk image — but that does not mean
+the space is lost.** The guest frees the blocks; the host file keeps them
+allocated until the guest issues a discard for them. So a `podman system prune`
+that reclaims 15 GB inside can leave the `.raw` byte-for-byte as large as
+before. Do not conclude from this that "podman disks only grow, recreate the
+machine": Podman's applehv backend passes discard through (`lsblk -D` in the
+guest shows a non-zero `DISC-MAX`), and Fedora CoreOS runs `fstrim.timer`
+weekly. The blocks come back — just up to a week late.
+
+The right sequence is prune, then trim: SpaceMatters' container mode has a
+**Reclaim host disk** button that runs `fstrim` in the machine and reports the
+measured change in the image file. By hand it is
+`podman machine ssh sudo fstrim /var`. Two cautions:
+
+- Never quote `fstrim`'s own output as space recovered. It prints the size of
+  the free extents it walked — "39.5 GiB trimmed" for 2.06 GB actually returned,
+  measured. Only the image file's on-disk size before and after is the truth.
+- `podman machine set --disk-size` grows a machine and cannot shrink one; there
+  is no resize path here, and none is needed, because the file is sparse.

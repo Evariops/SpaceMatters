@@ -15,6 +15,10 @@ final class ContainerController {
     private(set) var images: [CImage] = []
     private(set) var containers: [CContainer] = []
     private(set) var volumes: [CVolume] = []
+    private(set) var machineDisk: CMachineDisk?
+    /// Host bytes the last trim actually returned, measured by re-`stat`ing the
+    /// image. Never taken from `fstrim`'s own output — see `trimMachineDisk`.
+    private(set) var lastTrimFreed: Int64?
 
     /// Failure of the last cleanup action (timeout, engine refusal…), surfaced
     /// as an alert — a prune that dies silently looks like a button that does
@@ -40,6 +44,7 @@ final class ContainerController {
         engineName = engine.displayName
         state = .loading
         df = []; images = []; containers = []; volumes = []
+        machineDisk = nil; lastTrimFreed = nil
         expandedImages = []; layerCache = [:]
         actionError = nil
         runningAction = nil
@@ -68,6 +73,7 @@ final class ContainerController {
         images = snapshot.images.sorted { $0.size > $1.size }
         containers = snapshot.containers.sorted { $0.size > $1.size }
         volumes = snapshot.volumes.sorted { $0.size > $1.size }
+        machineDisk = snapshot.machineDisk
         state = .ready
     }
 
@@ -110,12 +116,58 @@ final class ContainerController {
     func pruneVolumes() { run("Prune volumes", ["volume", "prune", "-f"]) }
     func removeContainer(_ container: CContainer) { run("Remove container", ["rm", "-f", container.id]) }
 
+    /// Return the guest's free blocks to the host, shrinking the machine's
+    /// sparse disk image.
+    ///
+    /// This is the step that makes every prune above visible on the Mac. Podman
+    /// frees space *inside* the VM; the host file keeps the blocks until the
+    /// guest filesystem discards them, and Fedora CoreOS only does that on a
+    /// weekly timer. Running `fstrim` on demand collapses that week to now.
+    ///
+    /// Reads as a nothing-happened when run on its own after a fresh trim, and
+    /// that is correct: there is nothing to give back until something inside has
+    /// been deleted. Prune first, then trim.
+    ///
+    /// The freed figure is measured, never reported. `fstrim` prints the size of
+    /// the free extents it walked, which on a mostly-empty filesystem is close
+    /// to the whole disk — it read "39.5 GiB trimmed" for 2.06 GB actually
+    /// returned in testing. Only the before/after `st_blocks` of the image is
+    /// the truth.
+    func trimMachineDisk() {
+        guard let engine, engine.kind == .podman, let disk = machineDisk,
+              runningAction == nil else { return }
+        runningAction = "Reclaim host disk"
+        actionError = nil
+        lastTrimFreed = nil
+        let id = loadID
+        Task {
+            let before = disk.onDisk
+            // `/` and `/var` are the same XFS filesystem on a CoreOS machine;
+            // trimming one covers both.
+            let result = await ProcessRunner.run(
+                engine.executable, ["machine", "ssh", disk.machine, "sudo", "fstrim", "/var"],
+                timeout: 600)
+            guard id == loadID else { return }
+            runningAction = nil
+            if result.ok {
+                let after = ContainerQueries.machineDisk(engine)
+                lastTrimFreed = max(0, before - (after?.onDisk ?? before))
+            } else {
+                actionError = "Reclaim host disk failed: \(result.diagnostic)"
+            }
+            await reload(id)
+        }
+    }
+
     func clearActionError() { actionError = nil }
 
     private func run(_ label: String, _ args: [String]) {
         guard let engine, runningAction == nil else { return }
         runningAction = label
         actionError = nil
+        // A prune frees guest space and leaves the host image untouched, so the
+        // previous trim's figure would now be describing a stale state.
+        lastTrimFreed = nil
         let id = loadID
         Task {
             let result = await ProcessRunner.run(engine.executable, args, timeout: 600)
