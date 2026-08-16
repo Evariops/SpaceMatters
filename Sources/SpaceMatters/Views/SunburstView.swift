@@ -388,12 +388,7 @@ final class SunburstNSView: NSView, CALayerDelegate {
     /// factor here, not alpha, so only RGB moves.
     private func verdictTinted(_ color: SIMD4<Float>, _ node: FSNode) -> SIMD4<Float> {
         guard let controller, let note = controller.verdict(for: node) else { return color }
-        let tint = note.verdict.tint
-        let k = Verdict.tintStrength
-        return SIMD4<Float>(color.x + (tint.x - color.x) * k,
-                            color.y + (tint.y - color.y) * k,
-                            color.z + (tint.z - color.z) * k,
-                            color.w)
+        return note.verdict.applied(to: color)
     }
 
     private func srgbComps(_ color: Color) -> SIMD4<Float> {

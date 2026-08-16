@@ -614,13 +614,7 @@ final class TreemapNSView: NSView, CALayerDelegate {
     /// when verdicts exist — the common case pays one dictionary-empty check.
     private func verdictTinted(_ color: SIMD4<Float>, _ node: FSNode) -> SIMD4<Float> {
         guard let controller, let note = controller.verdict(for: node) else { return color }
-        let tint = note.verdict.tint
-        let k = Verdict.tintStrength
-        return SIMD4<Float>(
-            color.x + (tint.x - color.x) * k,
-            color.y + (tint.y - color.y) * k,
-            color.z + (tint.z - color.z) * k,
-            color.w)
+        return note.verdict.applied(to: color)
     }
 
     /// Highlight/search change: same tiles, new dims — repack and re-upload.

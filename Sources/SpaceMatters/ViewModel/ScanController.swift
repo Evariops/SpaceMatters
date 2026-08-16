@@ -764,6 +764,12 @@ final class ScanController {
     private(set) var verdictVersion = 0
     /// Observable so the menu can enable "Clear" without reaching into the map.
     private(set) var verdictCount = 0
+    /// Every ancestor of an annotated node — what the outline needs to place a
+    /// mark that sits eight levels down without listing everything in between.
+    @ObservationIgnored private var verdictAncestry: Set<ObjectIdentifier> = []
+    /// Outline filter: show only what an assistant marked. Off whenever there is
+    /// nothing marked, so the list can never come up mysteriously empty.
+    var showVerdictsOnly = false
 
     /// A node's verdict, inherited from the nearest annotated ancestor: marking
     /// `~/Library/Caches` has to paint the region, not one tile inside it.
@@ -799,11 +805,23 @@ final class ScanController {
     /// rather than trying to detect which subtree moved.
     private func rebindVerdicts() {
         var resolved: [ObjectIdentifier: VerdictNote] = [:]
+        var ancestry: Set<ObjectIdentifier> = []
         for (path, note) in verdictPaths {
-            if let node = node(at: path) { resolved[ObjectIdentifier(node)] = note }
+            guard let node = node(at: path) else { continue }
+            resolved[ObjectIdentifier(node)] = note
+            var parent = node.parent
+            while let n = parent {
+                // Stop early where an ancestor is already recorded: with many
+                // marks under one tree this turns a quadratic walk into a linear
+                // one.
+                if !ancestry.insert(ObjectIdentifier(n)).inserted { break }
+                parent = n.parent
+            }
         }
         verdictsByNode = resolved
+        verdictAncestry = ancestry
         verdictCount = verdictPaths.count
+        if resolved.isEmpty { showVerdictsOnly = false }
         verdictVersion &+= 1
     }
 
@@ -914,6 +932,28 @@ final class ScanController {
                 out.append(OutlineRow(
                     kind: .directory(node), depth: depth, siblingMax: siblingMax,
                     isExpandable: false, isExpanded: !kids.isEmpty, id: .dir(ObjectIdentifier(node))))
+                let childMax = max(kids.first?.sizeOnDisk ?? 1, 1)
+                for kid in kids { walk(kid, depth: depth + 1, siblingMax: childMax) }
+            }
+            walk(root, depth: 0, siblingMax: max(root.sizeOnDisk, 1))
+            return out
+        }
+
+        // Verdicts-only: the same pruned-tree shape search uses — the marked
+        // folders plus the ancestors needed to place them, fully expanded, and
+        // nothing below a mark (its contents are not the finding, it is).
+        if showVerdictsOnly, !verdictsByNode.isEmpty {
+            var out: [OutlineRow] = []
+            func walk(_ node: FSNode, depth: Int, siblingMax: Int64) {
+                let id = ObjectIdentifier(node)
+                guard verdictAncestry.contains(id) || verdictsByNode[id] != nil else { return }
+                let marked = verdictsByNode[id] != nil
+                let kids = marked ? [] : sortedChildren(node).filter {
+                    verdictAncestry.contains(ObjectIdentifier($0)) || verdictsByNode[ObjectIdentifier($0)] != nil
+                }
+                out.append(OutlineRow(
+                    kind: .directory(node), depth: depth, siblingMax: siblingMax,
+                    isExpandable: false, isExpanded: !kids.isEmpty, id: .dir(id)))
                 let childMax = max(kids.first?.sizeOnDisk ?? 1, 1)
                 for kid in kids { walk(kid, depth: depth + 1, siblingMax: childMax) }
             }

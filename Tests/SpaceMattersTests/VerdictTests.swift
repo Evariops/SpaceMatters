@@ -135,4 +135,51 @@ import simd
             }
         }
     }
+
+    @Test func theOutlineCanShowOnlyWhatWasMarked() async throws {
+        let root = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let c = await scanned(root)
+        let deep = root.appendingPathComponent("caches/deep").path
+        #expect(c.annotate(path: deep, verdict: .safe, reason: "regenerable") != nil)
+
+        c.showVerdictsOnly = true
+        let names = c.visibleRows().compactMap { row -> String? in
+            if case .directory(let n) = row.kind { return n.name }
+            return nil
+        }
+        // The mark, plus the ancestors needed to place it — and nothing else.
+        #expect(names == [root.lastPathComponent, "caches", "deep"])
+        #expect(!names.contains("keepme"))
+    }
+
+    @Test func theFilterTurnsItselfOffWhenNothingIsMarked() async throws {
+        // A filter that can only produce an empty list is worse than no filter.
+        let root = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let c = await scanned(root)
+        #expect(c.annotate(path: root.appendingPathComponent("caches").path,
+                           verdict: .safe, reason: "x") != nil)
+        c.showVerdictsOnly = true
+        c.clearVerdicts()
+        #expect(c.showVerdictsOnly == false)
+        #expect(c.visibleRows().count > 1)
+    }
+
+    @Test func aVerdictLooksTheSameWhateverItSitsOn() {
+        // Blending toward the tint made the same verdict render a different
+        // colour per file type — `review` orange over a green subtree came out
+        // olive. Hue must now be the verdict's alone; only brightness varies.
+        let onGreen = Verdict.review.applied(to: SIMD4<Float>(0.2, 0.7, 0.3, 1))
+        let onGold  = Verdict.review.applied(to: SIMD4<Float>(0.8, 0.62, 0.25, 1))
+        func hueRatio(_ c: SIMD4<Float>) -> SIMD2<Float> {
+            let sum = max(0.0001, c.x + c.y + c.z)
+            return SIMD2(c.x / sum, c.y / sum)
+        }
+        #expect(simd_distance(hueRatio(onGreen), hueRatio(onGold)) < 0.001)
+        // …and it is unmistakably orange: red leads, blue trails badly.
+        #expect(onGreen.x > onGreen.y && onGreen.y > onGreen.z * 2)
+        // Alpha carries the dim factor in the sunburst — it must survive.
+        #expect(Verdict.safe.applied(to: SIMD4<Float>(0.5, 0.5, 0.5, 0.42)).w == 0.42)
+    }
 }

@@ -420,6 +420,22 @@ private struct ToolbarBar: View {
                 ReconciliationButton(controller: controller)
             }
 
+            // Only once something is marked: a filter that can only ever produce
+            // an empty list is worse than no filter.
+            if controller.verdictCount > 0 {
+                Button { controller.showVerdictsOnly.toggle() } label: {
+                    Image(systemName: controller.showVerdictsOnly
+                          ? "line.3.horizontal.decrease.circle.fill"
+                          : "line.3.horizontal.decrease.circle")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(controller.showVerdictsOnly ? theme.accent : theme.textSecondary)
+                .help(controller.showVerdictsOnly
+                      ? "Showing only the \(controller.verdictCount) marked folders — click to show everything"
+                      : "Show only the \(controller.verdictCount) folders an assistant marked")
+                .accessibilityLabel("Filter to marked folders")
+            }
+
             // Hand the scan to an assistant (SPEC-14). An option, not a step, so
             // it sits with the other optional explanations rather than greeting
             // anyone with a dialog.
