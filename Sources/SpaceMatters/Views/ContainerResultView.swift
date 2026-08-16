@@ -10,9 +10,9 @@ struct ContainerResultView: View {
     @Environment(\.theme) private var theme
 
     private enum PruneKind: Identifiable { case images, containers, volumes; var id: Int { hashValue } }
-    @State private var confirmPrune: PruneKind?
-    @State private var confirmRemove: CImage?
-    @State private var confirmTrim = false
+    /// The confirmation waiting for an answer, if any. Errors do not live here
+    /// — they come from the controller and are merged in by `dialog`.
+    @State private var pending: Dialog?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -34,30 +34,69 @@ struct ContainerResultView: View {
             }
         }
         .background(theme.windowBackground)
-        .alert(item: $confirmPrune) { kind in pruneAlert(kind) }
-        .alert("Return free space to the Mac?", isPresented: $confirmTrim) {
-            Button("Reclaim") { controller.trimMachineDisk() }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            // Non-destructive, and the message says so plainly: `fstrim` only
-            // tells the host which blocks the guest already considers free.
-            // Nothing inside the VM is removed — that is what the prune buttons
-            // are for, and doing them first is what makes this worth running.
-            Text("Nothing inside the VM is deleted. This tells the Mac which blocks the "
-                 + "machine has already freed, so its disk image can shrink.\n\n"
-                 + "Prune images and volumes first — this only hands back what is already free.")
-        }
-        .alert(item: $confirmRemove) { image in removeAlert(image) }
-        .alert("Action failed", isPresented: actionErrorShown) {
-            Button("OK", role: .cancel) { controller.clearActionError() }
-        } message: {
-            Text(controller.actionError ?? "")
+        // Exactly one alert modifier. SwiftUI presents a single alert per view,
+        // so stacking several silently disables all but one — a button that
+        // does nothing, with nothing in the log to explain it. Routing every
+        // dialog through one binding makes that failure impossible rather than
+        // merely fixed.
+        .alert(item: dialog) { alert(for: $0) }
+    }
+
+    /// Everything this view can put in front of the user, confirmations and
+    /// failures alike, so they share the single alert slot.
+    private enum Dialog: Identifiable {
+        case prune(PruneKind)
+        case remove(CImage)
+        case trim
+        case failure(String)
+
+        var id: String {
+            switch self {
+            case .prune(let kind): return "prune-\(kind.id)"
+            case .remove(let image): return "remove-\(image.id)"
+            case .trim: return "trim"
+            case .failure(let message): return "failure-\(message)"
+            }
         }
     }
 
-    private var actionErrorShown: Binding<Bool> {
-        Binding(get: { controller.actionError != nil },
-                set: { if !$0 { controller.clearActionError() } })
+    /// Merges the pending confirmation with the controller's error channel. A
+    /// failure wins: it can only arrive after an action started, by which point
+    /// the confirmation that launched it is gone.
+    private var dialog: Binding<Dialog?> {
+        Binding(
+            get: { controller.actionError.map(Dialog.failure) ?? pending },
+            set: { newValue in
+                guard newValue == nil else { return }
+                pending = nil
+                controller.clearActionError()
+            })
+    }
+
+    private func alert(for dialog: Dialog) -> Alert {
+        switch dialog {
+        case .prune(let kind): return pruneAlert(kind)
+        case .remove(let image): return removeAlert(image)
+        case .trim: return trimAlert
+        case .failure(let message):
+            return Alert(title: Text("Action failed"), message: Text(message),
+                         dismissButton: .cancel(Text("OK")))
+        }
+    }
+
+    /// Non-destructive, and the message says so plainly: `fstrim` only tells the
+    /// host which blocks the guest already considers free. Nothing inside the VM
+    /// is removed — that is what the reclaim buttons are for, and doing them
+    /// first is what makes this worth running.
+    private var trimAlert: Alert {
+        Alert(
+            title: Text("Return free space to the Mac?"),
+            message: Text("Nothing inside the VM is deleted. This tells the Mac which blocks the "
+                          + "machine has already freed, so its disk image can shrink.\n\n"
+                          + "Reclaim unused images and volumes first — this only hands back what "
+                          + "is already free."),
+            primaryButton: .default(Text("Reclaim")) { controller.trimMachineDisk() },
+            secondaryButton: .cancel())
     }
 
     // MARK: Toolbar
@@ -129,7 +168,7 @@ struct ContainerResultView: View {
             Text(Format.bytes(disk.onDisk))
                 .font(.system(size: 17, weight: .semibold).monospacedDigit())
                 .foregroundStyle(theme.textPrimary)
-            Button { confirmTrim = true } label: {
+            Button { pending = .trim } label: {
                 Text(controller.runningAction == "Reclaim host disk" ? "Reclaiming…" : "Reclaim host disk")
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(.white)
@@ -179,9 +218,14 @@ struct ContainerResultView: View {
             Text(Format.bytes(size))
                 .font(.system(size: 17, weight: .semibold).monospacedDigit())
                 .foregroundStyle(theme.textPrimary)
+            // The button names its *scope*, not a number. Every prune here
+            // touches only what nothing references — putting a size on the
+            // button made it read as a promise of bytes, when the promise that
+            // matters is which items are safe from it. The figure stays
+            // underneath, where it is a measurement rather than a label.
             if reclaimable > 0 {
-                Button { confirmPrune = prune } label: {
-                    Text("Reclaim \(Format.bytes(reclaimable))")
+                Button { pending = .prune(prune) } label: {
+                    Text("Reclaim unused")
                         .font(.system(size: 10, weight: .semibold))
                         .foregroundStyle(.white)
                         .padding(.horizontal, 7).padding(.vertical, 3)
@@ -190,8 +234,10 @@ struct ContainerResultView: View {
                 .buttonStyle(.plain)
                 .disabled(controller.runningAction != nil)
                 .opacity(controller.runningAction != nil ? 0.5 : 1)
+                Text("\(Format.bytes(reclaimable)) reclaimable")
+                    .font(.system(size: 9)).foregroundStyle(theme.textSecondary.opacity(0.8))
             } else {
-                Text("nothing to reclaim")
+                Text("nothing unused to reclaim")
                     .font(.system(size: 10)).foregroundStyle(theme.textSecondary.opacity(0.7))
             }
         }
@@ -261,7 +307,7 @@ struct ContainerResultView: View {
                 indent: indent,
                 isExpanded: controller.expandedImages.contains(image.id),
                 onToggle: { controller.toggle(image) },
-                onRemove: { confirmRemove = image }
+                onRemove: { pending = .remove(image) }
             )
             if controller.expandedImages.contains(image.id) {
                 let layers = controller.layers(for: image)
@@ -298,18 +344,35 @@ struct ContainerResultView: View {
 
     // MARK: Alerts
 
+    /// "Unused" is the promise the button makes, so each dialog says what the
+    /// word means for that kind before anything is deleted. The images case
+    /// carries the one genuine surprise: nothing-references-it includes tagged
+    /// images the user pulled on purpose, which the list shows as `unused` too.
     private func pruneAlert(_ kind: PruneKind) -> Alert {
-        let (title, action): (String, () -> Void) = {
+        let (title, detail, action): (String, String, () -> Void) = {
             switch kind {
-            case .images: return ("Remove all unused images?", controller.pruneImages)
-            case .containers: return ("Remove all stopped containers?", controller.pruneContainers)
-            case .volumes: return ("Remove all unused volumes?", controller.pruneVolumes)
+            case .images:
+                return ("Remove every unused image?",
+                        "Unused means no container references it — including tagged images you "
+                        + "pulled deliberately. Anything a container uses, running or stopped, is "
+                        + "left alone. Re-pulling needs network access.",
+                        controller.pruneImages)
+            case .containers:
+                return ("Remove every stopped container?",
+                        "Running containers are left alone. A stopped container's writable layer "
+                        + "goes with it — named volumes do not.",
+                        controller.pruneContainers)
+            case .volumes:
+                return ("Remove every unused volume?",
+                        "Unused means no container references it. Volume contents are data, not a "
+                        + "cache: nothing regenerates them.",
+                        controller.pruneVolumes)
             }
         }()
         return Alert(
             title: Text(title),
-            message: Text("This frees the reclaimable space and can't be undone."),
-            primaryButton: .destructive(Text("Prune"), action: action),
+            message: Text(detail + "\n\nThis can't be undone."),
+            primaryButton: .destructive(Text("Remove unused"), action: action),
             secondaryButton: .cancel()
         )
     }

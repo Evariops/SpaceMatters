@@ -139,9 +139,15 @@ final class ContainerController {
     /// No `-f`: a forced `rmi` also stops and deletes the containers using the
     /// image. If it's in use the engine refuses and the refusal is shown as-is.
     func removeImage(_ image: CImage) { run("Remove image", ["rmi", image.id]) }
-    func pruneImages() { run("Prune images", ["image", "prune", "-a", "-f"]) }
-    func pruneContainers() { run("Prune containers", ["container", "prune", "-f"]) }
-    func pruneVolumes() { run("Prune volumes", ["volume", "prune", "-f"]) }
+    /// All three prunes are scoped to what nothing references — that is the
+    /// engine's own definition of an unused image, container or volume, and the
+    /// one the "Reclaim unused" buttons promise. `-a` is what makes the images
+    /// case match it: without it the engine removes only *dangling* images and
+    /// leaves every tagged-but-unreferenced one behind, which would clear a
+    /// fraction of the reclaimable figure shown on the card.
+    func pruneImages() { run("Reclaim unused images", ["image", "prune", "-a", "-f"]) }
+    func pruneContainers() { run("Reclaim stopped containers", ["container", "prune", "-f"]) }
+    func pruneVolumes() { run("Reclaim unused volumes", ["volume", "prune", "-f"]) }
     func removeContainer(_ container: CContainer) { run("Remove container", ["rm", "-f", container.id]) }
 
     /// Return the guest's free blocks to the host, shrinking the machine's
