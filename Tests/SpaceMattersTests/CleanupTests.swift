@@ -774,3 +774,37 @@ private actor CallCounter {
 private final class JournalBox {
     var entries: [CleanupJournal.Entry] = []
 }
+
+/// Catalog paths that are easy to get wrong because the tool ignores Apple's
+/// convention. Each of these was a real miss on a real disk.
+@Suite struct CatalogLocationTests {
+
+    /// uv keeps its cache under XDG on macOS too, so the Apple-shaped path alone
+    /// found nothing while 4 GiB sat in `~/.cache/uv`.
+    @Test func toolsThatFollowXDGAreLookedUpThere() {
+        let catalog = CleanupEngine.catalog(home: "/home/x")
+        func paths(_ id: String) -> [String] {
+            catalog.first { $0.id == id }?.paths ?? []
+        }
+        #expect(paths("uv").contains("/home/x/.cache/uv"))
+        // The legacy location stays: older uv builds used it, and `detect`
+        // drops whichever is absent.
+        #expect(paths("uv").contains("/home/x/Library/Caches/uv"))
+        #expect(paths("gh") == ["/home/x/.cache/gh"])
+        #expect(paths("pre-commit").contains("/home/x/.cache/pre-commit"))
+    }
+
+    /// npx installs a throwaway tree per invocation and never evicts one, so it
+    /// is routinely larger than the cache beside it.
+    @Test func npmCoversBothOfItsCaches() {
+        let npm = CleanupEngine.catalog(home: "/home/x").first { $0.id == "npm" }
+        #expect(npm?.paths == ["/home/x/.npm/_cacache", "/home/x/.npm/_npx"])
+    }
+
+    /// Every catalog id is unique, or two rows collide in the controller's
+    /// keyed lookups and one silently shadows the other.
+    @Test func catalogIdsAreUnique() {
+        let ids = CleanupEngine.catalog(home: "/home/x").map(\.id)
+        #expect(Set(ids).count == ids.count)
+    }
+}

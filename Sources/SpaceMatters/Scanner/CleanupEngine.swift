@@ -201,10 +201,19 @@ enum CleanupEngine {
                 id: "pip", name: "pip cache", category: "Python", icon: "archivebox",
                 note: "Wheel downloads, re-fetched on next install.",
                 paths: [home + "/Library/Caches/pip"]),
+            // uv puts its cache under XDG on *every* platform, so on a Mac the
+            // real location is `~/.cache/uv` — not the `~/Library/Caches` one
+            // the rest of this table uses. Listing only the Apple-shaped path
+            // missed 4 GiB on the machine this was written for. Both are kept:
+            // older uv builds did use Library/Caches, `detect` drops whichever
+            // is absent, and a relocated cache (`UV_CACHE_DIR`, `cache-dir` in
+            // uv.toml) is simply not found — a GUI app inherits no shell
+            // environment, so reading the variable would be false more often
+            // than true.
             Cleanable(
                 id: "uv", name: "uv cache", category: "Python", icon: "archivebox",
                 note: "Package cache, re-fetched on next sync.",
-                paths: [home + "/Library/Caches/uv"]),
+                paths: [xdgCache(home) + "/uv", home + "/Library/Caches/uv"]),
             Cleanable(
                 id: "gradle", name: "Gradle caches", category: "JVM", icon: "gearshape.2.fill",
                 note: "Dependency and build caches, re-downloaded on next build.",
@@ -231,12 +240,31 @@ enum CleanupEngine {
                 id: "go-mod", name: "Go module cache", category: "Rust & Go", icon: "shippingbox.circle.fill",
                 note: "Module sources and zips, re-downloaded on next build (needs network).",
                 paths: [home + "/go/pkg/mod"]),
+            // Cross-platform tools ignore `~/Library/Caches` and follow XDG, so
+            // they hide from anyone looking only in the Apple location.
+            Cleanable(
+                id: "pre-commit", name: "pre-commit hook environments", category: "Developer tools",
+                icon: "checkmark.seal.fill",
+                note: "Per-hook virtualenvs and clones, rebuilt on next run (needs network).",
+                paths: [xdgCache(home) + "/pre-commit", xdgCache(home) + "/prek"]),
+            Cleanable(
+                id: "gh", name: "GitHub CLI cache", category: "Developer tools", icon: "terminal.fill",
+                note: "Cached API responses, re-fetched on demand.",
+                paths: [xdgCache(home) + "/gh"]),
             Cleanable(
                 id: "homebrew", name: "Homebrew downloads", category: "Homebrew", icon: "mug.fill",
                 note: "Bottle, cask and API downloads, re-fetched on demand.",
                 paths: [home + "/Library/Caches/Homebrew"]),
         ]
     }
+
+    /// The XDG cache root. macOS has no XDG convention of its own, but the
+    /// tools that ignore `~/Library/Caches` all agree on this fallback, so it is
+    /// where several gigabytes hide from anyone who only looks the Apple way.
+    /// `XDG_CACHE_HOME` is deliberately not read: a GUI app inherits no shell
+    /// environment, so it would be empty here far more often than it would be
+    /// right (same reasoning as the Go module cache above).
+    static func xdgCache(_ home: String) -> String { home + "/.cache" }
 
     /// The catalog restricted to entries with at least one path that passes the
     /// same fence as `clean` (existing real directory, no symlinked root, still

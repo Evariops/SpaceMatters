@@ -254,6 +254,63 @@ import Testing
         #expect(firefox.paths.allSatisfy { $0.contains("/Library/Caches/Firefox/Profiles/") })
     }
 
+    // MARK: Cold dependency trees
+
+    /// `node_modules` is regenerable but only from the network, so unlike build
+    /// output it is offered on age rather than on the marker alone. A tree
+    /// installed recently belongs to a project someone is working on.
+    @Test func nodeModulesIsOfferedOnlyOnceItHasGoneCold() throws {
+        let root = try Self.fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Self.makeFile(root, "Warm/package.json")
+        try Self.makeFile(root, "Warm/node_modules/pkg/index.js")
+        try Self.makeFile(root, "Cold/package.json")
+        try Self.makeFile(root, "Cold/node_modules/pkg/index.js")
+        // Backdate the cold tree past the six-month gate.
+        let cold = root.appendingPathComponent("Cold/node_modules")
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(-200 * 86_400)], ofItemAtPath: cold.path)
+
+        let hits = CleanupDiscovery.walkForArtifacts(home: root.path).map(\.path)
+        #expect(hits == [cold.path])
+
+        let targets = CleanupDiscovery.projectArtifacts(home: root.path)
+        let node = try #require(targets.first { $0.id == "cold-node-modules" })
+        #expect(node.removal == .directory)
+        #expect(node.regenerable) // it does come back, just slowly and online
+        #expect(node.note.contains("npm install"))
+    }
+
+    /// A rule with no age gate is unaffected by mtime — build output is offered
+    /// the moment it exists.
+    @Test func buildOutputHasNoAgeGate() throws {
+        var fresh = stat()
+        fresh.st_mtimespec.tv_sec = Int(Date().timeIntervalSince1970)
+        let build = CleanupDiscovery.ArtifactRule(directory: "bin", markers: [".csproj"])
+        let aged = CleanupDiscovery.ArtifactRule(directory: "node_modules",
+                                                 markers: ["package.json"], minimumAgeDays: 180)
+        #expect(CleanupDiscovery.isOldEnough(fresh, for: build))
+        #expect(!CleanupDiscovery.isOldEnough(fresh, for: aged))
+
+        var old = stat()
+        old.st_mtimespec.tv_sec = Int(Date().addingTimeInterval(-200 * 86_400).timeIntervalSince1970)
+        #expect(CleanupDiscovery.isOldEnough(old, for: aged))
+    }
+
+    /// The walk must not descend into a matched `node_modules` even when it is
+    /// too warm to offer — walking one is the single most expensive thing this
+    /// code could do, and there is nothing inside it to find.
+    @Test func warmNodeModulesIsSkippedNotEntered() throws {
+        let root = try Self.fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Self.makeFile(root, "App/package.json")
+        // A nested project inside node_modules would be a hit if we descended.
+        try Self.makeFile(root, "App/node_modules/dep/dep.csproj")
+        _ = try Self.makeDir(root, "App/node_modules/dep/bin")
+
+        #expect(CleanupDiscovery.walkForArtifacts(home: root.path).isEmpty)
+    }
+
     // MARK: Single-path classification
 
     /// `explain` must reach the same verdict as the walk, without walking. The

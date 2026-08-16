@@ -61,9 +61,12 @@ struct ToolActivityTests {
             "node-gyp", "typescript", "bun",
             "workspace-storage-code", "workspace-storage-code---insiders",
             "workspace-storage-cursor", "workspace-storage-vscodium",
+            // npm/npx already map to the npm target; a cold tree by definition
+            // has no install running against it.
+            "cold-node-modules",
         ]
         let offered = Set(CleanupEngine.catalog().map(\.id))
-            .union(["dotnet-artifacts", "cargo-artifacts"])
+            .union(["dotnet-artifacts", "cargo-artifacts", "cold-node-modules"])
         let uncovered = offered.subtracting(ToolActivity.coveredTargets).subtracting(exempt)
         #expect(uncovered.isEmpty, "no active-tool warning for: \(uncovered.sorted())")
     }

@@ -23,6 +23,15 @@ enum ClaudeIntegration {
         var skillSource: URL?
         var skillDestination: URL
         var skillAlreadyInstalled: Bool
+        /// The installed skill differs from the one in this build.
+        ///
+        /// Treating "the directory exists" as "the skill is current" is how a
+        /// correction shipped in the app never reaches the assistant reading
+        /// it: the install runs once, and every later version of the guidance
+        /// stays in the bundle. The failure is silent and it is the worst kind
+        /// — the model keeps answering confidently from advice we already knew
+        /// was wrong.
+        var skillOutdated: Bool
         var executablePath: String
 
         var registerCommand: String {
@@ -41,13 +50,46 @@ enum ClaudeIntegration {
 
     static func plan() -> Plan {
         let destination = URL(fileURLWithPath: NSHomeDirectory() + "/.claude/skills/space")
+        let source = Bundle.main.url(forResource: "space", withExtension: nil,
+                                     subdirectory: "skills")
+        let installed = FileManager.default.fileExists(atPath: destination.path)
         return Plan(
             cliPath: cliCandidates.first { FileManager.default.isExecutableFile(atPath: $0) },
-            skillSource: Bundle.main.url(forResource: "space", withExtension: nil,
-                                         subdirectory: "skills"),
+            skillSource: source,
             skillDestination: destination,
-            skillAlreadyInstalled: FileManager.default.fileExists(atPath: destination.path),
+            skillAlreadyInstalled: installed,
+            skillOutdated: installed && source.map {
+                !treesMatch($0, destination)
+            } ?? false,
             executablePath: Bundle.main.executablePath ?? CommandLine.arguments[0])
+    }
+
+    /// Whether two skill directories hold the same files with the same bytes.
+    ///
+    /// A content comparison rather than a version number, because the thing that
+    /// matters is whether the assistant is reading what this build says — and
+    /// because it also catches a hand-edited copy, which is a reason to ask
+    /// before overwriting rather than a reason to overwrite. The tree is a
+    /// handful of small Markdown files, so reading it whole costs nothing.
+    /// Anything unreadable counts as a mismatch: fail towards offering the
+    /// update, never towards silently keeping stale guidance.
+    static func treesMatch(_ lhs: URL, _ rhs: URL) -> Bool {
+        func files(_ root: URL) -> [String: Data]? {
+            guard let walker = FileManager.default.enumerator(
+                at: root, includingPropertiesForKeys: [.isRegularFileKey]) else { return nil }
+            var out: [String: Data] = [:]
+            for case let url as URL in walker {
+                guard (try? url.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true
+                else { continue }
+                // Finder metadata is not content and must not force an update.
+                if url.lastPathComponent == ".DS_Store" { continue }
+                guard let data = try? Data(contentsOf: url) else { return nil }
+                out[url.path.replacingOccurrences(of: root.path, with: "")] = data
+            }
+            return out
+        }
+        guard let left = files(lhs), let right = files(rhs) else { return false }
+        return left == right
     }
 
     /// Is the server registered at user scope?

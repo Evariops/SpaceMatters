@@ -67,6 +67,11 @@ enum ToolActivity {
         "pip": ["pip"],
         "pip3": ["pip"],
         "uv": ["uv"],
+        // A run builds its hook environments straight into that cache, so
+        // emptying it underneath one fails the hooks mid-commit.
+        "pre-commit": ["pre-commit"],
+        "prek": ["pre-commit"],
+        "gh": ["gh"],
         "gradle": ["gradle"],
         "mvn": ["maven"],
         "mvnd": ["maven"],

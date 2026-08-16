@@ -14,7 +14,48 @@ import Foundation
             skillSource: nil,
             skillDestination: URL(fileURLWithPath: "/tmp/skills/space"),
             skillAlreadyInstalled: false,
+            skillOutdated: false,
             executablePath: executable)
+    }
+
+    /// A skill installed once and never refreshed is how a correction shipped
+    /// in the app fails to reach the assistant reading it — the failure this
+    /// comparison exists to catch, and one that already happened.
+    @Test func aDivergedSkillTreeIsDetected() throws {
+        let fm = FileManager.default
+        let base = fm.temporaryDirectory.appendingPathComponent("skill-\(UUID().uuidString)")
+        let shipped = base.appendingPathComponent("bundle/space")
+        let installed = base.appendingPathComponent("home/space")
+        for dir in [shipped, installed] {
+            try fm.createDirectory(at: dir.appendingPathComponent("references"),
+                                   withIntermediateDirectories: true)
+            try "procedure".write(to: dir.appendingPathComponent("SKILL.md"),
+                                  atomically: true, encoding: .utf8)
+            try "podman never shrinks".write(
+                to: dir.appendingPathComponent("references/directories.md"),
+                atomically: true, encoding: .utf8)
+        }
+        defer { try? fm.removeItem(at: base) }
+
+        #expect(ClaudeIntegration.treesMatch(shipped, installed))
+
+        // The app ships a correction; the installed copy still says the old
+        // thing. That is exactly the drift that must be visible.
+        try "podman trims on a weekly timer".write(
+            to: shipped.appendingPathComponent("references/directories.md"),
+            atomically: true, encoding: .utf8)
+        #expect(!ClaudeIntegration.treesMatch(shipped, installed))
+
+        // A file present on one side only counts as drift too.
+        try "podman never shrinks".write(
+            to: installed.appendingPathComponent("references/directories.md"),
+            atomically: true, encoding: .utf8)
+        try "extra".write(to: shipped.appendingPathComponent("references/new.md"),
+                          atomically: true, encoding: .utf8)
+        #expect(!ClaudeIntegration.treesMatch(shipped, installed))
+
+        // A missing tree is drift, not a match — fail towards offering the update.
+        #expect(!ClaudeIntegration.treesMatch(shipped, base.appendingPathComponent("absent")))
     }
 
     @Test func theCommandRegistersAtUserScope() {

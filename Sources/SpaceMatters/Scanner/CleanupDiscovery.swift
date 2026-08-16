@@ -45,6 +45,15 @@ enum CleanupDiscovery {
     struct ArtifactRule {
         let directory: String
         let markers: [String]
+        /// When set, the directory is only offered once it has gone this long
+        /// untouched.
+        ///
+        /// Build output needs no such gate — the next build recreates it in
+        /// seconds, from the source right beside it. A dependency tree does
+        /// not: restoring it needs the network, the registry to still serve
+        /// those versions, and minutes of waiting. That is regenerable enough
+        /// to offer, but only for a project nobody has touched in months.
+        var minimumAgeDays: Int?
     }
 
     /// `bin` and `obj` are the dangerous pair and the valuable one: together
@@ -57,6 +66,10 @@ enum CleanupDiscovery {
         ArtifactRule(directory: "bin", markers: [".csproj", ".fsproj", ".vbproj", ".sln", ".slnx"]),
         ArtifactRule(directory: "obj", markers: [".csproj", ".fsproj", ".vbproj", ".sln", ".slnx"]),
         ArtifactRule(directory: "target", markers: ["Cargo.toml"]),
+        // Six months. Long enough that the project is genuinely dormant rather
+        // than merely between installs, and it is the threshold that matches
+        // what a human reviewing the same disk called cold.
+        ArtifactRule(directory: "node_modules", markers: ["package.json"], minimumAgeDays: 180),
     ]
 
     /// Directory names never descended into. `node_modules` and `.git` are the
@@ -93,10 +106,26 @@ enum CleanupDiscovery {
         let found = walkForArtifacts(home: home)
         guard !found.isEmpty else { return [] }
 
-        let dotnet = found.filter { $0.rule.directory != "target" }.map(\.path)
+        let dotnet = found.filter { ["bin", "obj"].contains($0.rule.directory) }.map(\.path)
         let rust = found.filter { $0.rule.directory == "target" }.map(\.path)
+        let node = found.filter { $0.rule.directory == "node_modules" }.map(\.path)
 
         var out: [Cleanable] = []
+        if !node.isEmpty {
+            // Kept apart from the build-output rows on purpose. Those come back
+            // from the source next to them; this one comes back from a registry
+            // over the network, and only if it still serves the versions the
+            // lockfile pins. Same verdict, materially different cost — so it
+            // says "cold", says how many, and does not hide inside a row about
+            // build artifacts.
+            out.append(Cleanable(
+                id: "cold-node-modules", name: "Cold node_modules", category: "JavaScript",
+                icon: "shippingbox.circle",
+                note: "\(node.count) project\(node.count == 1 ? "" : "s") with no install for "
+                    + "6 months. `npm install` restores each — needs network.",
+                paths: node.sorted(), removal: .directory,
+                locationLabel: "\(node.count) projects"))
+        }
         if !dotnet.isEmpty {
             out.append(Cleanable(
                 id: "dotnet-artifacts", name: ".NET build output", category: ".NET",
@@ -139,7 +168,6 @@ enum CleanupDiscovery {
             // child costs no extra directory read.
             let names = Set(entries)
             for entry in entries {
-                guard !pruned.contains(entry) else { continue }
                 // Hidden directories hold configuration and tool state, never
                 // the build output we are after; skipping them also keeps the
                 // walk out of caches that have their own catalog entry.
@@ -148,10 +176,18 @@ enum CleanupDiscovery {
                 var st = stat()
                 guard lstat(child, &st) == 0, (st.st_mode & S_IFMT) == S_IFDIR else { continue }
 
-                if let rule = rulesByName[entry], names.contains(where: { matches($0, rule) }) {
-                    hits.append(ArtifactHit(path: child, rule: rule))
-                    continue // its contents are the artifact; nothing to find inside
+                // Rules are tested before the prune list, because a name can be
+                // in both: `node_modules` is never *descended* into, but it is
+                // exactly what one rule is looking for. Either way the walk
+                // stops here — whether the directory is a hit, too warm to
+                // offer, or simply pruned, nothing inside it is a candidate.
+                if let rule = rulesByName[entry] {
+                    if names.contains(where: { matches($0, rule) }), isOldEnough(st, for: rule) {
+                        hits.append(ArtifactHit(path: child, rule: rule))
+                    }
+                    continue
                 }
+                if pruned.contains(entry) { continue }
                 queue.append((child, depth + 1))
             }
         }
@@ -162,6 +198,19 @@ enum CleanupDiscovery {
     /// name (`Cargo.toml`) or an extension (`.csproj`).
     static func matches(_ name: String, _ rule: ArtifactRule) -> Bool {
         rule.markers.contains { $0.hasPrefix(".") ? name.hasSuffix($0) : name == $0 }
+    }
+
+    /// Whether a candidate has been dormant long enough for its rule.
+    ///
+    /// A dependency tree's own mtime is the right clock here: package managers
+    /// rewrite it on every install, and nothing else does. Editing the source
+    /// beside it leaves it untouched, which is the intent — what matters is
+    /// when the tree was last *populated*, not when the project was last read.
+    /// Rules without a gate always pass.
+    static func isOldEnough(_ st: stat, for rule: ArtifactRule, now: Date = Date()) -> Bool {
+        guard let days = rule.minimumAgeDays else { return true }
+        let modified = Date(timeIntervalSince1970: TimeInterval(st.st_mtimespec.tv_sec))
+        return now.timeIntervalSince(modified) >= TimeInterval(days) * 86_400
     }
 
     // MARK: VS Code workspace storage
@@ -268,6 +317,23 @@ enum CleanupDiscovery {
         if let rule = artifactRules.first(where: { $0.directory == name }) {
             let siblings = (try? FileManager.default.contentsOfDirectory(atPath: parent)) ?? []
             if siblings.contains(where: { matches($0, rule) }) {
+                var st = stat()
+                let warm = lstat(path, &st) == 0 && !isOldEnough(st, for: rule)
+                if warm {
+                    // The refusal that keeps an assistant from proposing
+                    // `rm -rf node_modules` across a working tree.
+                    return .protected(
+                        reason: "A dependency tree for a project installed within the last 6 "
+                            + "months. It restores only from the network, so it is offered only "
+                            + "once the project has gone dormant.")
+                }
+                if rule.directory == "node_modules" {
+                    return .cleanable(
+                        name: "Cold node_modules",
+                        note: "No install here for 6 months. `npm install` restores it, but that "
+                            + "needs network and the registry still serving the pinned versions. "
+                            + "SpaceMatters removes these itself.")
+                }
                 return .cleanable(
                     name: rule.directory == "target" ? "Cargo build output" : ".NET build output",
                     note: "Build output, recreated by the next build. SpaceMatters removes these "
