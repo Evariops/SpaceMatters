@@ -38,7 +38,7 @@ jobs:
 
       # Version matches the zizmor-pre-commit rev in .pre-commit-config.yaml.
       - name: zizmor (pedantic)
-        run: pipx run zizmor==1.25.2 --persona=pedantic --no-online-audits .github/workflows/
+        run: pipx run zizmor==1.29.0 --persona=pedantic --no-online-audits .github/workflows/
 
   lint:
     name: Lint (SwiftLint, strict)
