@@ -88,6 +88,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
+        // Only the GUI claims the MCP rendezvous socket (SPEC-14 §3.5).
+        MCPBridge.shared.enable()
     }
 
     func applicationWillTerminate(_ notification: Notification) {

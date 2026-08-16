@@ -50,7 +50,6 @@ enum ClaudeIntegration {
             executablePath: Bundle.main.executablePath ?? CommandLine.arguments[0])
     }
 
-
     /// Is the server registered at user scope?
     ///
     /// Read from the config rather than asked of `claude mcp list`: that command
@@ -105,5 +104,4 @@ enum ClaudeIntegration {
         }
         return .done(registered: true)
     }
-
 }

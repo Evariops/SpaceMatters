@@ -382,7 +382,6 @@ final class SunburstNSView: NSView, CALayerDelegate {
         borderComps = srgbComps(theme.treemapBorder)
     }
 
-
     /// Blend an arc toward its verdict (SPEC-14 §3.5). Applied after the palette
     /// LUT so a verdict never poisons the cached type colours. `w` is the dim
     /// factor here, not alpha, so only RGB moves.

@@ -287,4 +287,15 @@ import simd
         #expect(c.verdictCount == 0)
         #expect(c.showVerdictsOnly == false)
     }
+
+    @Test func aScanInTheTestProcessNeverClaimsTheMCPSocket() async throws {
+        // `swift test` used to unlink a running app's socket and re-bind it,
+        // then exit — manufacturing exactly the stale-socket failure the relay
+        // has to detect, and costing the incremental-refresh tests their timing.
+        // The rendezvous is machine-wide; only the GUI may claim it.
+        let root = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        _ = await scanned(root)
+        #expect(MCPBridge.shared.isRunning == false)
+    }
 }
