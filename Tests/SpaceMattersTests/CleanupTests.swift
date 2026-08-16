@@ -85,8 +85,8 @@ import Foundation
                                icon: "note.text", note: "fixture", paths: [cache.path])
         let c = CleanupController(
             catalog: [notion], allowedRoot: root.path,
-            blockedReason: { id, _ in
-                id == "notion" ? "Notion is running — quit it first" : nil
+            blockedReason: { item, _ in
+                item.id == "notion" ? "Notion is running — quit it first" : nil
             },
             journal: { _ in })
         c.load()
@@ -436,7 +436,9 @@ import Foundation
     }
 
     /// The Trash is user data, not a cache: the select-all header ignores it in
-    /// both directions — it is only ever selected row by row.
+    /// both directions — it is only ever selected row by row. The rule is the
+    /// target's `regenerable` flag, not its id, so orphaned editor state gets
+    /// the same protection without a second special case.
     @Test func selectAllNeverTouchesTheTrash() async throws {
         let (root, cache) = try Self.makeFixture()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -444,7 +446,8 @@ import Foundation
         try FileManager.default.createDirectory(at: trashDir, withIntermediateDirectories: true)
         try Data(count: 4096).write(to: trashDir.appendingPathComponent("t.bin"))
         let trash = Cleanable(id: "trash", name: "Trash", category: "System",
-                              icon: "trash.fill", note: "fixture", paths: [trashDir.path])
+                              icon: "trash.fill", note: "fixture", paths: [trashDir.path],
+                              regenerable: false)
         let c = CleanupController(catalog: [Self.cleanable([cache.path]), trash],
                                   allowedRoot: root.path, journal: { _ in })
         c.load()
@@ -467,7 +470,7 @@ import Foundation
         defer { try? FileManager.default.removeItem(at: root) }
         let c = CleanupController(
             catalog: [Self.cleanable([cache.path])], allowedRoot: root.path,
-            blockedReason: { id, _ in id == "test-cache" ? "would break venvs" : nil },
+            blockedReason: { item, _ in item.id == "test-cache" ? "would break venvs" : nil },
             journal: { _ in })
         c.load()
         await Self.waitForReady(c)
@@ -680,6 +683,84 @@ import Foundation
 
         #expect(CleanupEngine.size(of: Self.cleanable([link.path])) == .sized(0))
     }
+
+    // MARK: Discovered targets
+
+    /// Discovery joins the catalog rather than replacing it, and the mode does
+    /// not announce `.ready` while the walk is still running — `.ready` is what
+    /// makes the Clean button live, so declaring it early would offer a clean of
+    /// a list still missing rows.
+    @Test func discoveredRowsJoinTheCatalogBeforeReady() async throws {
+        let (root, cache) = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let extra = root.appendingPathComponent("discovered")
+        try FileManager.default.createDirectory(at: extra, withIntermediateDirectories: true)
+        try Data(count: 20_000).write(to: extra.appendingPathComponent("c.bin"))
+
+        let c = CleanupController(
+            catalog: [Self.cleanable([cache.path])], allowedRoot: root.path,
+            discover: { _ in
+                [Cleanable(id: "found", name: "Found", category: "Discovered", icon: "x",
+                           note: "n", paths: [extra.path], removal: .directory,
+                           locationLabel: "1 folder")]
+            },
+            journal: { _ in })
+        c.load()
+        await Self.waitForReady(c)
+
+        #expect(c.rows.map(\.id) == ["test-cache", "found"])
+        #expect(c.rows.last?.size == .sized(20_480))
+        // The discovered row's bytes count toward the mode's total like any
+        // other — the strip must not under-report a target it is offering.
+        #expect(c.totalFound == c.rows.reduce(0) { $0 + $1.size.bytes })
+        #expect(c.totalFound > 20_480)
+    }
+
+    /// A discovered target that is not regenerable (orphaned editor state) is
+    /// selectable, but never by select-all — same protection the Trash gets, and
+    /// from the same flag rather than a second hardcoded id.
+    @Test func nonRegenerableDiscoveredRowsAreNeverBulkSelected() async throws {
+        let (root, cache) = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let state = root.appendingPathComponent("orphan")
+        try FileManager.default.createDirectory(at: state, withIntermediateDirectories: true)
+        try Data(count: 8192).write(to: state.appendingPathComponent("chat.json"))
+
+        let c = CleanupController(
+            catalog: [Self.cleanable([cache.path])], allowedRoot: root.path,
+            discover: { _ in
+                [Cleanable(id: "orphan-state", name: "Orphaned state", category: "Editors",
+                           icon: "x", note: "n", paths: [state.path],
+                           removal: .directory, regenerable: false)]
+            },
+            journal: { _ in })
+        c.load()
+        await Self.waitForReady(c)
+
+        c.toggleAll()
+        #expect(c.selectedRows.map(\.id) == ["test-cache"])
+        #expect(c.selectAllState == .all) // "all" means all regenerable rows
+
+        c.toggle("orphan-state") // explicit per-row opt-in still works
+        #expect(c.selectedRows.count == 2)
+    }
+
+    /// The app-liveness gate is declared by the target, not by a case per app:
+    /// any `ownerBundleID` blocks while that app runs, and nothing blocks when
+    /// it doesn't.
+    @Test func ownerBundleIDBlocksWhileItsAppRuns() throws {
+        let item = Cleanable(id: "chrome-cache", name: "Chrome cache", category: "Browsers",
+                             icon: "globe", note: "n", paths: ["/tmp/x"],
+                             ownerBundleID: "com.google.Chrome")
+
+        let blocked = CleanupEngine.blockedReason(for: item, home: "/tmp", isRunning: { _ in true })
+        #expect(blocked == "Chrome is running — quit it first, or it keeps writing to these files")
+        #expect(CleanupEngine.blockedReason(for: item, home: "/tmp", isRunning: { _ in false }) == nil)
+
+        // A target without an owner is unaffected by whatever is running.
+        let anonymous = Self.cleanable(["/tmp/x"])
+        #expect(CleanupEngine.blockedReason(for: anonymous, home: "/tmp", isRunning: { _ in true }) == nil)
+    }
 }
 
 /// Serialized call counter usable from `@Sendable` closures in tests.
@@ -692,4 +773,51 @@ private actor CallCounter {
 @MainActor
 private final class JournalBox {
     var entries: [CleanupJournal.Entry] = []
+}
+
+/// Catalog paths that are easy to get wrong because the tool ignores Apple's
+/// convention. Each of these was a real miss on a real disk.
+@Suite struct CatalogLocationTests {
+
+    /// uv keeps its cache under XDG on macOS too, so the Apple-shaped path alone
+    /// found nothing while 4 GiB sat in `~/.cache/uv`.
+    @Test func toolsThatFollowXDGAreLookedUpThere() {
+        let catalog = CleanupEngine.catalog(home: "/home/x")
+        func paths(_ id: String) -> [String] {
+            catalog.first { $0.id == id }?.paths ?? []
+        }
+        #expect(paths("uv").contains("/home/x/.cache/uv"))
+        // The legacy location stays: older uv builds used it, and `detect`
+        // drops whichever is absent.
+        #expect(paths("uv").contains("/home/x/Library/Caches/uv"))
+        #expect(paths("gh") == ["/home/x/.cache/gh"])
+        #expect(paths("pre-commit").contains("/home/x/.cache/pre-commit"))
+        #expect(paths("opengrep").contains("/home/x/.cache/opengrep"))
+    }
+
+    /// A tool's `.cache` is disposable and its `.local/share` is not, however
+    /// alike the two names look. opencode keeps helper binaries in one and its
+    /// login token plus every conversation in the other — the catalog must
+    /// reach for exactly one of them.
+    @Test func onlyTheCacheHalfOfATwoDirectoryToolIsOffered() {
+        let opencode = CleanupEngine.catalog(home: "/home/x").first { $0.id == "opencode" }
+        #expect(opencode?.paths == ["/home/x/.cache/opencode"])
+        #expect(CleanupEngine.catalog(home: "/home/x").allSatisfy { item in
+            item.paths.allSatisfy { !$0.contains("/.local/share/opencode") }
+        })
+    }
+
+    /// npx installs a throwaway tree per invocation and never evicts one, so it
+    /// is routinely larger than the cache beside it.
+    @Test func npmCoversBothOfItsCaches() {
+        let npm = CleanupEngine.catalog(home: "/home/x").first { $0.id == "npm" }
+        #expect(npm?.paths == ["/home/x/.npm/_cacache", "/home/x/.npm/_npx"])
+    }
+
+    /// Every catalog id is unique, or two rows collide in the controller's
+    /// keyed lookups and one silently shadows the other.
+    @Test func catalogIdsAreUnique() {
+        let ids = CleanupEngine.catalog(home: "/home/x").map(\.id)
+        #expect(Set(ids).count == ids.count)
+    }
 }

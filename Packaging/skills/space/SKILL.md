@@ -58,7 +58,16 @@ on an external drive. That judgement is the entire value you add.
 - **Never propose `rm -rf` for a path `explain` reports as a cleanup target.**
   SpaceMatters empties those itself, fenced to the user's home, never following
   symlinks, and journalled. Point at Low-Hanging Fruits in the app instead.
+  This covers more than a fixed list: `bin`/`obj`/`target` beside a project
+  file, and orphaned editor workspace state, are recognised too.
+- **`explain` also answers "NOT a cleanup target", and that answer outranks
+  your own reading.** It is how you learn that a `bin/` is a virtualenv's, or
+  that a `workspaceStorage` folder belongs to a project still on disk. A
+  directory that looks obviously disposable from its name and size is exactly
+  the case this exists for.
 - **Never call anything "safe" that you have not run `explain` on.**
+- **Check whether the owning app is running** before recommending an app's
+  cache. Its files are held open; deleting them frees nothing until quit.
 - **Documents, photos, music and videos are never `safe`.** They are `review`
   at most, and the recommendation is to move them, not to delete them.
 - **Application Support is not a cache directory.** Some of it is state the app

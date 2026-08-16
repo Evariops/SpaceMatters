@@ -38,6 +38,13 @@ enum ToolActivity {
         return []
     }
 
+    /// Every target id this can warn about — the set the confirmation dialog
+    /// asks for. Kept next to the table so a target added to one and forgotten
+    /// in the other shows up as a failing test rather than as a silent gap.
+    static var coveredTargets: Set<String> {
+        Set(commTargets.values.flatMap { $0 } + ["gradle", "maven"])
+    }
+
     /// `p_comm` (16 chars, enough for every name here) → catalog target ids.
     /// `brew` is the bash wrapper script, alive for the whole run — the ruby
     /// child doesn't need matching. Xcode builds also touch the SwiftPM cache
@@ -52,16 +59,31 @@ enum ToolActivity {
         "npx": ["npm"],
         "yarn": ["yarn"],
         "pnpm": ["pnpm"],
-        "dotnet": ["nuget"],
-        "msbuild": ["nuget"],
+        // A build both restores into the NuGet cache and writes the bin/obj it
+        // is about to be asked to delete — the second is the more disruptive of
+        // the two, so the artifacts target must be named here too.
+        "dotnet": ["nuget", "dotnet-artifacts"],
+        "msbuild": ["nuget", "dotnet-artifacts"],
         "pip": ["pip"],
         "pip3": ["pip"],
         "uv": ["uv"],
+        // A run builds its hook environments straight into that cache, so
+        // emptying it underneath one fails the hooks mid-commit.
+        "pre-commit": ["pre-commit"],
+        "prek": ["pre-commit"],
+        "gh": ["gh"],
+        // Both run *from* the tree being emptied — opengrep out of its
+        // extracted engine, opencode out of its downloaded helper binaries.
+        "opengrep": ["opengrep"],
+        "semgrep": ["opengrep"],
+        "opencode": ["opencode"],
         "gradle": ["gradle"],
         "mvn": ["maven"],
         "mvnd": ["maven"],
-        "cargo": ["cargo"],
-        "go": ["go-build"],
+        "cargo": ["cargo", "cargo-artifacts"],
+        // A build fills both: compiled output in the build cache, downloaded
+        // module sources in the module cache.
+        "go": ["go-build", "go-mod"],
         "brew": ["homebrew"],
     ]
 

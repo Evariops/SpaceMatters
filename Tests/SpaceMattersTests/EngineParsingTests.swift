@@ -116,4 +116,166 @@ import Foundation
         #expect(elapsed < 10, "bounded reader wait must cap the straggler (took \(elapsed)s)")
         #expect(r.stdoutString.contains("done")) // partial output survives
     }
+
+    // MARK: Image identity
+
+    /// The ladder that turns a wall of `<none>` into something readable. Each
+    /// rung is inference presented to the user as an image's name, so each one
+    /// is pinned against the shape podman and docker actually emit.
+    @Test func identifyResolvesUntaggedImages() {
+        // A live tag wins outright.
+        let (tagged, taggedOrigin) = ContainerQueries.identify(
+            ["Names": ["ghcr.io/n8n-io/n8n:2.33.4"], "History": ["something:old"]])
+        #expect(tagged == "ghcr.io/n8n-io/n8n:2.33.4")
+        #expect(taggedOrigin == .tagged)
+
+        // Untagged, but History remembers the tag a newer build took.
+        let (former, formerOrigin) = ContainerQueries.identify(
+            ["Names": [], "History": ["docker.io/harness/runner-local:latest"]])
+        #expect(former == "docker.io/harness/runner-local:latest")
+        #expect(formerOrigin == .superseded)
+
+        // A buildah scratch name must not be presented as a repository.
+        let (tmp, tmpOrigin) = ContainerQueries.identify(
+            ["Names": [],
+             "History": ["docker.io/library/7c3a32dc6babb20d4dd0388c45182701cbd93830849e957dbb5f8ae109f1ef58-tmp:latest"]])
+        #expect(tmp == "build leftover")
+        #expect(tmpOrigin == .buildIntermediate)
+
+        // Pulled by digest: the repository is still known.
+        let (digest, digestOrigin) = ContainerQueries.identify(
+            ["Names": [], "RepoDigests": ["docker.io/library/postgres@sha256:abc"]])
+        #expect(digest == "docker.io/library/postgres")
+        #expect(digestOrigin == .digest)
+
+        // Labels are the last real identity before giving up.
+        let (labelled, labelledOrigin) = ContainerQueries.identify(
+            ["Names": [], "Labels": ["org.opencontainers.image.title": "dockerfiles"]])
+        #expect(labelled == "dockerfiles")
+        #expect(labelledOrigin == .labelled)
+
+        // Nothing known stays honest rather than inventing a name.
+        let (none, noneOrigin) = ContainerQueries.identify(["Names": []])
+        #expect(none == "<none>")
+        #expect(noneOrigin == .anonymous)
+
+        // Pulled by digest and named as such: the hash is not a tag and 71
+        // characters of it would crowd out every other column.
+        let (byDigest, byDigestOrigin) = ContainerQueries.identify(
+            ["Names": ["docker.io/kindest/node@sha256:7416a61b42b1662ca6ca89f02028ac13"]])
+        #expect(byDigest == "docker.io/kindest/node")
+        #expect(byDigestOrigin == .digest)
+
+        // podman writes "repo:<none>" for an untagged entry — not a real tag.
+        let (placeholder, placeholderOrigin) = ContainerQueries.identify(
+            ["Names": ["docker.io/library/x:<none>"], "History": ["docker.io/library/x:1.0"]])
+        #expect(placeholder == "docker.io/library/x:1.0")
+        #expect(placeholderOrigin == .superseded)
+    }
+
+    @Test func buildIntermediateNeedsAHexStem() {
+        #expect(ContainerQueries.isBuildIntermediate(
+            "docker.io/library/7c3a32dc6babb20d4dd0388c45182701cbd93830849e957db-tmp:latest"))
+        // A real project could genuinely be called this; only the hex stem
+        // marks a buildah scratch name.
+        #expect(!ContainerQueries.isBuildIntermediate("docker.io/acme/build-tmp:latest"))
+        #expect(!ContainerQueries.isBuildIntermediate("docker.io/acme/app:latest"))
+    }
+
+    /// `podman system df -v` is the only source of per-image unique size and
+    /// refuses `--format json`, so the table is parsed. CREATED is a human
+    /// duration of unpredictable width, which is why the parse reads from both
+    /// ends and never by column offset.
+    @Test func parsesUniqueSizesFromTheVerboseTable() {
+        let output = """
+        Images space usage:
+
+        REPOSITORY                        TAG         IMAGE ID      CREATED           SIZE      SHARED SIZE  UNIQUE SIZE  CONTAINERS
+        docker.io/library/postgres        17-alpine   5db836939fe3  2 months          293.8MB   8.94MB       284.9MB      1
+        mcr.microsoft.com/dotnet/aspnet   10.0        1ba87edc1ba3  About a minute    265.8MB   265.8MB      7.367kB      0
+        <none>                            <none>      18a22e769399  3 weeks           265.8MB   265.8MB      6.188kB      0
+
+        Containers space usage:
+
+        CONTAINER ID  IMAGE         COMMAND     LOCAL VOLUMES  SIZE      CREATED     STATUS      NAMES
+        abc123456789  postgres:17   postgres    0              1.5MB     2 days      running     db
+        """
+
+        let sizes = ContainerQueries.parseUniqueSizes(output)
+
+        #expect(sizes.count == 3)
+        #expect(sizes["5db836939fe3"] == 284_900_000)
+        // A three-token CREATED must not shift the size columns.
+        #expect(sizes["1ba87edc1ba3"] == 7_367)
+        #expect(sizes["18a22e769399"] == 6_188)
+        // The containers section has an id-shaped first column too; parsing it
+        // as an image would attribute a wrong unique size.
+        #expect(sizes["abc123456789"] == nil)
+    }
+
+    /// The number a row must not print unqualified: an image listed at 265.8 MB
+    /// that frees 6 KB when deleted, because every other byte is a layer other
+    /// images hold too.
+    @Test func imageKnowsWhenItsSizeOverstatesWhatDeletingFrees() {
+        let shared = CImage(id: "a", name: "x", size: 265_800_000, inUse: false,
+                            created: nil, uniqueSize: 6_188)
+        #expect(shared.sharesMostOfItsBytes)
+
+        let standalone = CImage(id: "b", name: "y", size: 293_800_000, inUse: false,
+                                created: nil, uniqueSize: 284_900_000)
+        #expect(!standalone.sharesMostOfItsBytes)
+
+        // Docker reports no unique size: claim nothing rather than guess.
+        let unknown = CImage(id: "c", name: "z", size: 100, inUse: false, created: nil)
+        #expect(!unknown.sharesMostOfItsBytes)
+    }
+
+    /// A group of rebuilds of one tag is the common case and the trap. Measured
+    /// on a real machine, 38 rebuilds of `harness/runner-local:latest` summed to
+    /// 42.6 GiB of image size and **0 B** of per-image unique size: every layer
+    /// is shared with a sibling. Neither figure is what removing the group
+    /// frees, so the group must not offer one — it says the layers are shared
+    /// and points at the engine's own reclaimable instead.
+    @Test func aGroupOfRebuildsReportsSharedLayersRatherThanAFakeTotal() {
+        let rebuilds = (0..<38).map {
+            CImage(id: "img\($0)", name: "harness/runner-local:latest", size: 1_200_000_000,
+                   inUse: false, created: nil, origin: $0 == 0 ? .tagged : .superseded,
+                   uniqueSize: 8_000)
+        }
+        let group = CImageGroup(name: "harness/runner-local:latest", images: rebuilds)
+
+        #expect(group.supersededCount == 37)
+        #expect(group.unusedCount == 38)
+        #expect(group.layersMostlyShared)
+        #expect(!group.isSingle)
+
+        // Independent images that each hold their own bytes are not flagged —
+        // there the advice "remove as a set" would be wrong.
+        let independent = (0..<3).map {
+            CImage(id: "sep\($0)", name: "n", size: 1_000_000, inUse: false,
+                   created: nil, uniqueSize: 900_000)
+        }
+        #expect(!CImageGroup(name: "n", images: independent).layersMostlyShared)
+
+        // Without measured unique sizes (docker), no claim is made either way.
+        let unmeasured = (0..<3).map {
+            CImage(id: "u\($0)", name: "n", size: 1_000_000, inUse: false, created: nil)
+        }
+        #expect(!CImageGroup(name: "n", images: unmeasured).layersMostlyShared)
+    }
+
+    @Test func ageBucketsSeparateRebuildsWithoutPretendingToDateThem() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        func age(_ secondsAgo: Double) -> String {
+            Format.age(now.addingTimeInterval(-secondsAgo), now: now)
+        }
+        #expect(age(600) == "just now")
+        #expect(age(5 * 3600) == "5h ago")
+        #expect(age(3 * 86_400) == "3d ago")
+        #expect(age(21 * 86_400) == "3w ago")
+        #expect(age(120 * 86_400) == "4mo ago")
+        #expect(age(800 * 86_400) == "2y ago")
+        // A clock skew must not produce "-3h ago".
+        #expect(age(-3600) == "just now")
+    }
 }

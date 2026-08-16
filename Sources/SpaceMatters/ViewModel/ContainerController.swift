@@ -15,6 +15,10 @@ final class ContainerController {
     private(set) var images: [CImage] = []
     private(set) var containers: [CContainer] = []
     private(set) var volumes: [CVolume] = []
+    private(set) var machineDisk: CMachineDisk?
+    /// Host bytes the last trim actually returned, measured by re-`stat`ing the
+    /// image. Never taken from `fstrim`'s own output — see `trimMachineDisk`.
+    private(set) var lastTrimFreed: Int64?
 
     /// Failure of the last cleanup action (timeout, engine refusal…), surfaced
     /// as an alert — a prune that dies silently looks like a button that does
@@ -24,7 +28,27 @@ final class ContainerController {
     private(set) var runningAction: String?
 
     var expandedImages: Set<String> = []
+    /// Image groups the user has opened. Collapsed by default: the point of
+    /// grouping is that forty rebuilds of one tag arrive as one line.
+    var expandedGroups: Set<String> = []
     private(set) var layerCache: [String: [CLayer]] = [:]
+
+    /// Images collapsed onto the identity they resolve to, largest first.
+    ///
+    /// The engine's own ordering is one row per image, which on a machine that
+    /// rebuilds the same handful of tags is hundreds of indistinguishable lines.
+    /// Grouping restores the question the view is meant to answer: which *tag*
+    /// is holding the space.
+    var imageGroups: [CImageGroup] {
+        let grouped = Dictionary(grouping: images, by: \.name)
+        return grouped
+            .map { CImageGroup(name: $0.key, images: $0.value.sorted { lhs, rhs in
+                // Newest first inside a group: the current build is the one the
+                // user is looking for, its predecessors trail behind it.
+                (lhs.created ?? .distantPast) > (rhs.created ?? .distantPast)
+            }) }
+            .sorted { $0.size > $1.size }
+    }
 
     private var engine: ContainerEngine?
     /// Superseded-load guard (same pattern as the Kubernetes and Cleanup modes):
@@ -40,7 +64,8 @@ final class ContainerController {
         engineName = engine.displayName
         state = .loading
         df = []; images = []; containers = []; volumes = []
-        expandedImages = []; layerCache = [:]
+        machineDisk = nil; lastTrimFreed = nil
+        expandedImages = []; expandedGroups = []; layerCache = [:]
         actionError = nil
         runningAction = nil
         loadID += 1
@@ -68,6 +93,7 @@ final class ContainerController {
         images = snapshot.images.sorted { $0.size > $1.size }
         containers = snapshot.containers.sorted { $0.size > $1.size }
         volumes = snapshot.volumes.sorted { $0.size > $1.size }
+        machineDisk = snapshot.machineDisk
         state = .ready
     }
 
@@ -79,6 +105,14 @@ final class ContainerController {
         } else {
             expandedImages.insert(image.id)
             loadLayersIfNeeded(image)
+        }
+    }
+
+    func toggle(group: CImageGroup) {
+        if expandedGroups.contains(group.id) {
+            expandedGroups.remove(group.id)
+        } else {
+            expandedGroups.insert(group.id)
         }
     }
 
@@ -105,10 +139,59 @@ final class ContainerController {
     /// No `-f`: a forced `rmi` also stops and deletes the containers using the
     /// image. If it's in use the engine refuses and the refusal is shown as-is.
     func removeImage(_ image: CImage) { run("Remove image", ["rmi", image.id]) }
-    func pruneImages() { run("Prune images", ["image", "prune", "-a", "-f"]) }
-    func pruneContainers() { run("Prune containers", ["container", "prune", "-f"]) }
-    func pruneVolumes() { run("Prune volumes", ["volume", "prune", "-f"]) }
+    /// All three prunes are scoped to what nothing references — that is the
+    /// engine's own definition of an unused image, container or volume, and the
+    /// one the "Reclaim unused" buttons promise. `-a` is what makes the images
+    /// case match it: without it the engine removes only *dangling* images and
+    /// leaves every tagged-but-unreferenced one behind, which would clear a
+    /// fraction of the reclaimable figure shown on the card.
+    func pruneImages() { run("Reclaim unused images", ["image", "prune", "-a", "-f"]) }
+    func pruneContainers() { run("Reclaim stopped containers", ["container", "prune", "-f"]) }
+    func pruneVolumes() { run("Reclaim unused volumes", ["volume", "prune", "-f"]) }
     func removeContainer(_ container: CContainer) { run("Remove container", ["rm", "-f", container.id]) }
+
+    /// Return the guest's free blocks to the host, shrinking the machine's
+    /// sparse disk image.
+    ///
+    /// This is the step that makes every prune above visible on the Mac. Podman
+    /// frees space *inside* the VM; the host file keeps the blocks until the
+    /// guest filesystem discards them, and Fedora CoreOS only does that on a
+    /// weekly timer. Running `fstrim` on demand collapses that week to now.
+    ///
+    /// Reads as a nothing-happened when run on its own after a fresh trim, and
+    /// that is correct: there is nothing to give back until something inside has
+    /// been deleted. Prune first, then trim.
+    ///
+    /// The freed figure is measured, never reported. `fstrim` prints the size of
+    /// the free extents it walked, which on a mostly-empty filesystem is close
+    /// to the whole disk — it read "39.5 GiB trimmed" for 2.06 GB actually
+    /// returned in testing. Only the before/after `st_blocks` of the image is
+    /// the truth.
+    func trimMachineDisk() {
+        guard let engine, engine.kind == .podman, let disk = machineDisk,
+              runningAction == nil else { return }
+        runningAction = "Reclaim host disk"
+        actionError = nil
+        lastTrimFreed = nil
+        let id = loadID
+        Task {
+            let before = disk.onDisk
+            // `/` and `/var` are the same XFS filesystem on a CoreOS machine;
+            // trimming one covers both.
+            let result = await ProcessRunner.run(
+                engine.executable, ["machine", "ssh", disk.machine, "sudo", "fstrim", "/var"],
+                timeout: 600)
+            guard id == loadID else { return }
+            runningAction = nil
+            if result.ok {
+                let after = ContainerQueries.machineDisk(engine)
+                lastTrimFreed = max(0, before - (after?.onDisk ?? before))
+            } else {
+                actionError = "Reclaim host disk failed: \(result.diagnostic)"
+            }
+            await reload(id)
+        }
+    }
 
     func clearActionError() { actionError = nil }
 
@@ -116,6 +199,9 @@ final class ContainerController {
         guard let engine, runningAction == nil else { return }
         runningAction = label
         actionError = nil
+        // A prune frees guest space and leaves the host image untouched, so the
+        // previous trim's figure would now be describing a stale state.
+        lastTrimFreed = nil
         let id = loadID
         Task {
             let result = await ProcessRunner.run(engine.executable, args, timeout: 600)

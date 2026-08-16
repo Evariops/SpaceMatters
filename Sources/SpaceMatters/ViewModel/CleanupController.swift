@@ -50,6 +50,10 @@ final class CleanupController {
     /// A reload asked for mid-clean is remembered and honoured when the batch
     /// lands, instead of being dropped (or worse, resetting rows under it).
     private var pendingReload = false
+    /// True while the disk walk is still running. Sizing the catalog can finish
+    /// long before it, and `.ready` must not be announced while rows are still
+    /// on their way — the Clean button becomes live at `.ready`.
+    private var awaitingDiscovery = false
 
     /// Which native cleaner (if any) handles a target, how one is executed, and
     /// which targets are blocked outright on this machine. All injectable:
@@ -57,7 +61,14 @@ final class CleanupController {
     /// without spawning a real tool or depending on this machine's config.
     private let nativeLookup: @Sendable (String, String) -> NativeCleaner?
     private let nativeRunner: @Sendable (NativeCleaner) async -> ProcessResult
-    private let blockedReason: @Sendable (String, String) -> String?
+    /// Takes the whole target, not just its id: the app-liveness rule reads
+    /// `ownerBundleID`, so a target declares its own gate instead of every new
+    /// app needing a case added here.
+    private let blockedReason: @Sendable (Cleanable, String) -> String?
+    /// Targets whose paths depend on what is on the disk (build output,
+    /// orphaned workspace state, browser profiles). Injectable and run off the
+    /// main actor — it walks the home directory.
+    private let discover: @Sendable (String) -> [Cleanable]
     /// Called on the main actor with one entry per cleaned target — the
     /// forensic trail behind field reports. Injectable so tests can collect.
     private let journal: (CleanupJournal.Entry) -> Void
@@ -72,29 +83,17 @@ final class CleanupController {
             await ProcessRunner.run(native.binary, native.arguments,
                                     timeout: native.timeout, environment: native.environment)
          },
-         blockedReason: @escaping @Sendable (String, String) -> String? = { id, home in
-            // A target whose vendor command is the only viable path is blocked
-            // when that command is missing, rather than offered a file removal
-            // that would fail on every entry (go-mod). Checked first: it is a
-            // property of the target, not of this machine's state.
-            if let missing = NativeCleaner.missingRequirement(for: id, home: home) {
-                return missing
-            }
-            switch id {
-            case "uv" where CleanupEngine.uvSymlinkMode(home: home):
-                return "uv link-mode is \"symlink\" — cleaning would break your virtualenvs"
-            case "notion" where CleanupEngine.notionIsRunning():
-                return "Notion is running — quit it first, or it keeps writing to the cache"
-            default:
-                return nil
-            }
+         blockedReason: @escaping @Sendable (Cleanable, String) -> String? = {
+            CleanupEngine.blockedReason(for: $0, home: $1)
          },
+         discover: @escaping @Sendable (String) -> [Cleanable] = { CleanupDiscovery.all(home: $0) },
          journal: @escaping (CleanupJournal.Entry) -> Void = { CleanupJournal.append($0) }) {
         self.catalog = catalog
         self.allowedRoot = allowedRoot
         self.nativeLookup = nativeLookup
         self.nativeRunner = nativeRunner
         self.blockedReason = blockedReason
+        self.discover = discover
         self.journal = journal
     }
 
@@ -112,33 +111,68 @@ final class CleanupController {
         lastFailures = 0
         lastRefused = 0
         lastNativeIssues = []
-        let detected = CleanupEngine.detect(catalog, allowedRoot: allowedRoot)
-        let blocked = Dictionary(uniqueKeysWithValues: detected.compactMap { item in
-            blockedReason(item.id, allowedRoot).map { (item.id, $0) }
-        })
         // Keep existing selections across a refresh; drop ones that vanished
         // (or got blocked meanwhile).
         let previouslySelected = Set(rows.filter(\.selected).map(\.id))
-        rows = detected.map {
-            Row(item: $0,
-                nativeLabel: nativeLookup($0.id, allowedRoot)?.label,
-                size: blocked[$0.id].map(SizeState.blocked) ?? .pending,
-                selected: previouslySelected.contains($0.id) && blocked[$0.id] == nil)
-        }
-        state = rows.contains { $0.size == .pending } ? .sizing : .ready
-        // One target at a time. Each sizing walk now drives the full scanner
-        // worker pool, so running the targets concurrently would multiply
-        // threads rather than work — and the slowest target used to set the
-        // whole mode's load time anyway. Rows still fill in live, in order.
-        let pending = detected.filter { blocked[$0.id] == nil }
+        // The hand-picked catalog is a pure list, so its rows can be shown and
+        // sized immediately. Discovery walks the disk — several seconds on a
+        // developer's home — and joins when it lands, rather than holding every
+        // other row hostage behind it.
+        rows = makeRows(CleanupEngine.detect(catalog, allowedRoot: allowedRoot),
+                        selected: previouslySelected)
+        state = .sizing
+        awaitingDiscovery = true
+        let root = allowedRoot
+        let discover = self.discover
         Task {
-            for item in pending {
-                let measure = await Task.detached(priority: .userInitiated) {
-                    CleanupEngine.size(of: item)
-                }.value
-                guard id == self.loadID else { return }
-                self.apply(measure, to: item.id)
+            // Started first, awaited last: the walk is readdir-only and
+            // single-threaded, so it costs nothing to run it alongside the
+            // sizing walks rather than before them.
+            let discovery = Task.detached(priority: .userInitiated) {
+                CleanupEngine.detect(discover(root), allowedRoot: root)
             }
+            await self.size(self.rows.filter { $0.size == .pending }.map(\.item), id: id)
+
+            let discovered = await discovery.value
+            guard id == self.loadID else { return }
+            let fresh = self.makeRows(discovered, selected: previouslySelected)
+            self.rows += fresh
+            self.awaitingDiscovery = false
+            await self.size(fresh.filter { $0.size == .pending }.map(\.item), id: id)
+            // Nothing left to measure and nothing still to arrive: the batch may
+            // have been all-blocked or empty, in which case no `apply` ran to
+            // make the transition.
+            if id == self.loadID, self.state == .sizing,
+               !self.rows.contains(where: { $0.size == .pending }) {
+                self.state = .ready
+            }
+        }
+    }
+
+    /// Size targets one at a time. Each sizing walk drives the full scanner
+    /// worker pool, so running the targets concurrently would multiply threads
+    /// rather than work — and the slowest target sets the mode's load time
+    /// either way. Rows still fill in live, in order.
+    private func size(_ items: [Cleanable], id: Int) async {
+        for item in items {
+            let measure = await Task.detached(priority: .userInitiated) {
+                CleanupEngine.size(of: item)
+            }.value
+            guard id == loadID else { return }
+            apply(measure, to: item.id)
+        }
+    }
+
+    /// Rows for a detected batch, with the blocked reasons resolved and the
+    /// pre-refresh selection carried over. Shared by the catalog and the
+    /// discovered batch so both get identical treatment.
+    private func makeRows(_ items: [Cleanable], selected: Set<String>) -> [Row] {
+        items.map { item in
+            let blocked = blockedReason(item, allowedRoot)
+            return Row(item: item,
+                       nativeLabel: nativeLookup(item.id, allowedRoot)?.label,
+                       size: blocked.map(SizeState.blocked) ?? .pending,
+                       selected: selected.contains(item.id) && blocked == nil)
         }
     }
 
@@ -149,6 +183,7 @@ final class CleanupController {
     func stop() {
         loadID += 1
         pendingReload = false
+        awaitingDiscovery = false
     }
 
     /// The model guards itself: a pending/denied/blocked row cannot be selected
@@ -163,15 +198,17 @@ final class CleanupController {
 
     enum SelectAllState { case none, some, all }
 
-    /// Select-all drives the *cache* rows only. The Trash is the one target
-    /// that is user data, not a regenerable cache — it is selected row by row,
-    /// never swept up in momentum, and the header checkbox ignores it both ways.
+    /// Select-all drives the *regenerable* rows only. The Trash and orphaned
+    /// editor state are user data whose bytes never come back — they are
+    /// selected row by row, never swept up in momentum, and the header checkbox
+    /// ignores them both ways.
     private func isBulkSelectable(_ row: Row) -> Bool {
-        row.size.isSelectable && row.item.id != "trash"
+        row.size.isSelectable && row.item.regenerable
     }
 
     /// Select-all checkbox state over the bulk-selectable rows (denied/pending/
-    /// blocked rows have no trustworthy size and never count; nor does Trash).
+    /// blocked rows have no trustworthy size and never count; nor do the
+    /// non-regenerable ones).
     var selectAllState: SelectAllState {
         let selectable = rows.filter(isBulkSelectable)
         let selected = selectable.filter(\.selected).count
@@ -290,7 +327,7 @@ final class CleanupController {
             }
         case .denied: rows[idx].size = .denied
         }
-        if state == .sizing, !rows.contains(where: { $0.size == .pending }) {
+        if state == .sizing, !awaitingDiscovery, !rows.contains(where: { $0.size == .pending }) {
             state = .ready
         }
     }

@@ -54,8 +54,9 @@ private struct AssistantPanel: View {
 
     private enum Status {
         case checking
-        /// Skill installed and the server registered — nothing left to do.
-        case ready
+        /// Skill installed and the server registered. `skillOutdated` still
+        /// matters here: the wiring is right, the guidance behind it is not.
+        case ready(skillOutdated: Bool)
         case notSetUp(skillInstalled: Bool, cliFound: Bool)
     }
 
@@ -118,11 +119,26 @@ private struct AssistantPanel: View {
                     .foregroundStyle(theme.textSecondary)
             }
 
-        case .ready:
+        case .ready(let skillOutdated):
             VStack(alignment: .leading, spacing: 6) {
                 Label("Claude Code is connected", systemImage: "checkmark.circle.fill")
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(theme.textPrimary)
+
+                // Connected but reading an older copy of the guidance. Worth
+                // interrupting for: the skill is where the app's judgement about
+                // what is safe to delete lives, so a stale one does not degrade
+                // the answers, it makes them confidently wrong about the exact
+                // things a newer version was written to correct.
+                if skillOutdated {
+                    Text("The installed skill is older than this version of SpaceMatters — a "
+                         + "session will be reading guidance this build has already corrected.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Color(hex: 0xE0915A))
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button("Update skill") { Task { await install() } }
+                        .disabled(busy || plan == nil)
+                }
 
                 // "It's connected" is a status, not an action. The three steps
                 // and a ready-made prompt are what actually gets someone from
@@ -213,7 +229,7 @@ private struct AssistantPanel: View {
             ClaudeIntegration.isRegistered()
         }.value
         status = (registered && plan.skillAlreadyInstalled)
-            ? .ready
+            ? .ready(skillOutdated: plan.skillOutdated)
             : .notSetUp(skillInstalled: plan.skillAlreadyInstalled, cliFound: plan.cliPath != nil)
     }
 
