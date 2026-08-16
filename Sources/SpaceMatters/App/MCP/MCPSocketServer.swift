@@ -51,7 +51,13 @@ final class MCPSocketServer: @unchecked Sendable {
         let bound = withUnsafePointer(to: &address) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, size) }
         }
-        guard bound == 0, listen(fd, 4) == 0 else { close(fd); return }
+        guard bound == 0 else {
+            NSLog("[SpaceMatters] MCP socket bind failed: %d", errno); close(fd); return
+        }
+        guard listen(fd, 16) == 0 else {
+            NSLog("[SpaceMatters] MCP socket listen failed: %d", errno); close(fd); return
+        }
+        NSLog("[SpaceMatters] MCP socket listening at %@", path)
         // Owner-only: this hands out a full map of the user's disk.
         chmod(path, 0o600)
 
@@ -72,9 +78,56 @@ final class MCPSocketServer: @unchecked Sendable {
     private func acceptLoop(_ fd: Int32) {
         while !stopping {
             let client = accept(fd, nil, nil)
-            if client < 0 { if stopping { return }; continue }
-            serve(client)
-            close(client)
+            if client < 0 {
+                if stopping || errno == EBADF || errno == EINVAL { return }
+                // A recoverable error (EINTR, EMFILE) must not become a spin at
+                // 100% CPU on a listener that will never accept again.
+                if errno != EINTR { usleep(50_000) }
+                continue
+            }
+            // One thread per connection. Serving inline blocked the accept loop
+            // for a whole session's lifetime — a second session then queued
+            // behind it, and once the backlog filled, further ones were refused
+            // and silently fell back to re-scanning from scratch.
+            let thread = Thread { [weak self] in
+                self?.serve(client)
+                close(client)
+            }
+            thread.name = "spacematters.mcp.session"
+            thread.stackSize = 512 * 1024
+            thread.start()
+        }
+    }
+
+    /// Is the published socket actually reachable? A path can outlive the
+    /// listener that owned it — a second app instance unlinks and re-binds it,
+    /// and an instance that dies without `applicationWillTerminate` leaves the
+    /// file pointing at a dead inode. Either way clients get ECONNREFUSED while
+    /// the file sits there looking healthy, so this is checked rather than
+    /// assumed.
+    static func isReachable() -> Bool {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+        return connectSocket(fd, to: socketPath) == 0
+    }
+
+    /// Fills a `sockaddr_un` and connects. Shared with the relay so the two can
+    /// never disagree about how the address is built.
+    static func connectSocket(_ fd: Int32, to path: String) -> Int32 {
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+        let bytes = Array(path.utf8)
+        guard bytes.count < MemoryLayout.size(ofValue: address.sun_path) else { return -1 }
+        withUnsafeMutablePointer(to: &address.sun_path) { raw in
+            raw.withMemoryRebound(to: CChar.self, capacity: bytes.count + 1) { dst in
+                for (i, byte) in bytes.enumerated() { dst[i] = CChar(bitPattern: byte) }
+                dst[bytes.count] = 0
+            }
+        }
+        let size = socklen_t(MemoryLayout<sockaddr_un>.size)
+        return withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, size) }
         }
     }
 

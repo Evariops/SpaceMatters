@@ -13,10 +13,33 @@ import Foundation
 /// socket, with no duplicated tool logic between them.
 final class MCPServer: @unchecked Sendable {
 
-    private let source: any MCPScanSource
+    /// Why this session is not attached to a running app — carried into
+    /// `overview` so the model reports the right cause instead of inferring one
+    /// from the absent map tools.
+    enum DetachedReason {
+        case appNotRunning
+        case socketUnreachable
 
-    init(source: any MCPScanSource) {
+        var note: String {
+            switch self {
+            case .appNotRunning:
+                return "SpaceMatters is not running, so this is a standalone scan and there is "
+                    + "no map to mark. Say so if the user asked for marks."
+            case .socketUnreachable:
+                return "A SpaceMatters socket exists but refused the connection, so this is a "
+                    + "standalone scan. **Do not tell the user the app is closed** — it may well "
+                    + "be open with a stale socket. Ask them to rescan in the app, which rebinds "
+                    + "it, then start a new session."
+            }
+        }
+    }
+
+    private let source: any MCPScanSource
+    private let detachedReason: DetachedReason?
+
+    init(source: any MCPScanSource, detachedReason: DetachedReason? = nil) {
         self.source = source
+        self.detachedReason = detachedReason
     }
 
     // MARK: Transports
@@ -183,6 +206,7 @@ final class MCPServer: @unchecked Sendable {
             counting: stats.counting, scanDate: stats.date, elapsed: stats.elapsed,
             types: source.exactTypes())
         var out = caveat(full: true)
+        if let detachedReason { out += "NOTE — \(detachedReason.note)\n\n" }
         if stats.isLive {
             out += "Attached to the running SpaceMatters — these are the numbers on screen, "
                 + "and `annotate` / `focus` will act on that window.\n\n"

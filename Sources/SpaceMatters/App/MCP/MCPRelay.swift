@@ -11,39 +11,45 @@ import Foundation
 enum MCPRelay {
 
     static func run(rootPath: String) -> Int32 {
-        if let client = connectToApp() {
+        switch connectToApp() {
+        case .connected(let client):
             JSONRPC.log("attached to the running SpaceMatters — no re-scan, map tools available")
             defer { close(client) }
             relay(client)
             return 0
+        case .noApp:
+            JSONRPC.log("SpaceMatters is not running — scanning standalone (root \(rootPath))")
+            return MCPServer(source: DetachedScanSource(rootPath: rootPath),
+                             detachedReason: .appNotRunning).runStdio()
+        case .unreachable(let code):
+            // Distinguished from "not running" on purpose. A model that sees no
+            // `annotate` tool concludes the app is closed and tells the user so;
+            // when the app is in fact open with a broken socket, that sends them
+            // looking in the wrong place entirely.
+            JSONRPC.log("a SpaceMatters socket exists but refused the connection (errno \(code)) "
+                + "— scanning standalone; rescan in the app to rebind it")
+            return MCPServer(source: DetachedScanSource(rootPath: rootPath),
+                             detachedReason: .socketUnreachable).runStdio()
         }
-        JSONRPC.log("SpaceMatters is not running — scanning standalone (root \(rootPath))")
-        return MCPServer(source: DetachedScanSource(rootPath: rootPath)).runStdio()
     }
 
-    private static func connectToApp() -> Int32? {
+    private enum Attachment {
+        case connected(Int32)
+        case noApp
+        case unreachable(Int32)
+    }
+
+    private static func connectToApp() -> Attachment {
         let path = MCPSocketServer.socketPath
-        guard FileManager.default.fileExists(atPath: path) else { return nil }
+        guard FileManager.default.fileExists(atPath: path) else { return .noApp }
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard fd >= 0 else { return nil }
-        var address = sockaddr_un()
-        address.sun_family = sa_family_t(AF_UNIX)
-        let bytes = Array(path.utf8)
-        guard bytes.count < MemoryLayout.size(ofValue: address.sun_path) else { close(fd); return nil }
-        withUnsafeMutablePointer(to: &address.sun_path) { raw in
-            raw.withMemoryRebound(to: CChar.self, capacity: bytes.count + 1) { dst in
-                for (i, byte) in bytes.enumerated() { dst[i] = CChar(bitPattern: byte) }
-                dst[bytes.count] = 0
-            }
+        guard fd >= 0 else { return .noApp }
+        guard MCPSocketServer.connectSocket(fd, to: path) == 0 else {
+            let code = errno
+            close(fd)
+            return .unreachable(code)
         }
-        let size = socklen_t(MemoryLayout<sockaddr_un>.size)
-        let connected = withUnsafePointer(to: &address) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, size) }
-        }
-        // A stale socket file from a crashed app refuses the connection; that is
-        // indistinguishable from "not running", and both mean: scan standalone.
-        guard connected == 0 else { close(fd); return nil }
-        return fd
+        return .connected(fd)
     }
 
     /// Pump stdin into the socket on a second thread while the main one pumps
