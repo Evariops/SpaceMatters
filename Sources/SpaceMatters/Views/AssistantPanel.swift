@@ -124,7 +124,15 @@ private struct AssistantPanel: View {
                 // here to an answer.
                 // Without `fixedSize` the stack compresses this multi-line Text
                 // to one line and ellipsises the other two steps away.
-                Text("1. Open a terminal, anywhere\n2. Run  claude\n3. Paste this:")
+                // A session builds its tool list at startup, so one that was
+                // already open when the server was registered will not see it
+                // and will say so in confusing ways ("no spacematters tools").
+                // Saying this here is the difference between the feature working
+                // and the feature looking broken.
+                // One literal, not a `+` concatenation: SwiftUI only parses
+                // markdown out of a string *literal*, so a built-up String would
+                // render the asterisks and backticks verbatim.
+                Text("1. Open a **new** terminal session — run `claude`\n2. Paste the prompt below\n\nAlready in a session? It won't see the server yet: run `/mcp` there and reconnect **spacematters**.")
                     .font(.system(size: 11))
                     .foregroundStyle(theme.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -194,7 +202,11 @@ private struct AssistantPanel: View {
     private func refresh() async {
         let plan = ClaudeIntegration.plan()
         self.plan = plan
-        let registered = await ClaudeIntegration.isRegistered(plan)
+        // Off the main actor: ~/.claude.json carries session history and can run
+        // to megabytes, and this happens every time the popover opens.
+        let registered = await Task.detached(priority: .userInitiated) {
+            ClaudeIntegration.isRegistered()
+        }.value
         status = (registered && plan.skillAlreadyInstalled)
             ? .ready
             : .notSetUp(skillInstalled: plan.skillAlreadyInstalled, cliFound: plan.cliPath != nil)
@@ -207,7 +219,8 @@ private struct AssistantPanel: View {
         switch ClaudeIntegration.apply(plan) {
         case .done(let registered):
             message = registered
-                ? "Done. Start a new Claude Code session — an existing one won't see the server yet."
+                ? "Registered. A session that is already open won't see it — start a new one, "
+                  + "or run /mcp there and reconnect."
                 : "Skill installed. Copy the command above and run it to register the server."
         case .failed(let text):
             message = text

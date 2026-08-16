@@ -51,13 +51,20 @@ enum ClaudeIntegration {
     }
 
 
-    /// Is the server already registered? Asks the CLI rather than parsing its
-    /// config file — that file is the CLI's business and its shape can change.
-    /// Short timeout: this only decorates a popover, it must never hang one.
-    static func isRegistered(_ plan: Plan) async -> Bool {
-        guard let cli = plan.cliPath else { return false }
-        let result = await ProcessRunner.run(cli, ["mcp", "list"], timeout: 10)
-        return result.exitCode == 0 && result.stdoutString.contains(serverName + ":")
+    /// Is the server registered at user scope?
+    ///
+    /// Read from the config rather than asked of `claude mcp list`: that command
+    /// *health-checks every server the user has*, including remote ones over the
+    /// network, which took seconds of spinner to answer a question about one
+    /// local entry. Reading is also safe in a way writing is not — registration
+    /// still goes through the CLI, because that is the half that must survive a
+    /// format change.
+    nonisolated static func isRegistered() -> Bool {
+        let path = NSHomeDirectory() + "/.claude.json"
+        guard let data = FileManager.default.contents(atPath: path),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let servers = root["mcpServers"] as? [String: Any] else { return false }
+        return servers[serverName] != nil
     }
 
     // MARK: Doing it
