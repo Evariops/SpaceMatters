@@ -750,6 +750,52 @@ final class ScanController {
         return (base == "/" ? "/" : base + "/") + file.name
     }
 
+    // MARK: LLM briefing (SPEC-14 §3.7)
+
+    /// Markdown digest of what the user is currently looking at — the zoom root,
+    /// not necessarily the whole scan — budgeted to fit a chat context.
+    ///
+    /// `nil` when there is nothing scanned yet. Available mid-scan too: the tree
+    /// is consistent at any tick (sizes are atomics propagated as directories
+    /// complete), it is simply incomplete, which the header's timing line makes
+    /// visible.
+    func llmBriefing(maxNodes: Int = 300) -> String? {
+        guard let root else { return nil }
+        let target = zoomRoot ?? root
+        let whole = target === root
+        let snapshot = TreeDigest.Snapshot(
+            title: whole ? rootName : target.name,
+            path: path(for: target) ?? rootPath,
+            isWholeScan: whole,
+            onDisk: target.sizeOnDisk,
+            apparent: target.sizeApparent,
+            files: target.fileCount.load(ordering: .relaxed),
+            // Only the scan-wide directory count is tracked; a subtree's would be
+            // a fresh walk for one header number.
+            folders: whole ? dirCount : nil,
+            skipped: errorCount,
+            counting: countingMode,
+            scanDate: scanDate,
+            elapsed: elapsed,
+            // `extRows` is scanner-global — showing it under a zoom root would
+            // put the whole scan's types against a subtree's total. SPEC-14
+            // phase 1 adds the per-subtree rollup.
+            types: whole ? extRows : [])
+        return TreeDigest.briefing(root: target, snapshot: snapshot,
+                                   options: .init(maxNodes: maxNodes))
+    }
+
+    /// Puts `llmBriefing()` on the general pasteboard. Returns false when there
+    /// was nothing to copy, so the caller can stay silent instead of clearing the
+    /// user's clipboard for no reason.
+    @discardableResult
+    func copyLLMBriefing() -> Bool {
+        guard let text = llmBriefing() else { return false }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        return true
+    }
+
     /// Resolve a filesystem path back to its directory node by walking from the
     /// nearest seed. Used to re-bind navigation state after `invalidate` rebuilds
     /// a subtree's nodes as fresh objects (their identities change, paths don't).

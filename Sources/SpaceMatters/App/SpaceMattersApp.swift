@@ -30,6 +30,14 @@ enum Entry {
             let scope = idx + 2 < args.count ? args[idx + 2] : "full"
             exit(HeadlessScan.runVM(runtime: args[idx + 1], scope: scope))
         }
+        if let idx = args.firstIndex(of: "--briefing") {
+            guard idx + 1 < args.count else {
+                print("usage: SpaceMatters --briefing <path> [max-nodes]")
+                exit(2)
+            }
+            let nodes = idx + 2 < args.count ? Int(args[idx + 2]) ?? 300 : 300
+            exit(HeadlessScan.runBriefing(path: args[idx + 1], maxNodes: nodes))
+        }
         if let idx = args.firstIndex(of: "--scan") {
             exit(HeadlessScan.run(paths: Array(args[(idx + 1)...]))) // empty → usage, exit 2
         }
@@ -54,6 +62,11 @@ struct SpaceMattersApp: App {
             }
             CommandGroup(after: .appInfo) {
                 CheckForUpdatesCommand(updater: updater)
+            }
+            CommandGroup(after: .pasteboard) {
+                Button("Copy LLM Briefing") { app.copyBriefing() }
+                    .keyboardShortcut("c", modifiers: [.command, .shift])
+                    .disabled(!app.canCopyBriefing)
             }
         }
     }
