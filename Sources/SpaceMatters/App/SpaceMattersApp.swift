@@ -39,10 +39,11 @@ enum Entry {
             exit(MCPRelay.run(rootPath: root))
         }
         if let idx = args.firstIndex(of: "--tui") {
-            // Same default as --mcp, for the same reason.
+            // No path means the home menu — disks, machines, clusters and the
+            // cleanup pass, as the window's splash offers. A path skips
+            // straight to browsing it.
             let next = idx + 1 < args.count ? args[idx + 1] : nil
-            let root = (next?.hasPrefix("-") == false ? next : nil) ?? NSHomeDirectory()
-            exit(TUI.run(path: root))
+            exit(TUI.run(path: next?.hasPrefix("-") == false ? next : nil))
         }
         if let idx = args.firstIndex(of: "--briefing") {
             guard idx + 1 < args.count else {

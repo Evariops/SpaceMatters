@@ -4,7 +4,10 @@ import Foundation
 enum TerminalKey: Equatable {
     case up, down, left, right
     case pageUp, pageDown, home, end
-    case enter, backspace, escape
+    case enter, backspace, escape, tab
+    /// The `Delete` key (`fn⌫` on a Mac keyboard), bound to "move to Trash" —
+    /// `⌫` itself stays "go up one level", as it is in the window's outline.
+    case delete
     /// Ctrl-C / Ctrl-D: raw mode turns signal generation off, so they arrive
     /// as bytes and quit like `q` instead of leaving the terminal raw.
     case interrupt
@@ -151,10 +154,22 @@ enum Terminal {
                 keys.append(.backspace)
             case 0x03, 0x04:
                 keys.append(.interrupt)
+            case 0x09:
+                keys.append(.tab)
             case 0x20...0x7E:
                 keys.append(.char(Character(Unicode.Scalar(byte))))
+            case 0x80...0xFF:
+                // A typed `é` or `ü` arrives as several bytes: the text fields
+                // (search pattern, path to scan) must take them as one key.
+                var j = i
+                while j < bytes.count, bytes[j] >= 0x80 { j += 1 }
+                for character in String(decoding: bytes[i..<j], as: UTF8.self) where character != "\u{FFFD}" {
+                    keys.append(.char(character))
+                }
+                i = j
+                continue
             default:
-                break // other control bytes and non-ASCII: no binding uses them
+                break // other control bytes: no binding uses them
             }
             i += 1
         }
@@ -174,6 +189,7 @@ enum Terminal {
             let first = params.split(separator: UInt8(ascii: ";")).first.map { String(decoding: $0, as: UTF8.self) } ?? ""
             switch first {
             case "1", "7": return .home
+            case "3": return .delete
             case "4", "8": return .end
             case "5": return .pageUp
             case "6": return .pageDown

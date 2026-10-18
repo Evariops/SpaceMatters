@@ -52,13 +52,20 @@ The server scans once on the first call (`$HOME` by default, or pass a path) and
 
 ## In a terminal
 
-No window to open — over `ssh`, or just faster than launching an app — the same scan runs in a terminal:
+No window to open — over `ssh`, or just faster than launching an app — the whole app runs in a terminal:
 
 ```sh
-/Applications/SpaceMatters.app/Contents/MacOS/SpaceMatters --tui ~
+/Applications/SpaceMatters.app/Contents/MacOS/SpaceMatters --tui        # the menu
+/Applications/SpaceMatters.app/Contents/MacOS/SpaceMatters --tui ~      # straight to a folder
 ```
 
-The same engine and the same live fill as the window, as a sortable outline: size, share, file count and last write per folder, arrow keys to walk in and out, `t` for file types. It is read-only — deleting stays in the app's cleanup pass — and draws with plain terminal sequences, no extra dependency.
+With no path it opens the same menu the window's home screen shows: mounted disks, any path you type, Low-Hanging Fruits, Podman machines, the container engine, your `kubectl` contexts. Inside a scan it is the outline, filling in live: size, share, file count and last write per folder *and* per file, `s` to re-rank, `t` for file types, `i` for what a row actually is.
+
+`/` finds folders by name across the scan ("19 `node_modules`, 6.7 GiB between them"), `T` ranks the largest, `A` the ones nobody has written to in six months — the questions the MCP tools answer, without an assistant. `c` copies the briefing. `m` opens the action menu, which doubles as the key legend, and `?` shows the rest.
+
+**It deletes too.** `d` moves the selected row to the Trash, `D` deletes it for good, and the Low-Hanging Fruits screen empties the caches you tick — through the very same controllers, fences and `cleanup.jsonl` journal as the window, with a confirmation that names the size and the full path first. Nothing is removed mid-scan, nothing on a VM or SSH scan, and permanent deletion will not take `⏎` for an answer.
+
+No curses, no TUI framework: plain terminal sequences, same binary, no extra dependency.
 
 ## Download
 
