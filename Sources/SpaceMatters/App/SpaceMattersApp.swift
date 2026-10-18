@@ -38,6 +38,12 @@ enum Entry {
             let root = (next?.hasPrefix("-") == false ? next : nil) ?? NSHomeDirectory()
             exit(MCPRelay.run(rootPath: root))
         }
+        if let idx = args.firstIndex(of: "--tui") {
+            // Same default as --mcp, for the same reason.
+            let next = idx + 1 < args.count ? args[idx + 1] : nil
+            let root = (next?.hasPrefix("-") == false ? next : nil) ?? NSHomeDirectory()
+            exit(TUI.run(path: root))
+        }
         if let idx = args.firstIndex(of: "--briefing") {
             guard idx + 1 < args.count else {
                 print("usage: SpaceMatters --briefing <path> [max-nodes]")

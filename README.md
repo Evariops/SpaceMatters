@@ -50,6 +50,16 @@ The session gets `overview`, `tree`, `top`, `types`, `find`, `aged`, `explain` a
 
 The server scans once on the first call (`$HOME` by default, or pass a path) and answers from memory after that. **It cannot delete anything** — no such tool exists. Its output is a plan; the cleanup pass in the app is what acts on it, fenced and journalled. Anything it could not read, it says so rather than quietly under-reporting.
 
+## In a terminal
+
+No window to open — over `ssh`, or just faster than launching an app — the same scan runs in a terminal:
+
+```sh
+/Applications/SpaceMatters.app/Contents/MacOS/SpaceMatters --tui ~
+```
+
+The same engine and the same live fill as the window, as a sortable outline: size, share, file count and last write per folder, arrow keys to walk in and out, `t` for file types. It is read-only — deleting stays in the app's cleanup pass — and draws with plain terminal sequences, no extra dependency.
+
 ## Download
 
 Grab the latest `.dmg` from the [Releases page](../../releases/latest), open it, and drag SpaceMatters into Applications.
