@@ -30,6 +30,12 @@ enum Format {
         countFormatter.string(from: NSNumber(value: value)) ?? "\(value)"
     }
 
+    /// A count with its noun, pluralised: "1 file", "1,204 files". Cheap, and
+    /// it keeps "1 files here" out of an interface that is otherwise careful.
+    static func plural(_ count: Int64, _ singular: String, _ plural: String? = nil) -> String {
+        "\(self.count(count)) " + (count == 1 ? singular : (plural ?? singular + "s"))
+    }
+
     /// Coarse relative age ("3w ago", "5mo ago").
     ///
     /// Coarse on purpose: it exists to separate a build from yesterday from one

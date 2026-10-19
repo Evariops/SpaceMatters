@@ -15,7 +15,7 @@ enum TerminalKey: Equatable {
 }
 
 /// Raw-mode terminal I/O for `--tui` (SPEC-15): termios, the alternate screen,
-/// the window size, and the byte → key decoder.
+/// the window size, signals, and the byte → key decoder.
 ///
 /// Plain VT/ANSI sequences — every terminal macOS ships or people install
 /// speaks them — so no curses and no dependency, in the spirit of the
@@ -28,34 +28,62 @@ enum Terminal {
 
     /// Switch to raw mode and the alternate screen. `false` when the terminal
     /// refused, in which case nothing was changed.
+    ///
+    /// Handlers are installed *before* raw mode: a crash or a `kill` in the
+    /// window between the two would otherwise leave the shell raw with no one
+    /// left to restore it.
     static func enter() -> Bool {
-        guard tcgetattr(STDIN_FILENO, &savedTermios) == 0 else { return false }
-        var raw = savedTermios
-        raw.c_lflag &= ~tcflag_t(ECHO | ICANON | ISIG | IEXTEN)
-        raw.c_iflag &= ~tcflag_t(IXON | ICRNL)
-        guard tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == 0 else { return false }
-        sessionActive = true
-        // Being killed or losing the terminal must not leave the shell raw and
-        // on the alternate screen.
-        signal(SIGTERM, restoreAndExit)
-        signal(SIGHUP, restoreAndExit)
-        // Alternate screen, cursor hidden, autowrap off — the last is a safety
-        // net: a line misjudged one cell too wide is clipped instead of
-        // wrapping and shearing every line below it.
-        output("\u{1B}[?1049h\u{1B}[?25l\u{1B}[?7l\u{1B}[2J")
-        return true
+        installHandlers()
+        return withSignalsBlocked {
+            guard tcgetattr(STDIN_FILENO, savedTermios) == 0 else { return false }
+            var raw = savedTermios.pointee
+            raw.c_lflag &= ~tcflag_t(ECHO | ICANON | ISIG | IEXTEN)
+            raw.c_iflag &= ~tcflag_t(IXON | ICRNL)
+            // Read returns as soon as one byte is there and never blocks on a
+            // timer of its own — `poll` is what decides how long to wait.
+            withUnsafeMutableBytes(of: &raw.c_cc) { cc in
+                cc[Int(VMIN)] = 1
+                cc[Int(VTIME)] = 0
+            }
+            guard tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == 0 else { return false }
+            sessionFlag.pointee = 1
+            // Alternate screen, cursor hidden, autowrap off — the last is a
+            // safety net: a line misjudged one cell too wide is clipped instead
+            // of wrapping and shearing every line below it.
+            output("\u{1B}[?1049h\u{1B}[?25l\u{1B}[?7l\u{1B}[2J")
+            return true
+        }
     }
 
     /// Undo `enter()`. Idempotent, and async-signal-safe — it is also what the
-    /// signal handler runs, so it only calls `write` and `tcsetattr`.
+    /// signal handlers run, so it only calls `write` and `tcsetattr`, and it
+    /// reaches its state through raw pointers rather than Swift accessors
+    /// (which are subject to exclusivity checks a signal can trap on).
     static func leave() {
-        guard sessionActive else { return }
-        sessionActive = false
-        let restore: StaticString = "\u{1B}[0m\u{1B}[?7h\u{1B}[?25h\u{1B}[?1049l"
-        restore.withUTF8Buffer { buffer in
-            _ = write(STDOUT_FILENO, buffer.baseAddress, buffer.count)
-        }
-        _ = tcsetattr(STDIN_FILENO, TCSAFLUSH, &savedTermios)
+        withSignalsBlocked { restoreTerminal() }
+    }
+
+    /// True while the alternate screen is up.
+    static var isActive: Bool { sessionFlag.pointee != 0 }
+
+    /// Ctrl-Z (or `kill -TSTP`) gave the terminal back and suspended us; `fg`
+    /// woke us up. Re-enter raw mode and tell the caller to repaint from
+    /// scratch — the shell has been drawing over our screen meanwhile.
+    ///
+    /// Returns `true` when a resume actually happened.
+    static func resumeIfNeeded() -> Bool {
+        guard resumeFlag.pointee != 0 else { return false }
+        resumeFlag.pointee = 0
+        installHandlers() // SIGTSTP was reset to the default to suspend for real
+        _ = enter()
+        return true
+    }
+
+    /// The window was resized since the last call (SIGWINCH).
+    static func takeResize() -> Bool {
+        guard resizeFlag.pointee != 0 else { return false }
+        resizeFlag.pointee = 0
+        return true
     }
 
     // MARK: Output
@@ -74,21 +102,48 @@ enum Terminal {
 
     /// Repaint only the lines that changed since `previous` — at ten frames a
     /// second most of the screen is identical, and rewriting it would flicker.
-    static func draw(_ frame: [String], over previous: [String]) {
+    ///
+    /// `false` when a write was lost, so the caller can repaint from scratch
+    /// rather than believe a half-written frame is on screen.
+    @discardableResult
+    static func draw(_ frame: [String], over previous: [String], width: Int, cursorRow: Int?) -> Bool {
+        let text = diff(frame, over: previous, width: width, cursorRow: cursorRow)
+        return text.isEmpty ? true : output(text)
+    }
+
+    /// The escape sequence that turns `previous` into `frame`. Pure, so what
+    /// goes on the wire is a value a test can read.
+    ///
+    /// A line that fills the terminal gets no `ESC[K`: with autowrap off the
+    /// cursor stays *on* the last column after writing it, and erase-to-end
+    /// would wipe the cell just drawn.
+    static func diff(_ frame: [String], over previous: [String], width: Int, cursorRow: Int?) -> String {
         var out = ""
         for (index, line) in frame.enumerated() where index >= previous.count || previous[index] != line {
-            out += "\u{1B}[\(index + 1);1H\u{1B}[0m" + line + "\u{1B}[0m\u{1B}[K"
+            out += "\u{1B}[\(index + 1);1H\u{1B}[0m" + line + "\u{1B}[0m"
+            if TextCell.displayWidth(line) < width { out += "\u{1B}[K" }
         }
         if previous.count > frame.count {
             for index in frame.count..<previous.count { out += "\u{1B}[\(index + 1);1H\u{1B}[K" }
         }
-        if !out.isEmpty { output(out) }
+        // Park the cursor on the selected row even though it is hidden: screen
+        // readers and Zoom follow the cursor, and a cursor left wherever the
+        // last write ended follows nothing.
+        if !out.isEmpty, let cursorRow, cursorRow >= 0 {
+            out += "\u{1B}[\(cursorRow + 1);1H"
+        }
+        return out
     }
 
-    static func output(_ text: String) {
+    /// Write everything or report failure. `EAGAIN` is retried through `poll`:
+    /// stdin and stdout normally share one file description, so the
+    /// non-blocking flag a shell left on stdin applies here too, and dropping
+    /// the rest of a frame would leave stale lines the caller thinks are fresh.
+    @discardableResult
+    static func output(_ text: String) -> Bool {
         var text = text
-        text.withUTF8 { buffer in
-            guard let base = buffer.baseAddress else { return }
+        return text.withUTF8 { buffer in
+            guard let base = buffer.baseAddress else { return true }
             var offset = 0
             while offset < buffer.count {
                 let n = write(STDOUT_FILENO, base + offset, buffer.count - offset)
@@ -96,19 +151,63 @@ enum Terminal {
                     offset += n
                 } else if n < 0 && errno == EINTR {
                     continue
+                } else if n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    var fds = pollfd(fd: STDOUT_FILENO, events: Int16(POLLOUT), revents: 0)
+                    if poll(&fds, 1, writeTimeoutMilliseconds) <= 0 { return false }
                 } else {
-                    return
+                    return false
                 }
             }
+            return true
         }
     }
 
+    private static let writeTimeoutMilliseconds: Int32 = 250
+
     // MARK: Input
+
+    /// Bytes of an escape sequence split across reads. Touched only by the
+    /// frame loop's thread.
+    private nonisolated(unsafe) static var pending: [UInt8] = []
 
     /// Wait up to `timeout` milliseconds for keys. `[]` on timeout; `nil` once
     /// input is gone (terminal closed) — the caller must stop rather than spin
     /// on a descriptor that is readable forever.
     static func readKeys(timeout: Int32) -> [TerminalKey]? {
+        guard let bytes = read(timeout: timeout) else { return nil }
+        guard !bytes.isEmpty || !pending.isEmpty else { return [] }
+
+        var result = decode(pending + bytes)
+        pending = result.remainder
+        // An unfinished sequence is held back rather than misread as `Esc` plus
+        // its letters. Give the rest of it one short window to arrive — long
+        // enough for a terminal's own bytes, short enough that a bare Esc
+        // still feels instant.
+        if !pending.isEmpty {
+            if let more = read(timeout: continuationMilliseconds), !more.isEmpty {
+                let second = decode(pending + more)
+                result.keys += second.keys
+                pending = second.remainder
+            }
+            if !pending.isEmpty {
+                // Nothing came: it really was a lone Esc (or junk).
+                result.keys += flushPending()
+            }
+        }
+        return result.keys
+    }
+
+    /// How long an incomplete escape sequence waits for its continuation.
+    private static let continuationMilliseconds: Int32 = 25
+
+    private static func flushPending() -> [TerminalKey] {
+        let keys: [TerminalKey] = pending.first == 0x1B ? [.escape] : []
+        pending = []
+        return keys
+    }
+
+    /// One `poll` + `read`. `nil` when input is gone, `[]` on timeout.
+    private static func read(timeout: Int32) -> [UInt8]? {
         var fds = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)
         let ready = poll(&fds, 1, timeout)
         if ready < 0 { return errno == EINTR ? [] : nil }
@@ -116,38 +215,44 @@ enum Terminal {
         guard fds.revents & Int16(POLLIN) != 0 else { return nil } // POLLHUP / POLLERR / POLLNVAL
         var buffer = [UInt8](repeating: 0, count: 64)
         let capacity = buffer.count
-        let n = read(STDIN_FILENO, &buffer, capacity)
+        let n = Darwin.read(STDIN_FILENO, &buffer, capacity)
         if n < 0 { return errno == EINTR || errno == EAGAIN ? [] : nil }
         guard n > 0 else { return nil }
-        return decode(Array(buffer[0..<n]))
+        return Array(buffer[0..<n])
     }
 
-    /// Bytes → keys. Pure, so the escape-sequence grammar is testable.
+    /// Bytes → keys, plus whatever tail could not be decoded yet. Pure, so the
+    /// escape-sequence grammar is testable.
     ///
     /// Arrows arrive as CSI (`ESC [ A`) or SS3 (`ESC O A`) depending on the
     /// terminal's cursor-key mode; modifiers ride as parameters (`ESC [ 1 ; 5 A`
-    /// is Ctrl-↑) and are ignored. A sequence cut off by the read is dropped,
-    /// never misread as keystrokes.
-    static func decode(_ bytes: [UInt8]) -> [TerminalKey] {
+    /// is Ctrl-↑) and are ignored. A sequence cut off by the read is returned
+    /// as `remainder` for the next read to complete — never misread as
+    /// keystrokes.
+    static func decode(_ bytes: [UInt8]) -> (keys: [TerminalKey], remainder: [UInt8]) {
         var keys: [TerminalKey] = []
         var i = 0
         while i < bytes.count {
             let byte = bytes[i]
             switch byte {
             case 0x1B:
-                if i + 2 < bytes.count, bytes[i + 1] == 0x5B || bytes[i + 1] == 0x4F {
+                guard i + 1 < bytes.count else { return (keys, Array(bytes[i...])) }
+                if bytes[i + 1] == 0x5B || bytes[i + 1] == 0x4F {
                     var j = i + 2
                     var params: [UInt8] = []
                     while j < bytes.count, (0x30...0x3F).contains(bytes[j]) {
                         params.append(bytes[j])
                         j += 1
                     }
-                    guard j < bytes.count else { return keys }
+                    guard j < bytes.count else { return (keys, Array(bytes[i...])) }
                     if let key = sequenceKey(final: bytes[j], params: params) { keys.append(key) }
                     i = j + 1
                     continue
                 }
-                keys.append(.escape)
+                // ESC + key is Meta/Alt. Nothing is bound to it, and emitting a
+                // bare Esc here would make Alt-q quit the browser.
+                i += 2
+                continue
             case 0x0D, 0x0A:
                 keys.append(.enter)
             case 0x7F, 0x08:
@@ -163,6 +268,11 @@ enum Terminal {
                 // (search pattern, path to scan) must take them as one key.
                 var j = i
                 while j < bytes.count, bytes[j] >= 0x80 { j += 1 }
+                // A UTF-8 character split across reads waits for its tail.
+                if j == bytes.count, let last = bytes.last, last >= 0xC0 || bytes.count - i < 4 {
+                    let text = String(decoding: bytes[i..<j], as: UTF8.self)
+                    if text.unicodeScalars.contains("\u{FFFD}") { return (keys, Array(bytes[i...])) }
+                }
                 for character in String(decoding: bytes[i..<j], as: UTF8.self) where character != "\u{FFFD}" {
                     keys.append(.char(character))
                 }
@@ -173,7 +283,7 @@ enum Terminal {
             }
             i += 1
         }
-        return keys
+        return (keys, [])
     }
 
     private static func sequenceKey(final: UInt8, params: [UInt8]) -> TerminalKey? {
@@ -199,14 +309,99 @@ enum Terminal {
             return nil
         }
     }
+
+    // MARK: Signals
+
+    /// Signals that must not leave the terminal raw: the ones a user or a
+    /// supervisor sends, and the ones a crash raises. `SIGKILL`/`SIGSTOP`
+    /// cannot be caught — a `kill -9` is the one case the shell's own `reset`
+    /// is the answer to.
+    private static let fatalSignals: [Int32] = [
+        SIGINT, SIGQUIT, SIGTERM, SIGHUP, SIGPIPE,
+        SIGILL, SIGTRAP, SIGABRT, SIGFPE, SIGBUS, SIGSEGV, SIGSYS,
+    ]
+
+    private static func installHandlers() {
+        for signal in fatalSignals {
+            install(signal, handler: fatalSignalHandler, restart: true)
+        }
+        install(SIGTSTP, handler: stopSignalHandler, restart: true)
+        install(SIGCONT, handler: continueSignalHandler, restart: true)
+        // Deliberately without SA_RESTART: the frame loop's `poll` must come
+        // back on a resize so the next frame is drawn at the new size.
+        install(SIGWINCH, handler: windowSignalHandler, restart: false)
+    }
+
+    private static func install(_ signal: Int32,
+                                handler: @escaping @convention(c) (Int32) -> Void,
+                                restart: Bool) {
+        var action = sigaction()
+        action.__sigaction_u.__sa_handler = handler
+        sigemptyset(&action.sa_mask)
+        action.sa_flags = restart ? Int32(SA_RESTART) : 0
+        sigaction(signal, &action, nil)
+    }
+
+    /// Run `body` with the handled signals blocked on this thread — the window
+    /// where the termios state is half-written is the one a handler must not
+    /// land in. (Only this thread: an asynchronous signal can still be
+    /// delivered to another one, which is why the handler is written to be
+    /// safe on its own.)
+    private static func withSignalsBlocked<T>(_ body: () -> T) -> T {
+        var mask = sigset_t()
+        sigemptyset(&mask)
+        for signal in fatalSignals + [SIGTSTP, SIGCONT, SIGWINCH] { sigaddset(&mask, signal) }
+        var previous = sigset_t()
+        pthread_sigmask(SIG_BLOCK, &mask, &previous)
+        defer { pthread_sigmask(SIG_SETMASK, &previous, nil) }
+        return body()
+    }
 }
 
-// Process-wide, outside the enum, because a C signal handler can capture
-// nothing: the terminal state to restore has to live at a fixed address.
-private var savedTermios = termios()
-private var sessionActive = false
+// Process-wide raw storage, outside the enum: a C signal handler can capture
+// nothing, and reading a Swift `var` from one risks a dynamic exclusivity trap
+// if the main thread happens to be in its accessor. Pointers are written and
+// read directly, which is what makes the handler honest about being
+// async-signal-safe.
+private let savedTermios = UnsafeMutablePointer<termios>.allocate(capacity: 1)
+private let sessionFlag = UnsafeMutablePointer<sig_atomic_t>.allocate(capacity: 1)
+private let resumeFlag = UnsafeMutablePointer<sig_atomic_t>.allocate(capacity: 1)
+private let resizeFlag = UnsafeMutablePointer<sig_atomic_t>.allocate(capacity: 1)
 
-private func restoreAndExit(_ signal: Int32) {
-    Terminal.leave()
-    _exit(128 + signal)
+/// Give the terminal back. `write` and `tcsetattr` are async-signal-safe; the
+/// flag is cleared *after* the restore, so a second signal landing mid-restore
+/// repeats it instead of skipping it.
+private func restoreTerminal() {
+    guard sessionFlag.pointee != 0 else { return }
+    let restore: StaticString = "\u{1B}[0m\u{1B}[?7h\u{1B}[?25h\u{1B}[?1049l"
+    restore.withUTF8Buffer { buffer in
+        _ = write(STDOUT_FILENO, buffer.baseAddress, buffer.count)
+    }
+    _ = tcsetattr(STDIN_FILENO, TCSAFLUSH, savedTermios)
+    sessionFlag.pointee = 0
+}
+
+/// Restore, then die of what actually killed us: re-raising with the default
+/// disposition reports a death by signal, where `_exit(128 + signal)` would
+/// claim a normal exit with a funny status and suppress the core dump.
+private func fatalSignalHandler(_ signal: Int32) {
+    restoreTerminal()
+    Darwin.signal(signal, SIG_DFL)
+    raise(signal)
+}
+
+/// Ctrl-Z / `kill -TSTP`: hand the terminal back cooked, then suspend for
+/// real, so the shell prompt behaves and `fg` can bring us back.
+private func stopSignalHandler(_ signal: Int32) {
+    restoreTerminal()
+    Darwin.signal(SIGTSTP, SIG_DFL)
+    raise(SIGTSTP)
+}
+
+private func continueSignalHandler(_ signal: Int32) {
+    resumeFlag.pointee = 1
+}
+
+private func windowSignalHandler(_ signal: Int32) {
+    resizeFlag.pointee = 1
 }

@@ -65,7 +65,7 @@ With no path it opens the same menu the window's home screen shows: mounted disk
 
 **It deletes too.** `d` moves the selected row to the Trash, `D` deletes it for good, and the Low-Hanging Fruits screen empties the caches you tick — through the very same controllers, fences and `cleanup.jsonl` journal as the window, with a confirmation that names the size and the full path first. Nothing is removed mid-scan, nothing on a VM or SSH scan, and permanent deletion will not take `⏎` for an answer.
 
-No curses, no TUI framework: plain terminal sequences, same binary, no extra dependency.
+No curses, no TUI framework: plain terminal sequences, same binary, no extra dependency. Ctrl-Z and `fg` work, the terminal comes back cooked whatever kills the process, and `SPACEMATTERS_TUI_ASCII=1` swaps the box drawing and bars for ASCII if your terminal draws ambiguous-width characters wide.
 
 ## Download
 

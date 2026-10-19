@@ -34,7 +34,7 @@ import Foundation
 
     private func names(_ rows: [TUIBrowser.Row]) -> [String] {
         rows.map { row -> String in
-            switch row {
+            switch row.kind {
             case .folder(let node): return node.name
             case .file(let file): return file.name
             case .ownFiles: return "[files]"
@@ -79,29 +79,45 @@ import Foundation
 
     // MARK: Keys
 
+    private func keys(_ text: String) -> [TerminalKey] { Terminal.decode(Array(text.utf8)).keys }
+
     @Test func decodesArrowsInBothCursorModes() {
-        #expect(Terminal.decode(Array("\u{1B}[A\u{1B}[B\u{1B}[C\u{1B}[D".utf8)) == [.up, .down, .right, .left])
-        #expect(Terminal.decode(Array("\u{1B}OA\u{1B}OB".utf8)) == [.up, .down])
+        #expect(keys("\u{1B}[A\u{1B}[B\u{1B}[C\u{1B}[D") == [.up, .down, .right, .left])
+        #expect(keys("\u{1B}OA\u{1B}OB") == [.up, .down])
     }
 
     @Test func decodesTildeKeysAndIgnoresModifiers() {
-        #expect(Terminal.decode(Array("\u{1B}[5~\u{1B}[6~\u{1B}[1~\u{1B}[4~".utf8)) == [.pageUp, .pageDown, .home, .end])
-        #expect(Terminal.decode(Array("\u{1B}[1;5A".utf8)) == [.up])
+        #expect(keys("\u{1B}[5~\u{1B}[6~\u{1B}[1~\u{1B}[4~") == [.pageUp, .pageDown, .home, .end])
+        #expect(keys("\u{1B}[1;5A") == [.up])
         // `fn⌫` — bound to "move to Trash", so it must decode, not vanish.
-        #expect(Terminal.decode(Array("\u{1B}[3~".utf8)) == [.delete])
+        #expect(keys("\u{1B}[3~") == [.delete])
     }
 
     @Test func decodesPlainBytesAndTypedText() {
-        #expect(Terminal.decode([0x71, 0x0D, 0x7F, 0x03]) == [.char("q"), .enter, .backspace, .interrupt])
-        #expect(Terminal.decode([0x1B]) == [.escape])
-        #expect(Terminal.decode([0x09]) == [.tab])
+        #expect(Terminal.decode([0x71, 0x0D, 0x7F, 0x03]).keys == [.char("q"), .enter, .backspace, .interrupt])
+        #expect(Terminal.decode([0x09]).keys == [.tab])
         // A path or a search pattern can hold anything a keyboard produces.
-        #expect(Terminal.decode(Array("é€".utf8)) == [.char("é"), .char("€")])
+        #expect(keys("é€") == [.char("é"), .char("€")])
     }
 
-    @Test func truncatedSequenceIsDroppedNotMisread() {
-        // `ESC [ 1 ;` cut by the read must not come out as `[`, `1`, `;` keystrokes.
-        #expect(Terminal.decode(Array("j\u{1B}[1;".utf8)) == [.char("j")])
+    @Test func aCutSequenceIsCarriedOverNotMisread() {
+        // `ESC [ 1 ;` cut by the read must not come out as `[`, `1`, `;`
+        // keystrokes — it is handed back to be finished by the next read.
+        let first = Terminal.decode(Array("j\u{1B}[1;".utf8))
+        #expect(first.keys == [.char("j")])
+        #expect(first.remainder == Array("\u{1B}[1;".utf8))
+        #expect(Terminal.decode(first.remainder + Array("5A".utf8)).keys == [.up])
+        // A lone ESC at the end of a read is held back too: it is only an
+        // `Esc` once nothing follows it.
+        #expect(Terminal.decode([0x1B]).keys.isEmpty)
+        #expect(Terminal.decode([0x1B]).remainder == [0x1B])
+    }
+
+    @Test func metaKeysAreNotReadAsEscape() {
+        // Option-as-Meta sends `ESC q`. Decoding that as Esc + q would quit the
+        // browser on a key nobody pressed.
+        #expect(keys("\u{1B}q").isEmpty)
+        #expect(keys("\u{1B}qj") == [.char("j")])
     }
 
     // MARK: Rows & navigation
@@ -118,7 +134,7 @@ import Foundation
         browser.refreshListing()
         // 3 own files, 2 of them listed: the rest stays visible as a remainder.
         #expect(names(browser.rows()) == ["big", "a.bin", "small", "b.bin", "[more]"])
-        #expect(browser.rows().last == .moreFiles(count: 1, bytes: 0))
+        #expect(browser.rows().last?.kind == .moreFiles(count: 1))
         // Nothing listed (a VM scan, or a listing still on its way): one aggregate.
         var plainBrowser = TUIBrowser(root: fixture(), rootPath: "/scan")
         plainBrowser.refreshListing()
@@ -456,7 +472,9 @@ import Foundation
         let openings: [[TerminalKey]] = [[], [.char("t")], [.char("?")], [.char("m")],
                                          [.char("d")], [.char("D")], [.char("/")], [.char("i")],
                                          [.char("T")], [.char("A")]]
-        for width in [1, 12, 23, 30, 49, 63, 80, 140] {
+        // The thresholds where a column appears (50 bar, 64 written, 76 files)
+        // and the cells on either side of each, where an off-by-one shows.
+        for width in [1, 12, 23, 24, 30, 49, 50, 51, 63, 64, 65, 75, 76, 77, 80, 140] {
             for height in [1, 3, 4, 8, 30] {
                 for keys in openings {
                     let root = fixture()
@@ -489,7 +507,7 @@ import Foundation
                           nativeLabel: "pnpm store prune", regenerable: true,
                           size: .sized(3 << 30), selected: true)])
         host.table = sampleTable()
-        for width in [1, 20, 40, 80, 140] {
+        for width in [1, 20, 40, 49, 50, 63, 64, 76, 80, 140] {
             for height in [1, 5, 24] {
                 let cleanup = TUIApp(host: host)
                 cleanup.start(.cleanup)
@@ -576,6 +594,143 @@ import Foundation
         #expect(text(app.render(width: 100, height: 8)).contains("Moving node_modules…"))
     }
 
+    // MARK: Output contract
+
+    @Test func aFullWidthLineGetsNoEraseToEndOfLine() {
+        // With autowrap off the cursor stays *on* the last column, so ESC[K
+        // after a full-width line would erase the cell just drawn.
+        let full = String(repeating: "x", count: 10)
+        #expect(!Terminal.diff([full], over: [], width: 10, cursorRow: nil).contains("\u{1B}[K"))
+        #expect(Terminal.diff(["xx"], over: [], width: 10, cursorRow: nil).contains("\u{1B}[K"))
+        // Styles do not count towards the width.
+        let styled = "\u{1B}[7m" + full + "\u{1B}[0m"
+        #expect(!Terminal.diff([styled], over: [], width: 10, cursorRow: nil).contains("\u{1B}[K"))
+    }
+
+    @Test func onlyChangedLinesAreWrittenAndTheCursorIsParked() {
+        let before = ["a", "b", "c"]
+        let after = ["a", "B", "c"]
+        let out = Terminal.diff(after, over: before, width: 40, cursorRow: 1)
+        #expect(out.contains("\u{1B}[2;1H"))     // line 2 repainted
+        #expect(!out.contains("\u{1B}[1;1H"))    // line 1 untouched
+        #expect(out.hasSuffix("\u{1B}[2;1H"))    // cursor parked on the selected row
+        #expect(Terminal.diff(before, over: before, width: 40, cursorRow: 0).isEmpty)
+        // A shorter frame erases the lines it no longer covers.
+        #expect(Terminal.diff(["a"], over: before, width: 40, cursorRow: nil).contains("\u{1B}[3;1H\u{1B}[K"))
+    }
+
+    @Test func theLoopStopsRedrawingOnATimerWhenNothingMoves() {
+        var status = TUIStatus()
+        status.phase = .scanning
+        #expect(TUI.tick(for: status) == TUI.liveTickMilliseconds)
+        status.phase = .ready
+        #expect(TUI.tick(for: status) == TUI.idleTickMilliseconds)
+        status.busy = "Moving node_modules…"
+        #expect(TUI.tick(for: status) == TUI.liveTickMilliseconds)
+    }
+
+    @Test func asciiModeKeepsEveryWidthItReplaces() {
+        // The swap must be cell-for-cell: a frame measured before it still
+        // fits after it.
+        for line in ["  12.4 GiB   48.2%  ████▊  Library/", "↑↓ move   → open   ← up   · ⏎ ⌫ …",
+                     "┌─ Keys ─┐", "│ x │"] {
+            #expect(TextCell.width(Glyphs.asciify(line)) == TextCell.width(line), "\(line)")
+        }
+        // Names are data, not chrome: they are left alone.
+        #expect(Glyphs.asciify("日本語-café-📦.txt") == "日本語-café-📦.txt")
+    }
+
+    // MARK: Golden frames
+
+    @Test func rowsAreDrawnExactlyAsSpecified() {
+        // Written out by hand rather than measured with the same function that
+        // built them: `TextCell.width` sizing its own output proves internal
+        // consistency, not what a terminal draws.
+        let root = FSNode(name: "root", parent: nil)
+        let docs = leaf("docs", in: root, bytes: 1000, files: 2)
+        root.finishScan(children: [docs], filesLogical: 0, filesPhysical: 0, fileCount: 2)
+        root.aggPhysical.store(1000, ordering: .relaxed)
+        var browser = TUIBrowser(root: root, rootPath: "/scan")
+
+        // 40 cells: size (10) + 2 + share (6) + 2 + name. No bar (< 50), no
+        // written column (< 64), no files column (< 76). The selected row is
+        // padded to the full width — that is what the highlight fills.
+        let narrow = browser.body(width: 40, height: 3, types: []).map(plain)
+        #expect(narrow[0] == "   on disk       %  name")
+        #expect(narrow[1] == "    1000 B  100.0%  docs/" + String(repeating: " ", count: 15))
+        #expect(narrow[1].count == 40)
+
+        // 80 cells: every column is in — 10 + 2 + 6 + 2 + 10 (bar) + 2 + 11
+        // (files) + 2 + 8 (written) + 2 + name = 59 before the padding.
+        // `written` reads "—": the fixture carries no mtime, and 0 means
+        // unknown, never 1970.
+        let wide = browser.body(width: 80, height: 3, types: []).map(plain)
+        #expect(wide[0] == "   on disk       %                    files   written  name")
+        #expect(wide[1].hasPrefix("    1000 B  100.0%  ██████████            2         —  docs/"))
+        #expect(TextCell.width(wide[1]) == 80)
+    }
+
+    @Test func wideAndCombiningNamesAreCutAtTheCellTheyFill() {
+        #expect(TextCell.fit("日本語のフォルダ", 8) == "日本語…")        // 3×2 + 1 = 7 cells
+        #expect(TextCell.fit("café\u{301}", 4) == "café\u{301}")        // combining mark: no cell
+        #expect(TextCell.fit("📦📦📦", 5) == "📦📦…")                   // 2 + 2 + 1 = 5
+        #expect(TextCell.displayWidth("\u{1B}[7mabc\u{1B}[0m") == 3)
+        #expect(TextCell.displayWidth("\u{1B}[38;5;9m日本\u{1B}[0m") == 4)
+    }
+
+    // MARK: Unreadable folders
+
+    @Test func anUnreadableFolderIsNotReportedAsEmpty() {
+        let root = FSNode(name: "root", parent: nil)
+        let locked = FSNode(name: "locked", parent: root)
+        locked.markUnreadable()
+        locked.finishScan(children: [], filesLogical: 0, filesPhysical: 0, fileCount: 0)
+        root.finishScan(children: [locked], filesLogical: 0, filesPhysical: 0, fileCount: 0)
+
+        let host = FakeHost()
+        host.skipped = 1
+        let (app, _) = browse(root, host: host)
+        let frame = text(app.render(width: 110, height: 10))
+        #expect(frame.contains("locked/  (unreadable)"))
+        // …and the header says what that does to every total above it.
+        #expect(frame.contains("lower bound"))
+
+        // Inside it, "no files" would be a lie.
+        press(app, [.enter])
+        let inside = text(app.render(width: 110, height: 10))
+        #expect(inside.contains("unreadable — permission denied"))
+        #expect(inside.contains("Full Disk Access"))
+        #expect(!inside.contains("(no files)"))
+    }
+
+    @Test func theSelectionIsPinnedBeforeTheFirstKeyPress() {
+        let root = fixture()
+        let host = FakeHost()
+        host.phase = .scanning
+        let (app, _) = browse(root, host: host)
+        // First frame: the highlight lands on the biggest row, `big`.
+        #expect(selectedName(app.render(width: 100, height: 12))?.hasSuffix("big/") == true)
+        // The scan then grows `small` past it. Without a pinned selection the
+        // highlight would follow "whatever is first now" — under the cursor.
+        let small = root.children.first { $0.name == "small" }!
+        small.aggPhysical.store(99_999, ordering: .relaxed)
+        app.refresh()
+        #expect(selectedName(app.render(width: 100, height: 12))?.hasSuffix("big/") == true)
+    }
+
+    @Test func oneFileIsNotOneFiles() {
+        let root = FSNode(name: "root", parent: nil)
+        root.finishScan(children: [], filesLogical: 10, filesPhysical: 10, fileCount: 1)
+        root.aggPhysical.store(10, ordering: .relaxed)
+        root.fileCount.store(1, ordering: .relaxed)
+        let host = FakeHost()
+        let (app, _) = browse(root, host: host)
+        let frame = text(app.render(width: 110, height: 8))
+        #expect(frame.contains("[1 file here]"))
+        #expect(!frame.contains("1 files"))
+        #expect(!frame.contains("1 folders"))
+    }
+
     // MARK: Text cells
 
     @Test func cellWidths() {
@@ -618,6 +773,7 @@ final class FakeHost: TUIHost {
     var tree: FSNode?
     var phase: TUIStatus.Phase = .ready
     var isHostScan = true
+    var skipped: Int64 = 0
     var busy: String?
     var files: [TUIFile] = []
     var sources = TUISources(loaded: true)
@@ -642,6 +798,8 @@ final class FakeHost: TUIHost {
         status.rootPath = "/scan"
         status.onDisk = tree?.sizeOnDisk ?? 0
         status.files = tree?.fileCount.load(ordering: .relaxed) ?? 0
+        status.folders = 1
+        status.skipped = skipped
         status.isHostScan = isHostScan
         status.canDelete = isHostScan && phase != .scanning && busy == nil
         status.busy = busy

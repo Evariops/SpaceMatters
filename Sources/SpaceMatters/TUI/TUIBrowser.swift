@@ -14,12 +14,34 @@ struct TUIBrowser {
     /// One line of the listing: a sub-folder, one of the folder's own files, or
     /// the files rolled into a single row — the aggregate the tree keeps while
     /// a listing is still on its way (files are never nodes, see `FSNode`).
-    enum Row: Equatable {
-        case folder(FSNode)
-        case file(TUIFile)
-        case ownFiles(count: Int64, bytes: Int64)
-        /// The listing is capped per folder; this is what it did not show.
-        case moreFiles(count: Int64, bytes: Int64)
+    ///
+    /// Every number it shows is **sampled once**, when the row is built. The
+    /// tree's atomics keep moving under a live scan: a row that re-read them
+    /// at draw time could be ranked by one size and printed with another, and
+    /// a share computed against a total read a moment later can exceed 100 %.
+    struct Row: Equatable {
+        enum Kind: Equatable {
+            case folder(FSNode)
+            case file(TUIFile)
+            case ownFiles(count: Int64)
+            /// The listing is capped per folder; this is what it did not show.
+            case moreFiles(count: Int64)
+        }
+
+        let kind: Kind
+        let bytes: Int64
+        let files: Int64
+        /// Unix seconds; 0 means unknown, never 1970.
+        let written: Int64
+        /// Raw name, for sorting. Sanitised only on the way to the screen.
+        let name: String
+        var isScanned = true
+        /// The folder could not be opened — it is not empty, it is closed.
+        var isUnreadable = false
+
+        static func == (lhs: Row, rhs: Row) -> Bool {
+            lhs.kind == rhs.kind && lhs.bytes == rhs.bytes && lhs.files == rhs.files
+        }
     }
 
     /// How rows are ranked. Size first, as everywhere in the app — the others
@@ -67,6 +89,8 @@ struct TUIBrowser {
     var filesProvider: (FSNode) -> [TUIFile] = { _ in [] }
 
     private var selection: Selection?
+    /// The rows of the last frame drawn — what the next key resolves against.
+    private var displayed: [Row] = []
     private var scrollTop = 0
     private var typesScroll = 0
     /// Rows the last frame had room for — what a page key moves by.
@@ -88,13 +112,19 @@ struct TUIBrowser {
 
     /// What an action (delete, reveal, info) applies to right now.
     var target: TUITarget? {
-        let rows = self.rows()
+        let rows = visibleRows()
         guard !rows.isEmpty else { return nil }
-        switch rows[selectedIndex(in: rows)] {
+        switch rows[selectedIndex(in: rows)].kind {
         case .folder(let node): return .folder(node)
         case .file(let file): return .file(file, in: current)
         case .ownFiles, .moreFiles: return nil
         }
+    }
+
+    /// The rows the user is actually looking at. A key must act on the frame
+    /// on screen, not on a fresh ranking computed between two of them.
+    private func visibleRows() -> [Row] {
+        displayed.isEmpty ? rows() : displayed
     }
 
     // MARK: Rows
@@ -104,26 +134,26 @@ struct TUIBrowser {
     /// the briefing read the same way.
     func rows() -> [Row] {
         let node = current
-        // Sizes are sampled once: the atomics keep moving under a live scan, and
-        // a comparator that reads them twice can disagree with itself.
-        var ranked: [(row: Row, bytes: Int64, name: String, files: Int64, written: Int64)] =
-            node.children.map {
-                (.folder($0), $0.sizeOnDisk, $0.name, $0.fileCount.load(ordering: .relaxed),
-                 $0.newestMTime.load(ordering: .relaxed))
-            }
+        var rows: [Row] = node.children.map { child in
+            Row(kind: .folder(child), bytes: child.sizeOnDisk,
+                files: child.fileCount.load(ordering: .relaxed),
+                written: child.newestMTime.load(ordering: .relaxed),
+                name: child.name, isScanned: child.isScanned, isUnreadable: child.isUnreadable)
+        }
 
         let listed = listing?.node == ObjectIdentifier(node) ? (listing?.files ?? []) : []
+        let ownWritten = node.directNewestMTime
         for file in listed {
-            ranked.append((.file(file), file.bytes, file.name, 1, node.directNewestMTime))
+            rows.append(Row(kind: .file(file), bytes: file.bytes, files: 1,
+                            written: ownWritten, name: file.name))
         }
 
         switch sort {
-        case .size: ranked.sort { $0.bytes != $1.bytes ? $0.bytes > $1.bytes : $0.name < $1.name }
-        case .name: ranked.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-        case .files: ranked.sort { $0.files != $1.files ? $0.files > $1.files : $0.bytes > $1.bytes }
-        case .written: ranked.sort { $0.written != $1.written ? $0.written > $1.written : $0.bytes > $1.bytes }
+        case .size: rows.sort { $0.bytes != $1.bytes ? $0.bytes > $1.bytes : $0.name < $1.name }
+        case .name: rows.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        case .files: rows.sort { $0.files != $1.files ? $0.files > $1.files : $0.bytes > $1.bytes }
+        case .written: rows.sort { $0.written != $1.written ? $0.written > $1.written : $0.bytes > $1.bytes }
         }
-        var rows = ranked.map(\.row)
 
         // What the listing did not show stays visible as one aggregate — the
         // bytes have to be somewhere. It has no name and no timestamp of its
@@ -133,19 +163,25 @@ struct TUIBrowser {
         let total = node.directFileCount
         if total > shown {
             let bytes = max(0, node.directFilesPhysical - listed.reduce(0) { $0 + $1.bytes })
-            let row: Row = listed.isEmpty
-                ? .ownFiles(count: total, bytes: bytes)
-                : .moreFiles(count: total - shown, bytes: bytes)
-            let at = sort == .size ? (ranked.firstIndex { $0.bytes < bytes } ?? rows.count) : rows.count
+            let kind: Row.Kind = listed.isEmpty ? .ownFiles(count: total) : .moreFiles(count: total - shown)
+            let row = Row(kind: kind, bytes: bytes, files: total - shown, written: ownWritten, name: "")
+            let at = sort == .size ? (rows.firstIndex { $0.bytes < bytes } ?? rows.count) : rows.count
             rows.insert(row, at: at)
         }
         return rows
     }
 
+    /// The folder's own size, as the sum of what is on screen. Taking it from
+    /// the node instead would be a *second* sample, and a share drawn against
+    /// it could read 103 %.
+    private func total(of rows: [Row]) -> Int64 {
+        rows.reduce(0) { $0 + $1.bytes }
+    }
+
     private func selectedIndex(in rows: [Row]) -> Int {
         guard let selection else { return 0 }
         return rows.firstIndex { row in
-            switch (row, selection) {
+            switch (row.kind, selection) {
             case (.folder(let a), .folder(let b)): return a === b
             case (.file(let a), .file(let name)): return a.name == name
             case (.ownFiles, .ownFiles), (.moreFiles, .ownFiles): return true
@@ -155,11 +191,19 @@ struct TUIBrowser {
     }
 
     private mutating func select(_ row: Row) {
-        switch row {
+        switch row.kind {
         case .folder(let node): selection = .folder(node)
         case .file(let file): selection = .file(file.name)
         case .ownFiles, .moreFiles: selection = .ownFiles
         }
+    }
+
+    /// Pin the selection to the top row before the first frame is drawn.
+    /// Without it the highlight is "whatever is first *now*", and it slides
+    /// from folder to folder as the scan re-ranks them under the user.
+    private mutating func pinSelection(_ rows: [Row]) {
+        guard selection == nil, let first = rows.first else { return }
+        select(first)
     }
 
     /// Pull the current folder's file listing. Cheap and idempotent: the host
@@ -176,7 +220,7 @@ struct TUIBrowser {
 
     mutating func apply(_ key: TerminalKey) -> TUIRequest {
         if showTypes { return applyInTypes(key) }
-        let rows = self.rows()
+        let rows = visibleRows()
         let page = max(1, listHeight - 1)
         switch key {
         case .up, .char("k"): move(by: -1, in: rows)
@@ -238,11 +282,12 @@ struct TUIBrowser {
     /// Enter the selected folder. `false` when the row is not a folder — the
     /// caller turns that into "show what this file is" rather than a dead key.
     private mutating func open(in rows: [Row]) -> Bool {
-        guard !rows.isEmpty, case .folder(let node) = rows[selectedIndex(in: rows)] else { return false }
+        guard !rows.isEmpty, case .folder(let node) = rows[selectedIndex(in: rows)].kind else { return false }
         trail.append(node)
         selection = nil
         scrollTop = 0
         listing = nil
+        displayed = []
         return true
     }
 
@@ -254,6 +299,7 @@ struct TUIBrowser {
         selection = .folder(trail.removeLast())
         scrollTop = 0
         listing = nil
+        displayed = []
         return true
     }
 
@@ -264,6 +310,7 @@ struct TUIBrowser {
         selection = nil
         scrollTop = 0
         listing = nil
+        displayed = []
     }
 
     /// Drop navigation that pointed into a subtree that no longer exists. Called
@@ -280,6 +327,7 @@ struct TUIBrowser {
         }
         selection = nil
         listing = nil
+        displayed = []
     }
 
     // MARK: Rendering
@@ -290,7 +338,9 @@ struct TUIBrowser {
     func subtitle(width: Int, typeCount: Int) -> String {
         if showTypes { return "whole scan, exact — \(Format.count(Int64(typeCount))) types" }
         let node = current
-        var facts = "\(Format.bytes(node.sizeOnDisk)) on disk · \(Format.count(node.fileCount.load(ordering: .relaxed))) files"
+        var facts = "\(Format.bytes(node.sizeOnDisk)) on disk · "
+            + Format.plural(node.fileCount.load(ordering: .relaxed), "file")
+        if node.isUnreadable { facts += " · unreadable" }
         if let divergence = node.divergence { facts += " · \(divergence.label)" }
         if sort != .size { facts += " · by \(sort.label)" }
         // Keep the facts and cut the path from the left: its end is the part
@@ -339,64 +389,67 @@ struct TUIBrowser {
 
     private mutating func listBody(width: Int) -> [String] {
         let columns = Columns(width: width)
+        displayed = rows()
+        pinSelection(displayed)
         var out = [Style.dim(TextCell.fit(line(size: "on disk", percent: "%", bar: "", files: "files",
                                                age: "written", name: "name", columns: columns), width))]
         guard listHeight > 0 else { return out }
 
-        let rows = self.rows()
+        let rows = displayed
         let selected = rows.isEmpty ? 0 : selectedIndex(in: rows)
         if selected < scrollTop { scrollTop = selected }
         if selected >= scrollTop + listHeight { scrollTop = selected - listHeight + 1 }
         scrollTop = max(0, min(scrollTop, max(0, rows.count - listHeight)))
 
-        let total = current.sizeOnDisk
+        let total = self.total(of: rows)
         for index in rows.indices.dropFirst(scrollTop).prefix(listHeight) {
             let text = TextCell.fit(describe(rows[index], total: total, columns: columns), width)
             if index == selected {
                 out.append(Style.reverse(TextCell.padRight(text, width)))
-            } else if case .folder = rows[index] {
-                out.append(text)
+            } else if case .folder = rows[index].kind {
+                out.append(rows[index].isUnreadable ? Style.yellow(text) : text)
             } else {
                 out.append(Style.dim(text)) // files read as leaves, folders as the way down
             }
         }
         if rows.isEmpty {
-            out.append(Style.dim(TextCell.fit(current.isScanned ? "  (no files)" : "  (scanning…)", width)))
+            out.append(Style.dim(TextCell.fit("  " + emptyReason, width)))
         }
         return padded(out, to: listHeight + 1)
     }
 
+    /// Why there is nothing to list. "No files" and "I was not allowed to
+    /// look" are the same empty screen and opposite facts: a folder reported
+    /// as empty because it was refused is how a user concludes there is
+    /// nothing to reclaim in the one place there is.
+    private var emptyReason: String {
+        if current.isUnreadable {
+            return "(unreadable — permission denied. Full Disk Access in System Settings "
+                + "› Privacy & Security would let it be read)"
+        }
+        return current.isScanned ? "(no files)" : "(scanning…)"
+    }
+
     private func describe(_ row: Row, total: Int64, columns: Columns) -> String {
-        let bytes: Int64, files: Int64, written: Int64, name: String
-        switch row {
+        let name: String
+        switch row.kind {
         case .folder(let node):
-            bytes = node.sizeOnDisk
-            files = node.fileCount.load(ordering: .relaxed)
-            written = node.newestMTime.load(ordering: .relaxed)
             // A trailing "…" marks a folder no worker has read yet: its row is
             // a placeholder that will fill in, not a small folder.
-            name = TextCell.sanitize(node.name) + "/" + (node.isScanned ? "" : " …")
+            name = TextCell.sanitize(node.name) + "/"
+                + (row.isUnreadable ? "  (unreadable)" : (row.isScanned ? "" : " …"))
         case .file(let file):
-            bytes = file.bytes
-            files = 1
-            written = current.directNewestMTime
             name = TextCell.sanitize(file.name) + (file.divergence != nil ? "  (sparse)" : "")
-        case .ownFiles(let count, let size):
-            bytes = size
-            files = count
-            written = current.directNewestMTime
-            name = "[\(Format.count(count)) files here]"
-        case .moreFiles(let count, let size):
-            bytes = size
-            files = count
-            written = current.directNewestMTime
-            name = "[\(Format.count(count)) more files]"
+        case .ownFiles(let count):
+            name = "[\(Format.plural(count, "file")) here]"
+        case .moreFiles(let count):
+            name = "[\(Format.plural(count, "more file"))]"
         }
-        let fraction = total > 0 ? Double(bytes) / Double(total) : 0
+        let fraction = total > 0 ? Double(row.bytes) / Double(total) : 0
         // 0 means unknown (streamed scans carry no timestamps) — never 1970.
-        let age = written > 0 ? Format.age(Date(timeIntervalSince1970: Double(written))) : "—"
-        return line(size: Format.bytes(bytes), percent: String(format: "%.1f%%", fraction * 100),
-                    bar: TextCell.bar(fraction, width: columns.bar), files: Format.count(files),
+        let age = row.written > 0 ? Format.age(Date(timeIntervalSince1970: Double(row.written))) : "—"
+        return line(size: Format.bytes(row.bytes), percent: String(format: "%.1f%%", fraction * 100),
+                    bar: TextCell.bar(fraction, width: columns.bar), files: Format.count(row.files),
                     age: age, name: name, columns: columns)
     }
 

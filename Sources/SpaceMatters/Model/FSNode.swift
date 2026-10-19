@@ -69,6 +69,7 @@ final class FSNode {
 
     private var _children: [FSNode] = []
     private var _scanned = false
+    private var _unreadable = false
 
     init(name: String, parent: FSNode?, isDirectory: Bool = true) {
         self.name = name
@@ -88,6 +89,20 @@ final class FSNode {
     var isScanned: Bool {
         gTreeLock.lock(); defer { gTreeLock.unlock() }
         return _scanned
+    }
+
+    /// The directory could not be opened (permissions, a dead mount). It is
+    /// scanned, empty and zero bytes — and none of that is true of what is
+    /// inside it. Without this flag a folder the scanner was turned away from
+    /// is indistinguishable from an empty one, which is the difference between
+    /// "nothing here" and "every total above me is a lower bound".
+    var isUnreadable: Bool {
+        gTreeLock.lock(); defer { gTreeLock.unlock() }
+        return _unreadable
+    }
+
+    func markUnreadable() {
+        gTreeLock.lock(); _unreadable = true; gTreeLock.unlock()
     }
 
     var childCount: Int {

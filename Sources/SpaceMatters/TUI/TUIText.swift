@@ -18,6 +18,31 @@ enum TextCell {
         text.reduce(0) { $0 + width(of: $1) }
     }
 
+    /// Cells a rendered line occupies, ignoring the SGR sequences in it. What
+    /// the terminal will actually fill — which is what decides whether an
+    /// `ESC[K` after it would erase the last column rather than clear it.
+    static func displayWidth(_ line: String) -> Int {
+        enum State { case text, escape, sequence }
+        var state = State.text
+        var total = 0
+        for character in line {
+            switch state {
+            case .text:
+                if character == "\u{1B}" { state = .escape } else { total += width(of: character) }
+            case .escape:
+                // `ESC [` (CSI) and `ESC O` (SS3) introduce a sequence; the
+                // introducer itself is in the @–~ range that *ends* one, so it
+                // has to be stepped over before looking for the terminator.
+                state = (character == "[" || character == "O") ? .sequence : .text
+            case .sequence:
+                if let scalar = character.unicodeScalars.first, (0x40...0x7E).contains(scalar.value) {
+                    state = .text
+                }
+            }
+        }
+        return total
+    }
+
     static func width(of character: Character) -> Int {
         let scalars = character.unicodeScalars
         guard let first = scalars.first else { return 0 }
@@ -141,5 +166,38 @@ enum Style {
     static func spinner(_ tick: Int) -> String {
         let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
         return frames[((tick % frames.count) + frames.count) % frames.count]
+    }
+}
+
+/// The non-ASCII characters the interface draws with, and the one-cell ASCII
+/// stand-in for each.
+///
+/// Box drawing, the bar's eighths, `…`, `·`, `—` and the arrows are East Asian
+/// *Ambiguous*: a terminal configured to draw ambiguous characters wide (the
+/// common CJK setup) gives them two cells, and every line of the interface
+/// overflows. `SPACEMATTERS_TUI_ASCII=1` swaps them for ASCII.
+///
+/// Every substitution is one cell wide, so a frame measured before the swap
+/// still fits after it — the widths the renderer computed stay true.
+enum Glyphs {
+
+    static let ascii = ProcessInfo.processInfo.environment["SPACEMATTERS_TUI_ASCII"] == "1"
+
+    private static let table: [Character: Character] = [
+        "…": "~", "·": "|", "—": "-", "–": "-",
+        "↑": "^", "↓": "v", "→": ">", "←": "<", "↳": ">",
+        "⏎": "*", "⌫": "<", "▸": ">", "⚠": "!", "✦": "*",
+        "█": "#", "▏": "=", "▎": "=", "▍": "=", "▌": "=", "▋": "=", "▊": "=", "▉": "=",
+        "┌": "+", "┐": "+", "└": "+", "┘": "+", "─": "-", "│": "|",
+        "⠋": "-", "⠙": "\\", "⠹": "|", "⠸": "/", "⠼": "-",
+        "⠴": "\\", "⠦": "|", "⠧": "/", "⠇": "-", "⠏": "\\",
+    ]
+
+    /// Applied to a finished frame line, so no screen has to know about it.
+    static func asciify(_ line: String) -> String {
+        guard ascii else { return line }
+        // Only the chrome is swapped: a CJK or accented *name* is the user's
+        // data, and its width (Wide, not Ambiguous) is measured correctly.
+        return String(line.map { table[$0] ?? $0 })
     }
 }

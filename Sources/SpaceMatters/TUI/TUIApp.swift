@@ -66,7 +66,13 @@ final class TUIApp {
     private var cleanupScreen = TUICleanupScreen()
     private var tableScreen: TUITableScreen?
 
-    private var status = TUIStatus()
+    /// Last sampled scan state — the frame loop reads it to decide how long
+    /// to wait for the next key.
+    private(set) var status = TUIStatus()
+    /// Row the terminal should park its cursor on: the selected line. Screen
+    /// readers and Zoom follow the cursor, and a hidden one left wherever the
+    /// last write ended follows nothing.
+    private(set) var cursorRow: Int?
     /// The last thing that happened, shown in the footer until the next key.
     private var note: String?
     private var tick = 0
@@ -508,7 +514,13 @@ final class TUIApp {
         switch target {
         case .folder(let node):
             lines.append("\(Format.bytes(node.sizeOnDisk)) on disk")
-            lines.append("\(Format.count(node.fileCount.load(ordering: .relaxed))) files · \(Format.count(Int64(node.childCount))) sub-folders")
+            lines.append(Format.plural(node.fileCount.load(ordering: .relaxed), "file")
+                         + " · " + Format.plural(Int64(node.childCount), "sub-folder"))
+            if node.isUnreadable {
+                lines += TextCell.wrap("This folder could not be opened, so its size reads as 0 "
+                                       + "and is not one. Full Disk Access in System Settings › "
+                                       + "Privacy & Security would let the scanner in.", 56)
+            }
             if let written = node.newestWrite {
                 lines.append("newest write \(Format.age(written))")
             } else {
@@ -654,7 +666,10 @@ final class TUIApp {
         lines = Array(lines.prefix(height))
         if let overlay { lines = draw(overlay, over: lines, width: width) }
         while lines.count < height { lines.append("") }
-        return lines
+        // The selected row is the one drawn in reverse video, wherever it is —
+        // a list row, or an entry in the menu on top of it.
+        cursorRow = lines.firstIndex { $0.contains("\u{1B}[7m") }
+        return Glyphs.ascii ? lines.map(Glyphs.asciify) : lines
     }
 
     private func body(width: Int, height: Int) -> [String] {
@@ -691,8 +706,14 @@ final class TUIApp {
                 facts = status.isScanning
                     ? String(format: "scanning… %.1f s", status.elapsed)
                     : String(format: "scanned in %.1f s", status.elapsed)
-                facts += " · \(Format.count(status.files)) files · \(Format.count(status.folders)) folders"
-                if status.skipped > 0 { facts += " · \(Format.count(status.skipped)) unreadable, skipped" }
+                // The caveat comes *before* the counts, not after: on an 80
+                // column terminal the tail is what gets cut, and "every total
+                // here is a floor" is the line that must survive. Same wording
+                // the MCP server carries, for the same reason.
+                if status.skipped > 0 {
+                    facts += " · \(Format.plural(status.skipped, "location")) unreadable — totals are a lower bound"
+                }
+                facts += " · \(Format.plural(status.files, "file")) · \(Format.plural(status.folders, "folder"))"
             }
         }
         guard width > TextCell.width(title) else { return Style.bold(TextCell.fit(title, width)) }

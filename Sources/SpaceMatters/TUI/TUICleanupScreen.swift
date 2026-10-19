@@ -20,13 +20,15 @@ struct TUICleanupScreen {
     func subtitle(width: Int) -> String {
         switch state.phase {
         case .idle: return "looking for caches and build output…"
-        case .sizing: return "measuring \(Format.count(Int64(state.rows.count))) targets — \(Format.bytes(state.totalFound)) so far"
-        case .cleaning: return "emptying \(Format.count(Int64(state.selected.count))) targets…"
+        case .sizing: return "measuring \(Format.plural(Int64(state.rows.count), "target")) — \(Format.bytes(state.totalFound)) so far"
+        case .cleaning: return "emptying \(Format.plural(Int64(state.selected.count), "target"))…"
         case .ready:
-            var text = "\(Format.count(Int64(state.rows.count))) targets · \(Format.bytes(state.totalFound)) found"
+            var text = "\(Format.plural(Int64(state.rows.count), "target")) · \(Format.bytes(state.totalFound)) found"
             if state.totalSelected > 0 { text += " · \(Format.bytes(state.totalSelected)) selected" }
             if state.lastFreed > 0 { text += " · freed \(Format.bytes(state.lastFreed))" }
-            if state.lastFailures > 0 { text += " · \(state.lastFailures) could not be removed" }
+            if state.lastFailures > 0 {
+                text += " · " + Format.plural(Int64(state.lastFailures), "item") + " could not be removed"
+            }
             return TextCell.fit(text, width)
         }
     }
