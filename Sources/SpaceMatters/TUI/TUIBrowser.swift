@@ -352,6 +352,13 @@ struct TUIBrowser {
         return TextCell.fitLeading(path, room) + suffix
     }
 
+    /// The footer is a *starting* legend, not the key map: it names one way to
+    /// do each thing a newcomer needs, and stops. The vi aliases (`j/k/h/l`),
+    /// `g`/`G` and the page keys are deliberately absent — they are the
+    /// shortcuts of someone who already knows the browser, and spelling them
+    /// out here costs the row its last column on an 80-cell terminal, where
+    /// the footer is the one line that must stay readable. `?` and `m` carry
+    /// the full map, and both are advertised right here.
     var hints: [String] {
         showTypes
             ? ["t/← folders", "↑↓ scroll", "? help"]

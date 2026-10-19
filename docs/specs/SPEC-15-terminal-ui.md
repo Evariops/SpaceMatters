@@ -135,6 +135,8 @@ Raw mode turns off signal generation, so Ctrl-C and Ctrl-D arrive as keys and qu
 
 The action menu (`m`) is also the legend: every entry shows the key that runs it from the screen below, and typing that key runs it from inside the menu.
 
+The **footer** deliberately shows less than this table: one way to do each thing a newcomer needs, and nothing else. The vi aliases, `g`/`G` and the page keys are the shortcuts of someone who already knows the browser, and listing them costs the last column of every row at 80 cells — where the footer is the one line that has to stay readable. `?` and `m` carry the full map, and the footer advertises both.
+
 ## 4. Verification
 
 ### 4.1 Tests
