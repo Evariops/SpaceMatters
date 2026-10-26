@@ -33,7 +33,7 @@ jobs:
   draft:
     name: Update release draft
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions:
       contents: write # create/update the draft release
@@ -50,7 +50,7 @@ jobs:
   autolabel:
     name: Autolabel PR
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions:
       contents: read # read .github/release-drafter.yml
