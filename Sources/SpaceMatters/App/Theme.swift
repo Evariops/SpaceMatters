@@ -78,6 +78,22 @@ struct Theme {
         }
     }
 
+    /// Continuous heat for a relative weight: the capacity gauges' green, amber
+    /// and red, blended rather than stepped — a weight has no threshold to
+    /// cross. Never colour alone: the bar's length carries the same value.
+    static func heatColor(_ fraction: Double) -> Color {
+        let stops: [(r: Double, g: Double, b: Double)] = [
+            (0x3F, 0xB9, 0x50), (0xD2, 0x99, 0x22), (0xF8, 0x51, 0x49),
+        ]
+        let position = max(0, min(1, fraction)) * Double(stops.count - 1)
+        let lower = min(Int(position), stops.count - 2)
+        let t = position - Double(lower)
+        let (a, b) = (stops[lower], stops[lower + 1])
+        return Color(red: (a.r + (b.r - a.r) * t) / 255,
+                     green: (a.g + (b.g - a.g) * t) / 255,
+                     blue: (a.b + (b.b - a.b) * t) / 255)
+    }
+
     /// A words-not-only-colour severity label for the same thresholds, so the
     /// gauge is legible without relying on hue (J10.2, colour-blindness).
     static func usageLevel(_ fraction: Double) -> String {

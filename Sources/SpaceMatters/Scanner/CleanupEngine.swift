@@ -20,6 +20,16 @@ struct Cleanable: Identifiable, Equatable, Sendable {
         case directory
     }
 
+    /// Which fence guards the paths — and so what a path may be.
+    enum Fence: Equatable, Sendable {
+        /// A directory strictly inside the user's home (`allowedRoot`).
+        case home
+        /// An entry of the user's own inside a temporary folder, removed
+        /// itself — file or folder — and only while it is still dormant
+        /// (`TemporaryFiles`). `removal` does not apply.
+        case temporary
+    }
+
     let id: String
     let name: String
     let category: String
@@ -44,10 +54,11 @@ struct Cleanable: Identifiable, Equatable, Sendable {
     /// ("1,722 folders under ~/sources"). Set by discovery, which is the only
     /// producer of targets with more paths than a row can show.
     var locationLabel: String?
+    var fence: Fence = .home
 
     init(id: String, name: String, category: String, icon: String, note: String,
          paths: [String], removal: Removal = .children, regenerable: Bool = true,
-         ownerBundleID: String? = nil, locationLabel: String? = nil) {
+         ownerBundleID: String? = nil, fence: Fence = .home, locationLabel: String? = nil) {
         self.id = id
         self.name = name
         self.category = category
@@ -57,7 +68,17 @@ struct Cleanable: Identifiable, Equatable, Sendable {
         self.removal = removal
         self.regenerable = regenerable
         self.ownerBundleID = ownerBundleID
+        self.fence = fence
         self.locationLabel = locationLabel
+    }
+
+    /// The stand-in shown while discovery is still looking for this target:
+    /// same identity and section, no paths yet.
+    func placeholder(_ label: String) -> Cleanable {
+        var copy = self
+        copy.paths = []
+        copy.locationLabel = label
+        return copy
     }
 }
 
@@ -80,6 +101,11 @@ struct Cleanable: Identifiable, Equatable, Sendable {
 ///   hand-written one — a `bin/` is only offered next to a project file that
 ///   explains it, a workspace-state folder only once its workspace is gone.
 ///   Discovery never widens the fence; it only decides which paths enter it.
+///
+/// One target lives outside the home: stale temporary files. It does not widen
+/// the home fence either — it has a fence of its own (`Cleanable.Fence`), the
+/// temporary folders, and every path in it must also be the user's own and
+/// still dormant at the moment it is removed.
 enum CleanupEngine {
 
     // MARK: Catalog
@@ -291,9 +317,15 @@ enum CleanupEngine {
     /// inside `allowedRoot` once resolved). Deciding at detection time keeps the
     /// UI honest: a relocated cache is never shown, sized through its link, and
     /// then refused at cleaning time with gigabytes left on screen.
-    static func detect(_ catalog: [Cleanable], allowedRoot: String = NSHomeDirectory()) -> [Cleanable] {
+    static func detect(_ catalog: [Cleanable], allowedRoot: String = NSHomeDirectory(),
+                       temporaryRoots: [String] = TemporaryFiles.roots()) -> [Cleanable] {
         catalog.compactMap { item in
-            let existing = item.paths.filter { passesFence($0, allowedRoot: allowedRoot) }
+            let existing = item.paths.filter { path in
+                switch item.fence {
+                case .home: passesFence(path, allowedRoot: allowedRoot)
+                case .temporary: TemporaryFiles.passesFence(path, roots: temporaryRoots)
+                }
+            }
             guard !existing.isEmpty else { return nil }
             var kept = item
             kept.paths = existing
@@ -334,10 +366,20 @@ enum CleanupEngine {
         let total = FSNode(name: "cleanup", parent: nil)
         var seeds: [DirectoryScanner.Seed] = []
         var deniedRoot = false
+        var looseBytes: Int64 = 0
 
         for root in item.paths {
             let fd = open(root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
             guard fd >= 0 else {
+                // A single file — only temporary-folder leftovers are — is its
+                // own blocks, counted the way the scanner counts a file.
+                if errno == ENOTDIR {
+                    var st = stat()
+                    if lstat(root, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG {
+                        looseBytes += Int64(st.st_blocks) * 512
+                    }
+                    continue
+                }
                 // ENOENT and EACCES are different stories: a root that no
                 // longer exists is *empty* (native cleaners like dotnet and go
                 // remove their directories outright), only a root we're not
@@ -349,11 +391,13 @@ enum CleanupEngine {
             seeds.append(DirectoryScanner.Seed(path: root, node: FSNode(name: root, parent: total)))
         }
 
-        guard !seeds.isEmpty else { return deniedRoot ? .denied : .sized(0) }
+        guard !seeds.isEmpty else {
+            return deniedRoot && looseBytes == 0 ? .denied : .sized(looseBytes)
+        }
         let scanner = DirectoryScanner(root: total, seeds: seeds)
         scanner.start()
         scanner.waitUntilFinished()
-        return .sized(total.sizeOnDisk)
+        return .sized(total.sizeOnDisk + looseBytes)
     }
 
     // MARK: Cleaning
@@ -379,7 +423,9 @@ enum CleanupEngine {
     /// (TOCTOU). The fence defends against catalog bugs and relocated caches —
     /// not against code already running as the same user, which could delete
     /// anything directly and gains nothing from racing this loop.
-    static func clean(_ item: Cleanable, allowedRoot: String = NSHomeDirectory()) -> CleanResult {
+    static func clean(_ item: Cleanable, allowedRoot: String = NSHomeDirectory(),
+                      temporaryRoots: [String] = TemporaryFiles.roots()) -> CleanResult {
+        if item.fence == .temporary { return cleanTemporary(item, roots: temporaryRoots) }
         var result = CleanResult()
         let fm = FileManager.default
 
@@ -428,6 +474,40 @@ enum CleanupEngine {
                 } catch {
                     result.failed += 1
                 }
+            }
+        }
+        return result
+    }
+
+    /// Remove each temporary-folder entry itself, after asking again what
+    /// discovery asked: still inside the temporary fence, still the user's own,
+    /// still dormant. One that came back to life since — the window may have
+    /// stayed open for days — is left alone and counted as in use; one that no
+    /// longer passes the fence is a refusal, like any other. `now` is
+    /// injectable because a fixture cannot be made old: nothing sets a ctime
+    /// back.
+    static func cleanTemporary(_ item: Cleanable, roots: [String], now: Date = Date()) -> CleanResult {
+        var result = CleanResult()
+        for path in item.paths {
+            var st = stat()
+            if lstat(path, &st) != 0 {
+                if errno != ENOENT { result.failed += 1 }
+                continue
+            }
+            guard TemporaryFiles.passesFence(path, roots: roots) else {
+                result.refused += 1
+                continue
+            }
+            guard TemporaryFiles.isDormant(path, now: now) else {
+                result.failed += 1
+                continue
+            }
+            // removeItem deletes a symlink met inside as a link, never its target.
+            do {
+                try FileManager.default.removeItem(atPath: path)
+                result.removed += 1
+            } catch {
+                result.failed += 1
             }
         }
         return result
