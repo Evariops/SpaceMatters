@@ -28,13 +28,68 @@ import Foundation
 /// only decides which paths are put forward.
 enum CleanupDiscovery {
 
-    /// Every discovered target, or none when nothing qualifies. Runs a bounded
-    /// directory walk, so callers must keep it off the main thread.
-    static func all(home: String = NSHomeDirectory()) -> [Cleanable] {
-        [projectArtifacts(home: home),
-         orphanedWorkspaceStorage(home: home),
-         browserCaches(home: home)]
-            .flatMap { $0 }
+    /// Every discovered target, or none when nothing qualifies. Runs bounded
+    /// directory walks, so callers must keep it off the main thread.
+    static func all(home: String = NSHomeDirectory(),
+                    temporaryRoots: [String] = TemporaryFiles.roots()) -> [Cleanable] {
+        passes(home: home, temporaryRoots: temporaryRoots).flatMap { $0.run() }
+    }
+
+    /// One discovery as the Low-Hanging Fruits mode runs it: the rows it can
+    /// produce, and the search that decides which of them are real.
+    ///
+    /// The placeholders are what keeps the list still under the user. A search
+    /// can take seconds, and rows that arrive late — whole sections appearing
+    /// at the bottom of a list that looked finished — read as a different
+    /// answer to the same question; rows that vanish read no better. So every
+    /// target a search can plausibly produce is on screen from the first frame,
+    /// in the section the real row will land in, and stays there: replaced by
+    /// what the search found, or marked "none found".
+    struct Pass: Sendable {
+        /// Stand-ins, in the order the real rows should take. Cheap to build —
+        /// at most a few `stat`s per target — because they are built on the
+        /// main actor at every load. Since a stand-in never goes away, one is
+        /// only put up where its target is plausible.
+        let placeholders: [Cleanable]
+        let run: @Sendable () -> [Cleanable]
+    }
+
+    static func passes(home: String = NSHomeDirectory(),
+                       temporaryRoots: [String] = TemporaryFiles.roots()) -> [Pass] {
+        let fm = FileManager.default
+        func installed(_ traces: [String]) -> Bool {
+            traces.contains { fm.fileExists(atPath: home + "/" + $0) }
+        }
+        // The walk itself cannot be predicted, but the toolchain behind each
+        // target leaves a trace in the home on first use. No trace, no
+        // stand-in: a Mac without Rust is not shown a Cargo row reading
+        // "none found" forever. A trace that misses only makes a row late.
+        let ecosystems: [(row: Cleanable, traces: [String])] = [
+            (coldNodeModules([]), [".npm", ".bun", "Library/pnpm", "Library/Caches/Yarn", ".yarn"]),
+            (dotnetArtifacts([]), [".nuget", ".dotnet"]),
+            (cargoArtifacts([]), [".cargo", ".rustup"]),
+        ]
+        var out = [
+            Pass(placeholders: ecosystems.filter { installed($0.traces) }
+                    .map { $0.row.placeholder("searching ~…") },
+                 run: { projectArtifacts(home: home) }),
+            // One stand-in per editor actually installed, browsers likewise:
+            // those roots are fixed, so a `stat` says whether a row can exist.
+            Pass(placeholders: workspaceStorageHosts
+                    .filter { fm.fileExists(atPath: workspaceStorageRoot(home: home, host: $0.support)) }
+                    .map { orphanedWorkspaceRow(host: $0, orphans: [], total: 0).placeholder("searching…") },
+                 run: { orphanedWorkspaceStorage(home: home) }),
+            Pass(placeholders: browserRoots(home: home)
+                    .filter { fm.fileExists(atPath: $0.root) }
+                    .map { browserRow($0.browser, paths: [], profiles: 0).placeholder("searching…") },
+                 run: { browserCaches(home: home) }),
+        ]
+        if !temporaryRoots.isEmpty {
+            out.append(Pass(
+                placeholders: [TemporaryFiles.row([], locationLabel: "searching…")],
+                run: { TemporaryFiles.discover(roots: temporaryRoots).map { [$0] } ?? [] }))
+        }
+        return out
     }
 
     // MARK: Project build artifacts
@@ -111,38 +166,42 @@ enum CleanupDiscovery {
         let node = found.filter { $0.rule.directory == "node_modules" }.map(\.path)
 
         var out: [Cleanable] = []
-        if !node.isEmpty {
-            // Kept apart from the build-output rows on purpose. Those come back
-            // from the source next to them; this one comes back from a registry
-            // over the network, and only if it still serves the versions the
-            // lockfile pins. Same verdict, materially different cost — so it
-            // says "cold", says how many, and does not hide inside a row about
-            // build artifacts.
-            out.append(Cleanable(
-                id: "cold-node-modules", name: "Cold node_modules", category: "JavaScript",
-                icon: "shippingbox.circle",
-                note: "\(node.count) project\(node.count == 1 ? "" : "s") with no install for "
-                    + "6 months. `npm install` restores each — needs network.",
-                paths: node.sorted(), removal: .directory,
-                locationLabel: "\(node.count) projects"))
-        }
-        if !dotnet.isEmpty {
-            out.append(Cleanable(
-                id: "dotnet-artifacts", name: ".NET build output", category: ".NET",
-                icon: "hammer.fill",
-                note: "bin/ and obj/ next to a project file. Recreated by the next build.",
-                paths: dotnet.sorted(), removal: .directory,
-                locationLabel: "\(dotnet.count) folders"))
-        }
-        if !rust.isEmpty {
-            out.append(Cleanable(
-                id: "cargo-artifacts", name: "Cargo build output", category: "Rust & Go",
-                icon: "wrench.and.screwdriver.fill",
-                note: "target/ next to a Cargo.toml. Recreated by the next build.",
-                paths: rust.sorted(), removal: .directory,
-                locationLabel: "\(rust.count) folders"))
-        }
+        if !node.isEmpty { out.append(coldNodeModules(node.sorted())) }
+        if !dotnet.isEmpty { out.append(dotnetArtifacts(dotnet.sorted())) }
+        if !rust.isEmpty { out.append(cargoArtifacts(rust.sorted())) }
         return out
+    }
+
+    /// Kept apart from the build-output rows on purpose. Those come back from
+    /// the source next to them; this one comes back from a registry over the
+    /// network, and only if it still serves the versions the lockfile pins.
+    /// Same verdict, materially different cost — so it says "cold", says how
+    /// many, and does not hide inside a row about build artifacts.
+    static func coldNodeModules(_ paths: [String]) -> Cleanable {
+        Cleanable(
+            id: "cold-node-modules", name: "Cold node_modules", category: "JavaScript",
+            icon: "shippingbox.circle",
+            note: "Projects with no install for 6 months. `npm install` restores each — needs network.",
+            paths: paths, removal: .directory,
+            locationLabel: "\(paths.count) project\(paths.count == 1 ? "" : "s")")
+    }
+
+    static func dotnetArtifacts(_ paths: [String]) -> Cleanable {
+        Cleanable(
+            id: "dotnet-artifacts", name: ".NET build output", category: ".NET",
+            icon: "hammer.fill",
+            note: "bin/ and obj/ next to a project file. Recreated by the next build.",
+            paths: paths, removal: .directory,
+            locationLabel: "\(paths.count) folders")
+    }
+
+    static func cargoArtifacts(_ paths: [String]) -> Cleanable {
+        Cleanable(
+            id: "cargo-artifacts", name: "Cargo build output", category: "Rust & Go",
+            icon: "wrench.and.screwdriver.fill",
+            note: "target/ next to a Cargo.toml. Recreated by the next build.",
+            paths: paths, removal: .directory,
+            locationLabel: "\(paths.count) folders")
     }
 
     struct ArtifactHit {
@@ -243,21 +302,29 @@ enum CleanupDiscovery {
     static func orphanedWorkspaceStorage(home: String = NSHomeDirectory()) -> [Cleanable] {
         var out: [Cleanable] = []
         for host in workspaceStorageHosts {
-            let root = home + "/Library/Application Support/\(host.support)/User/workspaceStorage"
+            let root = workspaceStorageRoot(home: home, host: host.support)
             guard let entries = try? FileManager.default.contentsOfDirectory(atPath: root) else { continue }
             let orphans = entries.map { root + "/" + $0 }.filter { isOrphanedWorkspace($0) }
             guard !orphans.isEmpty else { continue }
-            out.append(Cleanable(
-                id: "workspace-storage-\(host.support.replacingOccurrences(of: " ", with: "-").lowercased())",
-                name: "\(host.name) orphaned workspace state", category: "Editors",
-                icon: "curlybraces.square",
-                note: "State for \(orphans.count) workspace\(orphans.count == 1 ? "" : "s") "
-                    + "whose folder no longer exists. Folders still on disk are left alone.",
-                paths: orphans.sorted(), removal: .directory, regenerable: false,
-                ownerBundleID: host.bundleID,
-                locationLabel: "\(orphans.count) of \(entries.count) workspaces"))
+            out.append(orphanedWorkspaceRow(host: host, orphans: orphans.sorted(), total: entries.count))
         }
         return out
+    }
+
+    static func workspaceStorageRoot(home: String, host support: String) -> String {
+        home + "/Library/Application Support/\(support)/User/workspaceStorage"
+    }
+
+    static func orphanedWorkspaceRow(host: (support: String, name: String, bundleID: String),
+                                     orphans: [String], total: Int) -> Cleanable {
+        Cleanable(
+            id: "workspace-storage-\(host.support.replacingOccurrences(of: " ", with: "-").lowercased())",
+            name: "\(host.name) orphaned workspace state", category: "Editors",
+            icon: "curlybraces.square",
+            note: "State for workspaces whose folder no longer exists. Folders still on disk are left alone.",
+            paths: orphans, removal: .directory, regenerable: false,
+            ownerBundleID: host.bundleID,
+            locationLabel: "\(orphans.count) of \(total) workspaces")
     }
 
     /// True when the directory is a workspace-storage entry whose target is
@@ -354,7 +421,7 @@ enum CleanupDiscovery {
 
         // Per-workspace editor state.
         for host in workspaceStorageHosts {
-            let storage = home + "/Library/Application Support/\(host.support)/User/workspaceStorage"
+            let storage = workspaceStorageRoot(home: home, host: host.support)
             if path == storage { return .protected(reason: workspaceStorageSummary(storage, host: host.name)) }
             guard parent == storage else { continue }
             if isOrphanedWorkspace(path) {
@@ -402,44 +469,53 @@ enum CleanupDiscovery {
     /// touched here. That separation is what makes the target safe — it is not a
     /// claim about which subdirectory names look disposable.
     static func browserCaches(home: String = NSHomeDirectory()) -> [Cleanable] {
-        var out: [Cleanable] = []
         let fm = FileManager.default
-
-        // Chrome: ~/Library/Caches/Google/Chrome/<Profile>/{Cache, Code Cache,
-        // image_cache}. `Storage` is deliberately excluded — it holds
-        // per-extension state rather than fetched assets.
-        let chromeRoot = home + "/Library/Caches/Google/Chrome"
-        if let profiles = try? fm.contentsOfDirectory(atPath: chromeRoot) {
+        return browserRoots(home: home).compactMap { entry in
+            guard let profiles = try? fm.contentsOfDirectory(atPath: entry.root) else { return nil }
             let paths = profiles.flatMap { profile in
-                ["Cache", "Code Cache", "image_cache"].map { "\(chromeRoot)/\(profile)/\($0)" }
+                entry.browser.caches.map { "\(entry.root)/\(profile)/\($0)" }
             }.filter { fm.fileExists(atPath: $0) }
-            if !paths.isEmpty {
-                out.append(Cleanable(
-                    id: "chrome-cache", name: "Chrome cache", category: "Browsers", icon: "globe",
-                    note: "Fetched web assets, re-downloaded — quit Chrome first. History and "
-                        + "logins are elsewhere and untouched.",
-                    paths: paths.sorted(), ownerBundleID: "com.google.Chrome",
-                    locationLabel: "\(profiles.count) profile\(profiles.count == 1 ? "" : "s")"))
+            guard !paths.isEmpty else { return nil }
+            return browserRow(entry.browser, paths: paths.sorted(), profiles: profiles.count)
+        }
+    }
+
+    enum Browser: CaseIterable {
+        case chrome, firefox
+
+        /// Per-profile cache directories. Chrome's `Storage` is deliberately
+        /// excluded — it holds per-extension state rather than fetched assets;
+        /// Firefox's sibling JSON files are small and are the new-tab page's
+        /// state, so they are left in place too.
+        var caches: [String] {
+            switch self {
+            case .chrome: ["Cache", "Code Cache", "image_cache"]
+            case .firefox: ["cache2", "startupCache"]
             }
         }
+    }
 
-        // Firefox: ~/Library/Caches/Firefox/Profiles/<profile>/{cache2,
-        // startupCache}. The sibling JSON files are small and are the new-tab
-        // page's state, so they are left in place.
-        let firefoxRoot = home + "/Library/Caches/Firefox/Profiles"
-        if let profiles = try? fm.contentsOfDirectory(atPath: firefoxRoot) {
-            let paths = profiles.flatMap { profile in
-                ["cache2", "startupCache"].map { "\(firefoxRoot)/\(profile)/\($0)" }
-            }.filter { fm.fileExists(atPath: $0) }
-            if !paths.isEmpty {
-                out.append(Cleanable(
-                    id: "firefox-cache", name: "Firefox cache", category: "Browsers", icon: "globe",
-                    note: "Fetched web assets, re-downloaded — quit Firefox first. The profile "
-                        + "itself is elsewhere and untouched.",
-                    paths: paths.sorted(), ownerBundleID: "org.mozilla.firefox",
-                    locationLabel: "\(profiles.count) profile\(profiles.count == 1 ? "" : "s")"))
-            }
+    /// Where each browser keeps one folder per profile, inside the cache tree.
+    static func browserRoots(home: String) -> [(browser: Browser, root: String)] {
+        [(.chrome, home + "/Library/Caches/Google/Chrome"),
+         (.firefox, home + "/Library/Caches/Firefox/Profiles")]
+    }
+
+    static func browserRow(_ browser: Browser, paths: [String], profiles: Int) -> Cleanable {
+        let label = "\(profiles) profile\(profiles == 1 ? "" : "s")"
+        switch browser {
+        case .chrome:
+            return Cleanable(
+                id: "chrome-cache", name: "Chrome cache", category: "Browsers", icon: "globe",
+                note: "Fetched web assets, re-downloaded — quit Chrome first. History and "
+                    + "logins are elsewhere and untouched.",
+                paths: paths, ownerBundleID: "com.google.Chrome", locationLabel: label)
+        case .firefox:
+            return Cleanable(
+                id: "firefox-cache", name: "Firefox cache", category: "Browsers", icon: "globe",
+                note: "Fetched web assets, re-downloaded — quit Firefox first. The profile "
+                    + "itself is elsewhere and untouched.",
+                paths: paths, ownerBundleID: "org.mozilla.firefox", locationLabel: label)
         }
-        return out
     }
 }

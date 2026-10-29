@@ -6,12 +6,20 @@ import Observation
 /// so rows still fill in live — in order rather than all at once), and empties
 /// the selected ones. Nothing is pre-selected — cleaning is always an explicit
 /// choice, and it is refused while sizing or another clean is in flight.
+///
+/// Every row the mode can show is on screen from the first frame: targets that
+/// discovery is still looking for stand in as `.searching` rows in their final
+/// section, and each search swaps its stand-ins for what it found as soon as it
+/// lands. Nothing appears or vanishes once the list is up: a target that turns
+/// out empty, or a search that finds nothing, stays in place and says so.
 @MainActor
 @Observable
 final class CleanupController {
     enum State: Equatable { case idle, sizing, ready, cleaning }
 
     enum SizeState: Equatable {
+        /// A target discovery may still find — a stand-in, with no paths yet.
+        case searching
         case pending
         case sized(Int64)
         /// Exists but unreadable — typically the Trash without Full Disk Access.
@@ -46,14 +54,20 @@ final class CleanupController {
 
     private let catalog: [Cleanable]
     private let allowedRoot: String
+    /// The temporary folders the stale-temporary-files target is fenced to.
+    private let temporaryRoots: [String]
     private var loadID = 0 // invalidates in-flight sizing (same pattern as Kubernetes mode)
     /// A reload asked for mid-clean is remembered and honoured when the batch
     /// lands, instead of being dropped (or worse, resetting rows under it).
     private var pendingReload = false
-    /// True while the disk walk is still running. Sizing the catalog can finish
-    /// long before it, and `.ready` must not be announced while rows are still
-    /// on their way — the Clean button becomes live at `.ready`.
-    private var awaitingDiscovery = false
+    /// Searches of the current load that have not landed yet. Sizing the rows
+    /// already known can finish long before them, and `.ready` must not be
+    /// announced while rows are still on their way — the Clean button becomes
+    /// live at `.ready`.
+    private var searchesInFlight = 0
+    /// The load whose sizing loop is running, if any: one loop per load, so
+    /// its walks never overlap — rows that land mid-loop just join its queue.
+    private var sizingLoad: Int?
 
     /// Which native cleaner (if any) handles a target, how one is executed, and
     /// which targets are blocked outright on this machine. All injectable:
@@ -66,17 +80,24 @@ final class CleanupController {
     /// app needing a case added here.
     private let blockedReason: @Sendable (Cleanable, String) -> String?
     /// Targets whose paths depend on what is on the disk (build output,
-    /// orphaned workspace state, browser profiles). Injectable and run off the
-    /// main actor — it walks the home directory.
-    private let discover: @Sendable (String) -> [Cleanable]
+    /// orphaned workspace state, browser profiles, temporary leftovers), as
+    /// searches with their stand-ins. Built on the main actor at every load;
+    /// the searches themselves run off it. Injectable.
+    private let discovery: (String) -> [CleanupDiscovery.Pass]
     /// Called on the main actor with one entry per cleaned target — the
     /// forensic trail behind field reports. Injectable so tests can collect.
     private let journal: (CleanupJournal.Entry) -> Void
 
     /// `catalog`/`allowedRoot` are injectable so tests can run against fixtures;
     /// the app uses the built-in catalog fenced to the user's home.
+    ///
+    /// `temporaryRoots` defaults to the account's own temporary folders — but
+    /// only when the fence *is* the account's home. They belong to the same
+    /// account: a controller fenced to anything else (a test fixture) has none,
+    /// rather than reaching for the real `/tmp` behind its fixture's back.
     init(catalog: [Cleanable] = CleanupEngine.catalog(),
          allowedRoot: String = NSHomeDirectory(),
+         temporaryRoots: [String]? = nil,
          nativeLookup: @escaping @Sendable (String, String) -> NativeCleaner? =
             { NativeCleaner.available(for: $0, home: $1) },
          nativeRunner: @escaping @Sendable (NativeCleaner) async -> ProcessResult = { native in
@@ -86,14 +107,17 @@ final class CleanupController {
          blockedReason: @escaping @Sendable (Cleanable, String) -> String? = {
             CleanupEngine.blockedReason(for: $0, home: $1)
          },
-         discover: @escaping @Sendable (String) -> [Cleanable] = { CleanupDiscovery.all(home: $0) },
+         discovery: ((String) -> [CleanupDiscovery.Pass])? = nil,
          journal: @escaping (CleanupJournal.Entry) -> Void = { CleanupJournal.append($0) }) {
+        let temporaryRoots = temporaryRoots
+            ?? (allowedRoot == NSHomeDirectory() ? TemporaryFiles.roots() : [])
         self.catalog = catalog
         self.allowedRoot = allowedRoot
+        self.temporaryRoots = temporaryRoots
         self.nativeLookup = nativeLookup
         self.nativeRunner = nativeRunner
         self.blockedReason = blockedReason
-        self.discover = discover
+        self.discovery = discovery ?? { CleanupDiscovery.passes(home: $0, temporaryRoots: temporaryRoots) }
         self.journal = journal
     }
 
@@ -115,52 +139,83 @@ final class CleanupController {
         // (or got blocked meanwhile).
         let previouslySelected = Set(rows.filter(\.selected).map(\.id))
         // The hand-picked catalog is a pure list, so its rows can be shown and
-        // sized immediately. Discovery walks the disk — several seconds on a
-        // developer's home — and joins when it lands, rather than holding every
-        // other row hostage behind it.
-        rows = makeRows(CleanupEngine.detect(catalog, allowedRoot: allowedRoot),
+        // sized immediately. Each search walks the disk — seconds, on a
+        // developer's home or a long-lived /tmp — so its targets stand in right
+        // away, and the search swaps them for what it found the moment it
+        // lands: not after the catalog is sized, since a search that finished
+        // in a second must not wait behind a 30 GiB build cache.
+        let passes = discovery(allowedRoot)
+        rows = makeRows(CleanupEngine.detect(catalog, allowedRoot: allowedRoot,
+                                             temporaryRoots: temporaryRoots),
                         selected: previouslySelected)
+            + passes.flatMap { $0.placeholders.map { Row(item: $0, size: .searching) } }
         state = .sizing
-        awaitingDiscovery = true
+        searchesInFlight = passes.count
         let root = allowedRoot
-        let discover = self.discover
-        Task {
-            // Started first, awaited last: the walk is readdir-only and
-            // single-threaded, so it costs nothing to run it alongside the
-            // sizing walks rather than before them.
-            let discovery = Task.detached(priority: .userInitiated) {
-                CleanupEngine.detect(discover(root), allowedRoot: root)
+        let temporaryRoots = self.temporaryRoots
+        for pass in passes {
+            let standIns = Set(pass.placeholders.map(\.id))
+            Task {
+                // Readdir-only walks: they cost little next to the sizing
+                // walks, so they all run alongside them rather than before.
+                let found = await Task.detached(priority: .userInitiated) {
+                    CleanupEngine.detect(pass.run(), allowedRoot: root, temporaryRoots: temporaryRoots)
+                }.value
+                guard id == self.loadID else { return }
+                self.join(self.makeRows(found, selected: previouslySelected), replacing: standIns)
+                self.searchesInFlight -= 1
+                self.sizeRemaining(id: id)
+                // The search may have found nothing, or only blocked rows, in
+                // which case no `apply` runs to make the transition.
+                self.settle()
             }
-            await self.size(self.rows.filter { $0.size == .pending }.map(\.item), id: id)
+        }
+        sizeRemaining(id: id)
+    }
 
-            let discovered = await discovery.value
-            guard id == self.loadID else { return }
-            let fresh = self.makeRows(discovered, selected: previouslySelected)
-            self.rows += fresh
-            self.awaitingDiscovery = false
-            await self.size(fresh.filter { $0.size == .pending }.map(\.item), id: id)
-            // Nothing left to measure and nothing still to arrive: the batch may
-            // have been all-blocked or empty, in which case no `apply` ran to
-            // make the transition.
-            if id == self.loadID, self.state == .sizing,
-               !self.rows.contains(where: { $0.size == .pending }) {
-                self.state = .ready
+    /// Size the pending rows one at a time, in list order. Each sizing walk
+    /// drives the full scanner worker pool, so running the targets
+    /// concurrently would multiply threads rather than work. Rows a search adds
+    /// while the loop runs simply join its queue; once the loop has run dry,
+    /// the next search to land starts it again.
+    private func sizeRemaining(id: Int) {
+        guard sizingLoad != id else { return }
+        sizingLoad = id
+        Task {
+            while id == loadID, let item = rows.first(where: { $0.size == .pending })?.item {
+                let measure = await Task.detached(priority: .userInitiated) {
+                    CleanupEngine.size(of: item)
+                }.value
+                guard id == loadID else { break }
+                apply(measure, to: item.id)
             }
+            if sizingLoad == id { sizingLoad = nil }
+            settle()
         }
     }
 
-    /// Size targets one at a time. Each sizing walk drives the full scanner
-    /// worker pool, so running the targets concurrently would multiply threads
-    /// rather than work — and the slowest target sets the mode's load time
-    /// either way. Rows still fill in live, in order.
-    private func size(_ items: [Cleanable], id: Int) async {
-        for item in items {
-            let measure = await Task.detached(priority: .userInitiated) {
-                CleanupEngine.size(of: item)
-            }.value
-            guard id == loadID else { return }
-            apply(measure, to: item.id)
+    /// Swap each of a search's stand-ins for the row it found, in place. A
+    /// stand-in whose target was not found stays too, reading "none found":
+    /// nothing on screen moves or vanishes when a search lands.
+    private func join(_ found: [Row], replacing standIns: Set<String>) {
+        var unplaced = found
+        rows = rows.map { row in
+            guard standIns.contains(row.id), row.size == .searching else { return row }
+            if let match = unplaced.firstIndex(where: { $0.id == row.id }) {
+                return unplaced.remove(at: match)
+            }
+            return Row(item: row.item.placeholder("none found"), size: .sized(0))
         }
+        // A target the search found without having stood in for it — only
+        // possible when a stand-in hint missed. Late is better than never.
+        rows += unplaced
+    }
+
+    /// `.ready` once nothing is left to measure and nothing is still to arrive.
+    private func settle() {
+        guard state == .sizing, searchesInFlight == 0,
+              !rows.contains(where: { $0.size == .pending || $0.size == .searching }) else { return }
+        state = .ready
     }
 
     /// Rows for a detected batch, with the blocked reasons resolved and the
@@ -183,7 +238,7 @@ final class CleanupController {
     func stop() {
         loadID += 1
         pendingReload = false
-        awaitingDiscovery = false
+        searchesInFlight = 0
     }
 
     /// The model guards itself: a pending/denied/blocked row cannot be selected
@@ -228,6 +283,10 @@ final class CleanupController {
 
     var selectedRows: [Row] { rows.filter(\.selected) }
 
+    /// Rows that hold something, or may: empty ones and stand-ins still
+    /// searching are on screen but are not locations to clean.
+    var locationCount: Int { rows.filter { !$0.size.isEmpty && $0.size != .searching }.count }
+
     /// Sum of the sized rows (the "found" total in the summary strip).
     var totalFound: Int64 { rows.reduce(0) { $0 + $1.size.bytes } }
     var totalSelected: Int64 { selectedRows.reduce(0) { $0 + $1.size.bytes } }
@@ -256,6 +315,7 @@ final class CleanupController {
         let before = totalSelected
         let targets = selectedRows.map(\.item)
         let root = allowedRoot
+        let temporaryRoots = self.temporaryRoots
 
         var failures = 0
         var refused = 0
@@ -277,7 +337,7 @@ final class CleanupController {
                 }
             } else {
                 let result = await Task.detached(priority: .userInitiated) {
-                    CleanupEngine.clean(item, allowedRoot: root)
+                    CleanupEngine.clean(item, allowedRoot: root, temporaryRoots: temporaryRoots)
                 }.value
                 entry.removed = result.removed
                 entry.failed = result.failed
@@ -314,22 +374,13 @@ final class CleanupController {
     private func apply(_ measure: CleanupEngine.Measure, to id: String) {
         guard let idx = rows.firstIndex(where: { $0.id == id }) else { return }
         switch measure {
-        case .sized(let bytes):
-            // An empty target on the initial sizing pass is noise — nothing to
-            // reclaim, the row doesn't earn its place (the file engine keeps
-            // cache roots alive by design, so empties are common after a past
-            // clean). The same 0 B arriving during `.cleaning` is the *result*
-            // of this clean: the row stays as feedback until the next reload.
-            if bytes == 0, state == .sizing {
-                rows.remove(at: idx)
-            } else {
-                rows[idx].size = .sized(bytes)
-            }
+        // An empty target stays where it is and says so. Dropping it was
+        // tidier on paper, but on screen it is a row vanishing under the
+        // pointer — half the list rearranging itself while the user reads it.
+        case .sized(let bytes): rows[idx].size = .sized(bytes)
         case .denied: rows[idx].size = .denied
         }
-        if state == .sizing, !awaitingDiscovery, !rows.contains(where: { $0.size == .pending }) {
-            state = .ready
-        }
+        settle()
     }
 }
 
@@ -339,10 +390,14 @@ extension CleanupController.SizeState {
         return 0
     }
 
-    /// Only measured rows can be selected — a denied or still-sizing row has no
-    /// trustworthy size to confirm against.
+    /// Only measured rows with something in them can be selected — a denied or
+    /// still-sizing row has no trustworthy size to confirm against, and an
+    /// empty one has nothing to clean.
     var isSelectable: Bool {
-        if case .sized = self { return true }
+        if case .sized(let bytes) = self { return bytes > 0 }
         return false
     }
+
+    /// Measured, and nothing there — or a search that found nothing.
+    var isEmpty: Bool { self == .sized(0) }
 }

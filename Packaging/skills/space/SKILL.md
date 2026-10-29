@@ -59,7 +59,10 @@ on an external drive. That judgement is the entire value you add.
   SpaceMatters empties those itself, fenced to the user's home, never following
   symlinks, and journalled. Point at Low-Hanging Fruits in the app instead.
   This covers more than a fixed list: `bin`/`obj`/`target` beside a project
-  file, and orphaned editor workspace state, are recognised too.
+  file, and orphaned editor workspace state, are recognised too. So are the
+  user's leftovers in `/tmp` and `$TMPDIR` — but only entries nothing has
+  written to for 3 days and that hold no live socket, which `cleanup_targets`
+  lists. Never sweep a temporary folder wholesale: it holds live endpoints.
 - **`explain` also answers "NOT a cleanup target", and that answer outranks
   your own reading.** It is how you learn that a `bin/` is a virtualenv's, or
   that a `workspaceStorage` folder belongs to a project still on disk. A

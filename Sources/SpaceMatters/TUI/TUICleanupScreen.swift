@@ -130,7 +130,9 @@ struct TUICleanupScreen {
         let box = row.selected ? "[x]" : (row.isSelectable ? "[ ]" : " · ")
         let size: String
         switch row.size {
+        case .searching: size = "searching"
         case .pending: size = "…"
+        case .sized(0): size = "empty"
         case .sized(let bytes): size = Format.bytes(bytes)
         case .denied: size = "denied"
         case .blocked: size = "blocked"

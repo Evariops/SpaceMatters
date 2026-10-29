@@ -229,6 +229,48 @@ import Testing
         #expect(CleanupDiscovery.localPath(fromFileURI: "file:///tmp/a%20b") == "/tmp/a b")
     }
 
+    // MARK: Stand-ins
+
+    /// Each search's stand-ins carry the ids of the rows it can produce, so a
+    /// found row lands where its stand-in stood rather than reshuffling the
+    /// sections. A stand-in never goes away, so one is only put up where its
+    /// target is plausible: editors and browsers where their folder exists,
+    /// project output where its toolchain has left a trace in the home.
+    @Test func standInsShareTheIdsOfTheRowsTheyStandFor() throws {
+        let root = try Self.fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try Self.makeFile(root, "App/App.csproj")
+        try Self.makeFile(root, "App/bin/Debug/app.dll")
+        try Self.makeFile(root, "crate/Cargo.toml")
+        try Self.makeFile(root, "crate/target/debug/x")
+        let storage = "Library/Application Support/Code/User/workspaceStorage"
+        try Self.makeFile(root, "\(storage)/bbb/workspace.json", bytes: 0)
+        try #"{"folder":"file:///nope/deleted-repo"}"#
+            .write(toFile: root.appendingPathComponent("\(storage)/bbb/workspace.json").path,
+                   atomically: true, encoding: .utf8)
+        try Self.makeFile(root, "Library/Caches/Google/Chrome/Default/Cache/f")
+        _ = try Self.makeDir(root, ".nuget/packages")
+        _ = try Self.makeDir(root, ".cargo/registry")
+
+        let passes = CleanupDiscovery.passes(home: root.path, temporaryRoots: [])
+        var produced: [String] = []
+        for pass in passes {
+            let standIns = Set(pass.placeholders.map(\.id))
+            #expect(pass.placeholders.allSatisfy { $0.paths.isEmpty })
+            for row in pass.run() {
+                produced.append(row.id)
+                #expect(standIns.contains(row.id), "\(row.id) has no stand-in")
+            }
+        }
+        #expect(Set(produced) == ["dotnet-artifacts", "cargo-artifacts", "workspace-storage-code", "chrome-cache"])
+
+        let standIns = Set(passes.flatMap { $0.placeholders.map(\.id) })
+        #expect(!standIns.contains("cold-node-modules")) // no package manager ever ran here
+        #expect(!standIns.contains("workspace-storage-cursor"))
+        #expect(!standIns.contains("firefox-cache"))
+        #expect(!standIns.contains(TemporaryFiles.targetID)) // no temporary folder, no row
+    }
+
     // MARK: Browser caches
 
     /// Profile directory names are generated, so the paths are found rather than

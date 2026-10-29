@@ -92,6 +92,8 @@ struct TUIStatus {
 /// One Low-Hanging Fruits row, flattened for the terminal.
 struct TUICleanupRow: Equatable {
     enum Size: Equatable {
+        /// A target discovery is still looking for (see `CleanupController`).
+        case searching
         case pending
         case sized(Int64)
         case denied
@@ -115,8 +117,10 @@ struct TUICleanupRow: Equatable {
         return 0
     }
 
+    /// Same rule as `CleanupController.SizeState.isSelectable`: measured, and
+    /// something in it.
     var isSelectable: Bool {
-        if case .sized = size { return true }
+        if case .sized(let value) = size { return value > 0 }
         return false
     }
 }

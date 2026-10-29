@@ -16,7 +16,7 @@ The home screen lists everything worth analyzing, not just volumes.
 
 ![Home screen: internal disk, Low-Hanging Fruits safe cleanup, Podman virtual machines and Kubernetes contexts](docs/screenshots/home.webp)
 
-- **Low-Hanging Fruits** — a safe one-click cleanup pass over the usual suspects: Trash, `DerivedData`, npm and NuGet caches, and friends. It only ever touches locations that are safe to regenerate.
+- **Low-Hanging Fruits** — a safe one-click cleanup pass over the usual suspects: Trash, `DerivedData`, npm and NuGet caches, stale files in `/tmp` and `$TMPDIR`, and friends. Caches come back on demand; the few rows that don't (Trash, temporary leftovers, orphaned editor state) are marked and never swept up by Select all.
 - **Virtual machines** — Podman machines, scanned from inside the VM.
 - **Kubernetes** — pick a kube context and see every PVC by namespace, provisioned capacity against actual usage, as the same treemap.
 

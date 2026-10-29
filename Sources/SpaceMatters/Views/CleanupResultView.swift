@@ -109,9 +109,9 @@ struct CleanupResultView: View {
     private var summaryStrip: some View {
         HStack(spacing: 12) {
             summaryCard("Reclaimable found", value: Format.bytes(controller.totalFound),
-                        subtitle: controller.state == .sizing ? "still measuring…" : "\(controller.rows.count) locations")
+                        subtitle: foundSubtitle)
             summaryCard("Selected", value: Format.bytes(controller.totalSelected),
-                        subtitle: "\(controller.selectedRows.count) of \(controller.rows.count)")
+                        subtitle: "\(controller.selectedRows.count) of \(controller.locationCount)")
             // Shown as soon as a clean ran — a batch where everything failed
             // must not hide its failures behind the absent card.
             if controller.lastFreed > 0 || controller.lastFailures > 0 || controller.lastRefused > 0 {
@@ -122,6 +122,12 @@ struct CleanupResultView: View {
         }
         .padding(.horizontal, 14).padding(.vertical, 8)
         .background(theme.panelBackground)
+    }
+
+    private var foundSubtitle: String {
+        if controller.rows.contains(where: { $0.size == .searching }) { return "still searching…" }
+        if controller.state == .sizing { return "still measuring…" }
+        return "\(controller.locationCount) locations"
     }
 
     /// Failures (in use, locked) and fence refusals (a bug indicator) are
@@ -156,7 +162,10 @@ struct CleanupResultView: View {
     /// up exactly), category bands inside it, hairlines between rows. Full
     /// width, aligned with the summary strip.
     private var list: some View {
-        ScrollView {
+        // The bars are relative to the heaviest row, so the largest finding
+        // always spans the whole track and the rest read against it.
+        let heaviest = controller.rows.map(\.size.bytes).max() ?? 0
+        return ScrollView {
             VStack(spacing: 0) {
                 selectAllHeader
                 ForEach(controller.categories, id: \.self) { category in
@@ -174,6 +183,7 @@ struct CleanupResultView: View {
                             Divider().overlay(theme.separator.opacity(0.5)).padding(.leading, 36)
                         }
                         CleanupRowView(row: row, theme: theme,
+                                       heaviest: heaviest, total: controller.totalFound,
                                        disabled: controller.state == .cleaning) {
                             controller.toggle(row.id)
                         }
@@ -294,6 +304,10 @@ private struct CheckSquare: View {
 private struct CleanupRowView: View {
     let row: CleanupController.Row
     let theme: Theme
+    /// Bytes of the heaviest row — the full length of the weight bar.
+    let heaviest: Int64
+    /// Bytes of every row — what the bar's tooltip states a share of.
+    let total: Int64
     let disabled: Bool
     let toggle: () -> Void
 
@@ -352,24 +366,74 @@ private struct CleanupRowView: View {
                 .foregroundStyle(theme.textSecondary.opacity(0.7))
                 .lineLimit(1).truncationMode(.middle)
                 .frame(maxWidth: 260, alignment: .trailing)
+                // A summary label is short and says nothing once cut ("3…IR"):
+                // it keeps its width and the note gives way instead. A path
+                // still truncates in the middle, where it loses least.
+                .fixedSize(horizontal: row.item.locationLabel != nil, vertical: false)
                 .help(row.item.paths.prefix(40).map(abbreviate).joined(separator: "\n")
                       + (row.item.paths.count > 40 ? "\n… and \(row.item.paths.count - 40) more" : ""))
+
+            weightBar
 
             sizeLabel
                 .frame(width: 80, alignment: .trailing)
         }
         .padding(.horizontal, 10).padding(.vertical, 5)
+        // Still searching, or nothing there: present, but not something to act on.
+        .opacity(row.size == .searching || row.size.isEmpty ? 0.55 : 1)
         .contentShape(Rectangle())
         .onTapGesture { if !disabled && row.size.isSelectable { toggle() } }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(row.item.name), \(sizeAccessibility)")
+        .accessibilityLabel("\(row.item.name), \(sizeAccessibility)"
+                            + (share.map { ", \($0) of everything found" } ?? ""))
+    }
+
+    /// This row's weight against the heaviest one: length and heat say the
+    /// same thing, so the colour is never the only carrier. A row with nothing
+    /// measured yet keeps an empty track, so the column never shifts.
+    private var weightBar: some View {
+        let bytes = row.size.bytes
+        let fraction = heaviest > 0 ? Double(bytes) / Double(heaviest) : 0
+        return GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule().fill(theme.barTrack)
+                if bytes > 0 {
+                    // A sliver even for a few KiB: present, just negligible.
+                    Capsule().fill(Theme.heatColor(fraction))
+                        .frame(width: max(3, geo.size.width * fraction))
+                }
+            }
+        }
+        .frame(width: 110, height: 5)
+        .animation(.easeOut(duration: 0.25), value: fraction)
+        .help(share.map { "\(Format.bytes(bytes)) — \($0) of everything found" } ?? "")
+        .accessibilityHidden(true)
+    }
+
+    /// Share of the mode's total, as the tooltip and VoiceOver state it.
+    private var share: String? {
+        let bytes = row.size.bytes
+        guard bytes > 0, total > 0 else { return nil }
+        let percent = Double(bytes) / Double(total) * 100
+        return percent < 1 ? "<1%" : "\(Int(percent.rounded()))%"
     }
 
     @ViewBuilder
     private var sizeLabel: some View {
         switch row.size {
+        case .searching:
+            HStack(spacing: 4) {
+                ProgressView().controlSize(.mini)
+                Text("Searching")
+                    .font(.system(size: 10))
+                    .foregroundStyle(theme.textSecondary)
+            }
         case .pending:
             ProgressView().controlSize(.mini)
+        case .sized(0):
+            Text("Empty")
+                .font(.system(size: 10))
+                .foregroundStyle(theme.textSecondary)
         case .sized(let bytes):
             Text(Format.bytes(bytes))
                 .font(.system(size: 12, weight: .medium).monospacedDigit())
@@ -392,7 +456,9 @@ private struct CleanupRowView: View {
 
     private var sizeAccessibility: String {
         switch row.size {
+        case .searching: return "searching"
         case .pending: return "measuring"
+        case .sized(0): return "empty"
         case .sized(let bytes): return Format.bytes(bytes)
         case .denied: return "needs Full Disk Access"
         case .blocked(let reason): return "protected: \(reason)"

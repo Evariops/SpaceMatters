@@ -411,9 +411,11 @@ import Foundation
 
         await batch.value
         await Self.waitForReady(c)
-        // The deferred reload ran as a *fresh* load: the cache the batch just
-        // emptied re-measures at 0 B and is dropped by the empty-row rule.
-        #expect(c.rows.isEmpty)
+        // The deferred reload ran as a *fresh* load: it cleared the batch's
+        // result, and re-measured the cache the batch just emptied.
+        #expect(c.lastFreed == 0)
+        #expect(c.rows.map(\.id) == ["test-cache"])
+        #expect(c.rows.first?.size == .sized(0))
         #expect(c.totalFound == 0)
     }
 
@@ -566,31 +568,37 @@ import Foundation
         #expect(decoded.bytesBefore == 42)
     }
 
-    /// An empty cache on the initial sizing pass is dropped — nothing to
-    /// reclaim, the row is noise (the file engine keeps cache roots alive, so
-    /// empties are common after a past clean). A row cleaned to 0 B in-session
-    /// stays visible: that 0 is the result the user just paid for.
-    @Test func emptyRowsAreDroppedOnLoadButKeptAfterCleaning() async throws {
+    /// An empty target stays where it is and says so: a row vanishing mid-load
+    /// is the list rearranging itself while the user reads it. It just cannot
+    /// be selected, by hand or by select-all — there is nothing to clean. A
+    /// row a clean emptied follows the same rule, on this load and the next.
+    @Test func emptyRowsStayInPlaceButCannotBeSelected() async throws {
         let (root, cache) = try Self.makeFixture()
         defer { try? FileManager.default.removeItem(at: root) }
         let empty = root.appendingPathComponent("empty-cache")
         try FileManager.default.createDirectory(at: empty, withIntermediateDirectories: true)
         let emptyItem = Cleanable(id: "empty-cache", name: "Empty", category: "Test",
                                   icon: "shippingbox", note: "fixture", paths: [empty.path])
-        let c = CleanupController(catalog: [Self.cleanable([cache.path]), emptyItem],
+        let c = CleanupController(catalog: [emptyItem, Self.cleanable([cache.path])],
                                   allowedRoot: root.path, journal: { _ in })
         c.load()
         await Self.waitForReady(c)
-        #expect(c.rows.map(\.id) == ["test-cache"]) // the empty row never appears
+        #expect(c.rows.map(\.id) == ["empty-cache", "test-cache"])
+        #expect(c.rows.first?.size == .sized(0))
+        #expect(c.locationCount == 1)
+        c.toggle("empty-cache")
+        #expect(c.selectedRows.isEmpty)
+        c.toggleAll()
+        #expect(c.selectedRows.map(\.id) == ["test-cache"])
 
-        c.toggle("test-cache")
         await c.cleanSelected()
-        #expect(c.rows.map(\.id) == ["test-cache"]) // still there, showing its result…
-        #expect(c.rows.first?.size == .sized(0))    // …which is 0 B
+        #expect(c.rows.map(\.id) == ["empty-cache", "test-cache"]) // nothing moved…
+        #expect(c.rows.last?.size == .sized(0))                    // …and the result shows
+        #expect(c.locationCount == 0)
 
-        c.refresh() // next reload applies the fresh-load rule again
+        c.refresh()
         await Self.waitForReady(c)
-        #expect(c.rows.isEmpty)
+        #expect(c.rows.map(\.id) == ["empty-cache", "test-cache"])
         #expect(c.state == .ready)
     }
 
@@ -713,10 +721,12 @@ import Foundation
 
         let c = CleanupController(
             catalog: [Self.cleanable([cache.path])], allowedRoot: root.path,
-            discover: { _ in
-                [Cleanable(id: "found", name: "Found", category: "Discovered", icon: "x",
-                           note: "n", paths: [extra.path], removal: .directory,
-                           locationLabel: "1 folder")]
+            discovery: { _ in
+                [CleanupDiscovery.Pass(placeholders: [], run: {
+                    [Cleanable(id: "found", name: "Found", category: "Discovered", icon: "x",
+                               note: "n", paths: [extra.path], removal: .directory,
+                               locationLabel: "1 folder")]
+                })]
             },
             journal: { _ in })
         c.load()
@@ -728,6 +738,58 @@ import Foundation
         // other — the strip must not under-report a target it is offering.
         #expect(c.totalFound == c.rows.reduce(0) { $0 + $1.size.bytes })
         #expect(c.totalFound > 20_480)
+    }
+
+    /// Every row the mode can show is on screen from the first frame. A target
+    /// a search may still find stands in, in its own section, unselectable; the
+    /// catalog is measured meanwhile without waiting for the search; and when
+    /// the search lands each stand-in is swapped for what it found, in place —
+    /// or marked "none found". Nothing appears late, nothing vanishes.
+    @Test func standInsHoldTheirPlaceUntilTheSearchLands() async throws {
+        let (root, cache) = try Self.makeFixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let extra = root.appendingPathComponent("discovered")
+        try FileManager.default.createDirectory(at: extra, withIntermediateDirectories: true)
+        try Data(count: 20_000).write(to: extra.appendingPathComponent("c.bin"))
+
+        let gate = DispatchSemaphore(value: 0)
+        defer { gate.signal() } // never leave the search blocked if an expectation fails early
+        let found = Cleanable(id: "found", name: "Found", category: "Discovered", icon: "x",
+                              note: "n", paths: [extra.path], removal: .directory)
+        let ghost = Cleanable(id: "ghost", name: "Ghost", category: "Discovered", icon: "x",
+                              note: "n", paths: [])
+        let c = CleanupController(
+            catalog: [Self.cleanable([cache.path])], allowedRoot: root.path,
+            discovery: { _ in
+                [CleanupDiscovery.Pass(
+                    placeholders: [found.placeholder("searching…"), ghost.placeholder("searching…")],
+                    run: { gate.wait(); return [found] })]
+            },
+            journal: { _ in })
+        c.load()
+        #expect(c.rows.map(\.id) == ["test-cache", "found", "ghost"])
+        #expect(c.rows.dropFirst().allSatisfy { $0.size == .searching })
+        #expect(c.categories == ["Test", "Discovered"])
+
+        // The catalog row is measured while the search is still out…
+        let deadline = Date().addingTimeInterval(60)
+        while c.rows.first?.size == .pending && Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+            await Task.yield()
+        }
+        #expect(c.rows.first?.size.isSelectable == true)
+        // …but the mode is not ready, and a stand-in cannot be selected.
+        #expect(c.state == .sizing)
+        c.toggle("found")
+        #expect(c.selectedRows.isEmpty)
+
+        gate.signal()
+        await Self.waitForReady(c)
+        // Replaced in place; the ghost found nothing and stays, saying so.
+        #expect(c.rows.map(\.id) == ["test-cache", "found", "ghost"])
+        #expect(c.rows[1].size == .sized(20_480))
+        #expect(c.rows[2].size == .sized(0))
+        #expect(c.rows[2].item.locationLabel == "none found")
     }
 
     /// A discovered target that is not regenerable (orphaned editor state) is
@@ -742,10 +804,12 @@ import Foundation
 
         let c = CleanupController(
             catalog: [Self.cleanable([cache.path])], allowedRoot: root.path,
-            discover: { _ in
-                [Cleanable(id: "orphan-state", name: "Orphaned state", category: "Editors",
-                           icon: "x", note: "n", paths: [state.path],
-                           removal: .directory, regenerable: false)]
+            discovery: { _ in
+                [CleanupDiscovery.Pass(placeholders: [], run: {
+                    [Cleanable(id: "orphan-state", name: "Orphaned state", category: "Editors",
+                               icon: "x", note: "n", paths: [state.path],
+                               removal: .directory, regenerable: false)]
+                })]
             },
             journal: { _ in })
         c.load()

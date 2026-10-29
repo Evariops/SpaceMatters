@@ -87,6 +87,7 @@ final class AppTUIHost: TUIHost {
             state.rows = cleanupController.rows.map { row in
                 let size: TUICleanupRow.Size
                 switch row.size {
+                case .searching: size = .searching
                 case .pending: size = .pending
                 case .sized(let bytes): size = .sized(bytes)
                 case .denied: size = .denied
