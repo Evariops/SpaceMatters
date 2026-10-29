@@ -12,11 +12,19 @@ enum FSAttr {
     static let cmnName: UInt32          = 0x0000_0001
     static let cmnDevID: UInt32         = 0x0000_0002 // dev_t, exact mode (inode dedup key)
     static let cmnObjType: UInt32       = 0x0000_0008
+    /// Creation (birth) time (`struct timespec`). Requested only by the
+    /// temporary-files walk: for a directory it is the one clock that removing
+    /// entries does not move.
+    static let cmnCrTime: UInt32        = 0x0000_0200
     /// Last data-modification time (`struct timespec`, 16 B). Free: it rides in
     /// the bulk buffer the walk already fills, no extra syscall. "Regenerable
     /// *and* cold" is the only delete signal strong enough to act on unprompted
     /// (SPEC-14 §3.4), and size alone can never express it.
     static let cmnModTime: UInt32       = 0x0000_0400
+    /// Last inode change (`struct timespec`). Requested only by the temporary-
+    /// files walk: unlike the mtime, nothing can set it back, so it records when
+    /// an unpacked archive actually landed rather than when its files were made.
+    static let cmnChgTime: UInt32       = 0x0000_0800
     static let cmnFlags: UInt32         = 0x0004_0000 // BSD st_flags (u_int32) — UF_COMPRESSED lives here
     static let cmnFileID: UInt32        = 0x0200_0000 // inode number (u_int64), exact mode
     static let cmnError: UInt32         = 0x2000_0000
@@ -38,7 +46,9 @@ enum FSAttr {
     static let fileAllocSize: UInt32    = 0x0000_0004 // on-disk size, all forks
 
     // vnode object types (sys/vnode.h)
+    static let vreg: UInt32 = 1
     static let vdir: UInt32 = 2
+    static let vlnk: UInt32 = 5
 }
 
 /// A single entry yielded by the bulk enumerator.
@@ -72,6 +82,12 @@ struct BulkEntry {
     /// filesystem that doesn't report the attribute must not read as "ancient",
     /// which is exactly the inference a cold-data annotation would draw from it.
     let modTime: Int64
+    /// Creation and last inode change, unix seconds — `0` unless the
+    /// enumerator was asked for `activityTimes`.
+    let creationTime: Int64
+    let changeTime: Int64
+    /// vnode type (`VREG`, `VDIR`, `VLNK`, `VSOCK`…) — `0` when unreported.
+    let objectType: UInt32
 
     /// Content stored compressed (APFS/HFS+ transparent compression): the
     /// apparent size exceeds the footprint because the data shrank.
@@ -98,6 +114,7 @@ func enumerateDirectory(
     buffer: UnsafeMutableRawPointer,
     bufferSize: Int,
     hardlinkAware: Bool = false,
+    activityTimes: Bool = false,
     _ body: (BulkEntry) -> Void
 ) -> Int {
     var attrList = attrlist()
@@ -112,6 +129,11 @@ func enumerateDirectory(
     if hardlinkAware {
         attrList.commonattr |= FSAttr.cmnDevID | FSAttr.cmnFileID
         attrList.fileattr |= FSAttr.fileLinkCount
+    }
+    // Same gating for the creation and change times: only the temporary-files
+    // walk asks.
+    if activityTimes {
+        attrList.commonattr |= FSAttr.cmnCrTime | FSAttr.cmnChgTime
     }
 
     var errorCount = 0
@@ -174,6 +196,14 @@ func enumerateDirectory(
                 off += 4
             }
 
+            // ATTR_CMN_CRTIME (0x00000200) packs after OBJTYPE (0x08) and before
+            // MODTIME, as a full `struct timespec`.
+            var creationTime: Int64 = 0
+            if commonReturned & FSAttr.cmnCrTime != 0 {
+                creationTime = Int64(entry.loadUnaligned(fromByteOffset: off, as: time_t.self))
+                off += MemoryLayout<timespec>.size
+            }
+
             // ATTR_CMN_MODTIME (0x00000400) packs after OBJTYPE (0x08) and
             // before FLAGS (0x00040000) — ascending-bit order. The value is a
             // `struct timespec` (16 B here), not a bare time_t: read the whole
@@ -181,6 +211,14 @@ func enumerateDirectory(
             var modTime: Int64 = 0
             if commonReturned & FSAttr.cmnModTime != 0 {
                 modTime = Int64(entry.loadUnaligned(fromByteOffset: off, as: time_t.self))
+                off += MemoryLayout<timespec>.size
+            }
+
+            // ATTR_CMN_CHGTIME (0x00000800) packs right after MODTIME, also as a
+            // full `struct timespec`.
+            var changeTime: Int64 = 0
+            if commonReturned & FSAttr.cmnChgTime != 0 {
+                changeTime = Int64(entry.loadUnaligned(fromByteOffset: off, as: time_t.self))
                 off += MemoryLayout<timespec>.size
             }
 
@@ -244,7 +282,10 @@ func enumerateDirectory(
                     fileID: fileID,
                     deviceID: deviceID,
                     linkCount: linkCount,
-                    modTime: modTime
+                    modTime: modTime,
+                    creationTime: creationTime,
+                    changeTime: changeTime,
+                    objectType: objType
                 ))
             }
 
