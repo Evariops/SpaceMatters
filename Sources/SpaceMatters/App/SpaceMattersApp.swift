@@ -38,6 +38,22 @@ enum Entry {
             let root = (next?.hasPrefix("-") == false ? next : nil) ?? NSHomeDirectory()
             exit(MCPRelay.run(rootPath: root))
         }
+        if let idx = args.firstIndex(of: "--tui") {
+            // No path means the home menu — disks, machines, clusters and the
+            // cleanup pass, as the window's splash offers. A path skips
+            // straight to browsing it.
+            //
+            // A mistyped flag is a usage error, not a silent fallback: `--tui
+            // -recursive` quietly opening the menu is how someone concludes
+            // the flag worked. (`--mcp` above keeps its lenient parsing: its
+            // arguments come from an installed config, not from a keyboard.)
+            let rest = Array(args[(idx + 1)...])
+            guard rest.count <= 1, rest.first?.hasPrefix("-") != true else {
+                print("usage: SpaceMatters --tui [path]")
+                exit(2)
+            }
+            exit(TUI.run(path: rest.first))
+        }
         if let idx = args.firstIndex(of: "--briefing") {
             guard idx + 1 < args.count else {
                 print("usage: SpaceMatters --briefing <path> [max-nodes]")

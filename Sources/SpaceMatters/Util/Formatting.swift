@@ -30,6 +30,12 @@ enum Format {
         countFormatter.string(from: NSNumber(value: value)) ?? "\(value)"
     }
 
+    /// A count with its noun, pluralised: "1 file", "1,204 files". Cheap, and
+    /// it keeps "1 files here" out of an interface that is otherwise careful.
+    static func plural(_ count: Int64, _ singular: String, _ plural: String? = nil) -> String {
+        "\(self.count(count)) " + (count == 1 ? singular : (plural ?? singular + "s"))
+    }
+
     /// Coarse relative age ("3w ago", "5mo ago").
     ///
     /// Coarse on purpose: it exists to separate a build from yesterday from one
@@ -47,6 +53,23 @@ enum Format {
         case ..<(730 * day): return "\(Int(seconds / (30 * day)))mo ago"
         default: return "\(Int(seconds / (365 * day)))y ago"
         }
+    }
+
+    /// A share in whole percents ("47%", "<1%", "100%") — never a decimal
+    /// whose separator would disagree with the sizes beside it. `nil` when
+    /// there is no whole to be a share of.
+    static func share(_ part: Int64, of whole: Int64) -> String? {
+        guard whole > 0 else { return nil }
+        let pct = Double(part) / Double(whole) * 100
+        if pct >= 99.5 { return "100%" }
+        if pct < 0.5 { return "<1%" }
+        return "\(Int(pct.rounded()))%"
+    }
+
+    /// Seconds with one decimal, separator localized like `bytes`.
+    static func seconds(_ value: TimeInterval) -> String {
+        let text = String(format: "%.1f s", value)
+        return decimalSeparator == "." ? text : text.replacingOccurrences(of: ".", with: decimalSeparator)
     }
 
     static func rate(_ value: Double) -> String {

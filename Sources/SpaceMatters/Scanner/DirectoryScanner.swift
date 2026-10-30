@@ -285,6 +285,7 @@ final class DirectoryScanner: ScanBackend {
         let fd = open(item.path, O_RDONLY | O_DIRECTORY)
         if fd < 0 {
             errorCount.wrappingAdd(1, ordering: .relaxed)
+            item.node.markUnreadable()
             item.node.finishScan(children: [], filesLogical: 0, filesPhysical: 0, fileCount: 0)
             dirCount.wrappingAdd(1, ordering: .relaxed)
             return []

@@ -327,11 +327,7 @@ enum TreeDigest {
 
     /// Percent of the parent. `nil` for the root (no parent to be a share of).
     private static func share(_ part: Int64, of whole: Int64) -> String? {
-        guard whole > 0 else { return nil }
-        let pct = Double(part) / Double(whole) * 100
-        if pct >= 99.5 { return "100%" }
-        if pct < 0.5 { return "<1%" }
-        return "\(Int(pct.rounded()))%"
+        Format.share(part, of: whole)
     }
 
     /// Absolute paths of every known cleanup target, so the digest can say "this
