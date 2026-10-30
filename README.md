@@ -63,7 +63,7 @@ With no path it opens the same menu the window's home screen shows: mounted disk
 
 `/` finds folders by name across the scan ("19 `node_modules`, 6.7 GiB between them"), `T` ranks the largest, `A` the ones nobody has written to in six months — the questions the MCP tools answer, without an assistant. `c` copies the briefing. `m` opens the action menu, which doubles as the key legend, and `?` shows the rest.
 
-**It deletes too.** `d` moves the selected row to the Trash, `D` deletes it for good, and the Low-Hanging Fruits screen empties the caches you tick — through the very same controllers, fences and `cleanup.jsonl` journal as the window, with a confirmation that names the size and the full path first. Nothing is removed mid-scan, nothing on a VM or SSH scan, and permanent deletion will not take `⏎` for an answer.
+**It deletes too.** `d` moves the selected row to the Trash, `D` deletes it for good, and the Low-Hanging Fruits screen empties the caches you tick — through the very same controllers and fences as the window, with a confirmation that names the size and the full path first, and every deletion recorded in `cleanup.jsonl`. Nothing is removed mid-scan, nothing on a VM or SSH scan, and permanent deletion will not take `⏎` for an answer. A confirmation only takes a key pressed after it is on screen: a paste, or keys typed ahead, cannot answer it.
 
 No curses, no TUI framework: plain terminal sequences, same binary, no extra dependency. Ctrl-Z and `fg` work, the terminal comes back cooked whatever kills the process, and `SPACEMATTERS_TUI_ASCII=1` swaps the box drawing and bars for ASCII if your terminal draws ambiguous-width characters wide.
 

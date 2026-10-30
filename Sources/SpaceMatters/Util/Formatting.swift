@@ -55,6 +55,23 @@ enum Format {
         }
     }
 
+    /// A share in whole percents ("47%", "<1%", "100%") — never a decimal
+    /// whose separator would disagree with the sizes beside it. `nil` when
+    /// there is no whole to be a share of.
+    static func share(_ part: Int64, of whole: Int64) -> String? {
+        guard whole > 0 else { return nil }
+        let pct = Double(part) / Double(whole) * 100
+        if pct >= 99.5 { return "100%" }
+        if pct < 0.5 { return "<1%" }
+        return "\(Int(pct.rounded()))%"
+    }
+
+    /// Seconds with one decimal, separator localized like `bytes`.
+    static func seconds(_ value: TimeInterval) -> String {
+        let text = String(format: "%.1f s", value)
+        return decimalSeparator == "." ? text : text.replacingOccurrences(of: ".", with: decimalSeparator)
+    }
+
     static func rate(_ value: Double) -> String {
         if value >= 1000 {
             return String(format: "%.1fk/s", value / 1000)

@@ -141,6 +141,41 @@ enum TextCell {
         }
         return lines
     }
+
+    /// A path, wrapped without losing a character: broken after a `/` where
+    /// that fits, mid-name where nothing does. `wrap` cuts an over-long word
+    /// with an ellipsis, which is right for prose and wrong here — in a
+    /// deletion prompt the whole path is the point of showing it.
+    static func wrapPath(_ path: String, _ width: Int) -> [String] {
+        guard width > 0 else { return [] }
+        var segments: [String] = []
+        var segment = ""
+        for character in path {
+            segment.append(character)
+            if character == "/" { segments.append(segment); segment = "" }
+        }
+        if !segment.isEmpty { segments.append(segment) }
+
+        var lines: [String] = []
+        var line = ""
+        for segment in segments {
+            if self.width(line + segment) <= width {
+                line += segment
+                continue
+            }
+            if !line.isEmpty { lines.append(line) }
+            line = ""
+            for character in segment {
+                if !line.isEmpty, self.width(line + String(character)) > width {
+                    lines.append(line)
+                    line = ""
+                }
+                line.append(character)
+            }
+        }
+        if !line.isEmpty || lines.isEmpty { lines.append(line) }
+        return lines
+    }
 }
 
 /// The SGR sequences the terminal UI draws with. Colour is used for meaning

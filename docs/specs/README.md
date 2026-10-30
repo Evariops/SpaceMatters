@@ -28,6 +28,6 @@ Guiding principle (carried over from the plan): **integrity > performance > robu
 | [SPEC-12](SPEC-12-auto-update.md) | Auto-updates (Sparkle 2) | J1.x, D4 | 1 d | SPEC-07 |
 | [SPEC-13](SPEC-13-sunburst.md) | **Sunburst view** — polar projection of the world (same scan, no re-scan on switch) | feature request | 1–2 d | SPEC-09, SPEC-10 |
 | [SPEC-14](SPEC-14-mcp-llm-analysis.md) | **LLM analysis** — token-budgeted digests, MCP server, verdicts painted back onto the map — shipped | feature request | 5–6 d (4 increments) | SPEC-09, SPEC-10, SPEC-13 (phase 3 only) |
-| [SPEC-15](SPEC-15-terminal-ui.md) | **Terminal UI** — `--tui`: the live outline in a terminal, read-only, no dependency — phase 0 | feature request | ~1 d (phase 0) | — |
+| [SPEC-15](SPEC-15-terminal-ui.md) | **Terminal UI** — `--tui`: the app in a terminal — menu, live outline, queries, cleanup and deletion; no dependency — phase 1 | feature request | phase 1 done | — |
 
 **Recommended order**: SPEC-02 (unblocks SPEC-04 and closes A6/A7 cleanly) → SPEC-01 → SPEC-03 → SPEC-08 → SPEC-04 → SPEC-05/06/07 depending on product priorities.

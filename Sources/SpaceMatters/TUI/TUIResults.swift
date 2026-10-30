@@ -143,7 +143,7 @@ struct TUIResults {
             let fraction = scanTotal > 0 ? Double(bytes) / Double(scanTotal) : 0
             let written = hit.node.newestMTime.load(ordering: .relaxed)
             var text = TextCell.padLeft(Format.bytes(bytes), 10)
-                + "  " + TextCell.padLeft(String(format: "%.1f%%", fraction * 100), 6)
+                + "  " + TextCell.padLeft(Format.share(hit.node.sizeOnDisk, of: scanTotal) ?? "—", 6)
             if showBar { text += "  " + TextCell.bar(fraction, width: 10) }
             if showFiles { text += "  " + TextCell.padLeft(Format.count(hit.node.fileCount.load(ordering: .relaxed)), 11) }
             text += "  " + TextCell.padLeft(

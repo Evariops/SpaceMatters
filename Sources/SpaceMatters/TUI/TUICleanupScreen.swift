@@ -43,7 +43,7 @@ struct TUICleanupScreen {
     // MARK: Keys
 
     mutating func apply(_ key: TerminalKey) -> TUIRequest {
-        let rows = state.rows
+        let rows = ordered
         let page = max(1, listHeight - 1)
         switch key {
         case .up, .char("k"): move(by: -1, in: rows)
@@ -71,11 +71,25 @@ struct TUICleanupScreen {
         selectedID = rows[min(max(current + delta, 0), rows.count - 1)].id
     }
 
+    /// Rows in display order: grouped by category, each in the order it
+    /// first appears. The controller appends discovered targets at the end of
+    /// its list, and they belong in their own section — not under a second
+    /// heading of the same name at the bottom.
+    private var ordered: [TUICleanupRow] {
+        var categories: [String] = []
+        var groups: [String: [TUICleanupRow]] = [:]
+        for row in state.rows {
+            if groups[row.category] == nil { categories.append(row.category) }
+            groups[row.category, default: []].append(row)
+        }
+        return categories.flatMap { groups[$0] ?? [] }
+    }
+
     // MARK: Rendering
 
     mutating func body(width: Int, height: Int) -> [String] {
         listHeight = max(0, height)
-        let rows = state.rows
+        let rows = ordered
         let cursor = rows.firstIndex { $0.id == selectedID } ?? 0
 
         var lines: [(text: String, kind: Kind)] = []
@@ -145,7 +159,7 @@ struct TUICleanupScreen {
         var detail: String
         switch row.size {
         case .blocked(let reason): detail = reason
-        case .denied: detail = "unreadable — Full Disk Access would let the app size it"
+        case .denied: detail = "unreadable — Full Disk Access for this terminal would let it be sized"
         default: detail = row.note
         }
         if let native = row.nativeLabel { detail = "\(native) · " + detail }

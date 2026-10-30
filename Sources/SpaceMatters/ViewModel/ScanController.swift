@@ -1315,6 +1315,7 @@ final class ScanController {
             a = n.parent
         }
         node.zeroAggregates()
+        node.clearUnreadable()
 
         // Re-scan in place: children are created with `node` as their parent, so
         // the parent chain stays intact all the way to the real root.

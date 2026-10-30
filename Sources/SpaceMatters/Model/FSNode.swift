@@ -105,6 +105,12 @@ final class FSNode {
         gTreeLock.lock(); _unreadable = true; gTreeLock.unlock()
     }
 
+    /// Ahead of a re-read: the scanner marks the folder again if it still
+    /// cannot get in, and a permission fixed since then clears the flag.
+    func clearUnreadable() {
+        gTreeLock.lock(); _unreadable = false; gTreeLock.unlock()
+    }
+
     var childCount: Int {
         gTreeLock.lock(); defer { gTreeLock.unlock() }
         return _children.count

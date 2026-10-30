@@ -8,10 +8,16 @@ struct TUIFile: Equatable {
     /// On-disk (allocated) bytes — what deleting frees, as everywhere else.
     let bytes: Int64
     let apparent: Int64
+    /// Stored compressed by the filesystem: the gap between `apparent` and
+    /// `bytes` is compression, not holes. Carried through to `remove(file:)`,
+    /// which subtracts the gap from the matching aggregate.
+    var compressed = false
 
     var divergence: SizeDivergence? {
-        SizeDivergence.notable(onDisk: bytes, apparent: apparent,
-                               sparseExcess: max(0, apparent - bytes), compressedExcess: 0)
+        let gap = max(0, apparent - bytes)
+        return SizeDivergence.notable(onDisk: bytes, apparent: apparent,
+                                      sparseExcess: compressed ? 0 : gap,
+                                      compressedExcess: compressed ? gap : 0)
     }
 }
 

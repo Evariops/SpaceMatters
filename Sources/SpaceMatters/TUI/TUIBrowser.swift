@@ -212,7 +212,11 @@ struct TUIBrowser {
         let node = current
         let key = ObjectIdentifier(node)
         let count = node.directFileCount
-        if let listing, listing.node == key, listing.count == count { return }
+        // An empty answer for a folder that has files is a listing still on
+        // its way (the host enumerates off the main actor): ask again next
+        // frame rather than keep the placeholder for good.
+        if let listing, listing.node == key, listing.count == count,
+           !(listing.files.isEmpty && count > 0) { return }
         listing = (key, count, filesProvider(node))
     }
 
@@ -336,7 +340,7 @@ struct TUIBrowser {
 
     /// The context line: where you are, and what is there.
     func subtitle(width: Int, typeCount: Int) -> String {
-        if showTypes { return "whole scan, exact — \(Format.count(Int64(typeCount))) types" }
+        if showTypes { return "whole scan — \(Format.count(Int64(typeCount))) types" }
         let node = current
         var facts = "\(Format.bytes(node.sizeOnDisk)) on disk · "
             + Format.plural(node.fileCount.load(ordering: .relaxed), "file")
@@ -431,8 +435,10 @@ struct TUIBrowser {
     /// nothing to reclaim in the one place there is.
     private var emptyReason: String {
         if current.isUnreadable {
-            return "(unreadable — permission denied. Full Disk Access in System Settings "
-                + "› Privacy & Security would let it be read)"
+            // A process started from a shell is the terminal's (or sshd's) in
+            // macOS privacy terms: that is whose Full Disk Access counts here.
+            return "(unreadable — permission denied. If macOS privacy protection is why, "
+                + "Full Disk Access for the terminal this runs in would let it be read)"
         }
         return current.isScanned ? "(no files)" : "(scanning…)"
     }
@@ -455,7 +461,7 @@ struct TUIBrowser {
         let fraction = total > 0 ? Double(row.bytes) / Double(total) : 0
         // 0 means unknown (streamed scans carry no timestamps) — never 1970.
         let age = row.written > 0 ? Format.age(Date(timeIntervalSince1970: Double(row.written))) : "—"
-        return line(size: Format.bytes(row.bytes), percent: String(format: "%.1f%%", fraction * 100),
+        return line(size: Format.bytes(row.bytes), percent: Format.share(row.bytes, of: total) ?? "—",
                     bar: TextCell.bar(fraction, width: columns.bar), files: Format.count(row.files),
                     age: age, name: name, columns: columns)
     }
@@ -471,7 +477,7 @@ struct TUIBrowser {
         for row in types.dropFirst(typesScroll).prefix(listHeight) {
             let fraction = total > 0 ? Double(row.physical) / Double(total) : 0
             var s = TextCell.padLeft(Format.bytes(row.physical), 10)
-                + "  " + TextCell.padLeft(String(format: "%.1f%%", fraction * 100), 6)
+                + "  " + TextCell.padLeft(Format.share(row.physical, of: total) ?? "—", 6)
             if showBar { s += "  " + TextCell.bar(fraction, width: 10) }
             s += "  " + TextCell.padLeft(Format.count(row.count), 11) + "  " + TextCell.sanitize(row.name)
             out.append(TextCell.fit(s, width))

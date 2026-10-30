@@ -1,7 +1,7 @@
 # SPEC-15 — Terminal UI: the app, in a terminal
 
 > **Request**: a TUI version of SpaceMatters — and then: make it play the game of a real TUI, without losing features, with a proper menu and a way to delete.
-> **Status**: 🟢 **Phase 1 implemented** — `SpaceMatters --tui [path]`: [TUI](../../Sources/SpaceMatters/TUI/TUI.swift), [TUIApp](../../Sources/SpaceMatters/TUI/TUIApp.swift), [AppTUIHost](../../Sources/SpaceMatters/TUI/AppTUIHost.swift), the screens ([home](../../Sources/SpaceMatters/TUI/TUIHome.swift), [browser](../../Sources/SpaceMatters/TUI/TUIBrowser.swift), [results & tables](../../Sources/SpaceMatters/TUI/TUIResults.swift), [cleanup](../../Sources/SpaceMatters/TUI/TUICleanupScreen.swift)), [Terminal](../../Sources/SpaceMatters/TUI/Terminal.swift), [TextCell & Glyphs](../../Sources/SpaceMatters/TUI/TUIText.swift), 51 tests in [TUITests](../../Tests/SpaceMattersTests/TUITests.swift).
+> **Status**: 🟢 **Phase 1 implemented** — `SpaceMatters --tui [path]`: [TUI](../../Sources/SpaceMatters/TUI/TUI.swift), [TUIApp](../../Sources/SpaceMatters/TUI/TUIApp.swift), [AppTUIHost](../../Sources/SpaceMatters/TUI/AppTUIHost.swift), the screens ([home](../../Sources/SpaceMatters/TUI/TUIHome.swift), [browser](../../Sources/SpaceMatters/TUI/TUIBrowser.swift), [results & tables](../../Sources/SpaceMatters/TUI/TUIResults.swift), [cleanup](../../Sources/SpaceMatters/TUI/TUICleanupScreen.swift)), [Terminal](../../Sources/SpaceMatters/TUI/Terminal.swift), [TextCell & Glyphs](../../Sources/SpaceMatters/TUI/TUIText.swift), 62 tests in [TUITests](../../Tests/SpaceMattersTests/TUITests.swift).
 > **Guiding constraint**: same engine, same tree, same controllers. The terminal is a different *view* of the app, never a second app — and never a weaker promise.
 
 ## 1. Objective
@@ -57,7 +57,7 @@ Long operations — a delete, a clean, a `kubectl` round-trip, the probes — ru
 
 ### 2.4 Deleting, and what stands in front of it
 
-Phase 0 refused deletion on the grounds that "a keystroke in a terminal is not a fenced, journalled cleanup pass". The answer in phase 1 is not to loosen that bar but to clear it: the terminal calls `ScanController.remove(directory:permanently:)` and `CleanupController.cleanSelected()`, so it inherits every guard the window has — host scans only, never mid-scan, one structural operation at a time, epoch-checked across every suspension, aggregates and the file-type table corrected on the way back, `cleanup.jsonl` journalled.
+Phase 0 refused deletion on the grounds that "a keystroke in a terminal is not a fenced, journalled cleanup pass". The answer in phase 1 is not to loosen that bar but to clear it: the terminal calls `ScanController.remove(directory:permanently:)` and `CleanupController.cleanSelected()`, so it inherits every guard the window has — host scans only, never mid-scan, one structural operation at a time, epoch-checked across every suspension, aggregates and the file-type table corrected on the way back. The cleanup pass journals itself; `d` and `D` are journalled by the terminal (`terminal-trash` / `terminal-delete` in `cleanup.jsonl`), since `ScanController.remove` writes no trail of its own.
 
 On top of that, the terminal adds its own:
 
@@ -65,7 +65,10 @@ On top of that, the terminal adds its own:
 |---|---|
 | `d` moves to the **Trash**; `D` deletes for good | the reversible path is the default and the easy keystroke |
 | the Trash takes `⏎`, permanent deletion only takes `y` | ⏎ is muscle memory; it must not be enough where nothing comes back |
-| the confirmation shows size **and** the resolved full path | the wrong `node_modules` is one row away |
+| the confirmation shows size **and** the resolved full path, wrapped rather than cut | the wrong `node_modules` is one row away |
+| a confirmation is only answered by a key read **after it was drawn**: the rest of the read that opened it is dropped and the input queue flushed once it is on screen; while it is up, a read bringing more than one key is refused whole | a pasted `Do you have a minute?⏎` is `D` then `y` |
+| bracketed paste: a paste is text, taken by a text field and dropped everywhere else | a paste's letters are commands in the browser |
+| a folder never read (unreadable, or not reached) says "size unknown", never "0 B", and `D` refuses it; after a stopped scan sizes read "at least" | "0 B on disk" reads as "it is empty" |
 | refused mid-scan, on VM/SSH scans, on the scan root, while a job runs | each stated in the footer rather than silently ignored |
 | `space` picks, nothing is pre-picked; "select all" skips non-regenerable targets | the Trash and orphaned editor state are ticked one by one or not at all |
 | the frame says what happened: "Moved to Trash — node_modules (1.2 GiB)" | and the screens reconcile, so a trail standing inside a deleted folder walks back out |
@@ -123,7 +126,7 @@ Raw mode turns off signal generation, so Ctrl-C and Ctrl-D arrive as keys and qu
 |---|---|
 | `↑` `↓` / `k` `j`, `PgUp` `PgDn`, `g` `G` | move, page, jump |
 | `→` `⏎` / `l` | open a folder (or describe a file) |
-| `←` `⌫` / `h` | up one level (`esc` too); at the root, back to the home menu |
+| `←` `⌫` / `h` | up one level (`esc` too); at the root, back to the home menu — after asking, since it discards the scan |
 | `t` · `s` · `i` | file types · change sort · what is this |
 | `/` · `T` · `A` | find by name · largest folders · cold folders (6 months+) |
 | `d` / `fn⌫` · `D` | move to the Trash · delete permanently (asks with `y`) |
@@ -179,7 +182,7 @@ The header's totals at the end of a scan against `--scan` on the same path.
 - 🔬 `pthread_sigmask` blocks the handled signals on the thread doing the termios work only. An asynchronous signal can still be delivered to another thread, which is why the handler is written to be correct on its own rather than relying on the mask.
 - 🔬 A folder is marked unreadable when `open(2)` refuses it. A directory that opens but fails partway through (a dying mount) still only raises the scan-wide `skipped` count.
 - 🔬 `DispatchQueue.main.sync` from the frame thread assumes the main run loop is alive. It is started before the frame thread and never stopped; the process exits from the frame loop, after restoring the terminal.
-- 🔬 Full Disk Access is a property of the *binary*. The app bundle has it; `.build/debug/SpaceMatters` is a different binary, so a dev build sizes protected locations (the Trash) as `denied` — shown as such, never as 0 B.
+- 🔬 **Unverified: whose Full Disk Access applies.** macOS privacy protection attributes a process started from Terminal.app (or `sshd`) to that terminal as its *responsible* process, unless the terminal disclaims it; so the app bundle's grant most likely does not reach `SpaceMatters --tui` launched from a shell, and the terminal's own grant is what counts. The UI says so ("Full Disk Access for the terminal this runs in"), and either way an unreadable folder is flagged and every total called a lower bound. Same open question as SPEC-14 §6 for `--mcp`.
 
 ## 6. Next, in order of value per line of code
 

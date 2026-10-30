@@ -11,6 +11,12 @@ enum TerminalKey: Equatable {
     /// Ctrl-C / Ctrl-D: raw mode turns signal generation off, so they arrive
     /// as bytes and quit like `q` instead of leaving the terminal raw.
     case interrupt
+    /// Ctrl-Z, for the same reason: raw mode delivers it as a byte, and the
+    /// frame loop turns it back into the job-control stop it stands for.
+    case suspend
+    /// Text the terminal marked as pasted (bracketed paste). Never a command:
+    /// only a text field takes it, so a paste cannot drive the interface.
+    case paste(String)
     case char(Character)
 }
 
@@ -49,8 +55,10 @@ enum Terminal {
             sessionFlag.pointee = 1
             // Alternate screen, cursor hidden, autowrap off — the last is a
             // safety net: a line misjudged one cell too wide is clipped instead
-            // of wrapping and shearing every line below it.
-            output("\u{1B}[?1049h\u{1B}[?25l\u{1B}[?7l\u{1B}[2J")
+            // of wrapping and shearing every line below it. Bracketed paste on,
+            // so a paste arrives marked as one rather than as keystrokes: a
+            // pasted `Do you have a minute?⏎` must not be read as `D`, then `y`.
+            output("\u{1B}[?1049h\u{1B}[?25l\u{1B}[?7l\u{1B}[?2004h\u{1B}[2J")
             return true
         }
     }
@@ -77,6 +85,23 @@ enum Terminal {
         installHandlers() // SIGTSTP was reset to the default to suspend for real
         _ = enter()
         return true
+    }
+
+    /// Ctrl-Z: stop the way the shell expects. The SIGTSTP handler gives the
+    /// terminal back first, and `resumeIfNeeded` takes it again on `fg`.
+    static func suspend() {
+        raise(SIGTSTP)
+    }
+
+    /// Drop everything typed or pasted that has not been read yet — called
+    /// once a question is on screen, so that only a key pressed after it was
+    /// drawn can answer it. A paste cut short by the flush is closed too: what
+    /// is left of it either went with the flush or arrives as a burst, which a
+    /// confirmation refuses (`TUIApp.apply(batch:)`).
+    static func discardInput() {
+        tcflush(STDIN_FILENO, TCIFLUSH)
+        pending = []
+        pasting = false
     }
 
     /// The window was resized since the last call (SIGWINCH).
@@ -169,6 +194,8 @@ enum Terminal {
     /// Bytes of an escape sequence split across reads. Touched only by the
     /// frame loop's thread.
     private nonisolated(unsafe) static var pending: [UInt8] = []
+    /// Inside a bracketed paste whose end marker has not been read yet.
+    private nonisolated(unsafe) static var pasting = false
 
     /// Wait up to `timeout` milliseconds for keys. `[]` on timeout; `nil` once
     /// input is gone (terminal closed) — the caller must stop rather than spin
@@ -177,19 +204,20 @@ enum Terminal {
         guard let bytes = read(timeout: timeout) else { return nil }
         guard !bytes.isEmpty || !pending.isEmpty else { return [] }
 
-        var result = decode(pending + bytes)
+        var result = decode(pending + bytes, pasting: &pasting)
         pending = result.remainder
         // An unfinished sequence is held back rather than misread as `Esc` plus
         // its letters. Give the rest of it one short window to arrive — long
         // enough for a terminal's own bytes, short enough that a bare Esc
-        // still feels instant.
-        if !pending.isEmpty {
+        // still feels instant. Inside a paste the held-back bytes are the start
+        // of its end marker: they wait for the next read, however long.
+        if !pending.isEmpty, !pasting {
             if let more = read(timeout: continuationMilliseconds), !more.isEmpty {
-                let second = decode(pending + more)
+                let second = decode(pending + more, pasting: &pasting)
                 result.keys += second.keys
                 pending = second.remainder
             }
-            if !pending.isEmpty {
+            if !pending.isEmpty, !pasting {
                 // Nothing came: it really was a lone Esc (or junk).
                 result.keys += flushPending()
             }
@@ -230,9 +258,36 @@ enum Terminal {
     /// as `remainder` for the next read to complete — never misread as
     /// keystrokes.
     static func decode(_ bytes: [UInt8]) -> (keys: [TerminalKey], remainder: [UInt8]) {
+        var pasting = false
+        return decode(bytes, pasting: &pasting)
+    }
+
+    /// `ESC [ 200 ~` … `ESC [ 201 ~`: what a terminal wraps a paste in once
+    /// bracketed paste is on.
+    private static let pasteStart: [UInt8] = Array("\u{1B}[200~".utf8)
+    private static let pasteEnd: [UInt8] = Array("\u{1B}[201~".utf8)
+
+    /// The same, carrying whether a paste is open across reads: a paste can be
+    /// far longer than one read, and none of it may come out as keystrokes.
+    static func decode(_ bytes: [UInt8], pasting: inout Bool) -> (keys: [TerminalKey], remainder: [UInt8]) {
         var keys: [TerminalKey] = []
         var i = 0
         while i < bytes.count {
+            if pasting {
+                if let end = firstIndex(of: pasteEnd, in: bytes, from: i) {
+                    if end > i { keys.append(.paste(String(decoding: bytes[i..<end], as: UTF8.self))) }
+                    pasting = false
+                    i = end + pasteEnd.count
+                    continue
+                }
+                // The end marker may be cut by the read: hold back whatever
+                // could be its beginning, hand over the rest.
+                var held = min(pasteEnd.count - 1, bytes.count - i)
+                while held > 0, !bytes[(bytes.count - held)...].elementsEqual(pasteEnd.prefix(held)) { held -= 1 }
+                let stop = bytes.count - held
+                if stop > i { keys.append(.paste(String(decoding: bytes[i..<stop], as: UTF8.self))) }
+                return (keys, Array(bytes[stop...]))
+            }
             let byte = bytes[i]
             switch byte {
             case 0x1B:
@@ -245,6 +300,11 @@ enum Terminal {
                         j += 1
                     }
                     guard j < bytes.count else { return (keys, Array(bytes[i...])) }
+                    if bytes[j] == UInt8(ascii: "~"), params == Array("200".utf8) {
+                        pasting = true
+                        i = j + 1
+                        continue
+                    }
                     if let key = sequenceKey(final: bytes[j], params: params) { keys.append(key) }
                     i = j + 1
                     continue
@@ -259,6 +319,8 @@ enum Terminal {
                 keys.append(.backspace)
             case 0x03, 0x04:
                 keys.append(.interrupt)
+            case 0x1A:
+                keys.append(.suspend)
             case 0x09:
                 keys.append(.tab)
             case 0x20...0x7E:
@@ -284,6 +346,15 @@ enum Terminal {
             i += 1
         }
         return (keys, [])
+    }
+
+    private static func firstIndex(of marker: [UInt8], in bytes: [UInt8], from start: Int) -> Int? {
+        guard bytes.count - start >= marker.count else { return nil }
+        for index in start...(bytes.count - marker.count)
+        where bytes[index..<(index + marker.count)].elementsEqual(marker) {
+            return index
+        }
+        return nil
     }
 
     private static func sequenceKey(final: UInt8, params: [UInt8]) -> TerminalKey? {
@@ -373,7 +444,7 @@ private let resizeFlag = UnsafeMutablePointer<sig_atomic_t>.allocate(capacity: 1
 /// repeats it instead of skipping it.
 private func restoreTerminal() {
     guard sessionFlag.pointee != 0 else { return }
-    let restore: StaticString = "\u{1B}[0m\u{1B}[?7h\u{1B}[?25h\u{1B}[?1049l"
+    let restore: StaticString = "\u{1B}[0m\u{1B}[?2004l\u{1B}[?7h\u{1B}[?25h\u{1B}[?1049l"
     restore.withUTF8Buffer { buffer in
         _ = write(STDOUT_FILENO, buffer.baseAddress, buffer.count)
     }

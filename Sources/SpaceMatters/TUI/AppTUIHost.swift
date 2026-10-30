@@ -28,10 +28,15 @@ final class AppTUIHost: TUIHost {
     private var sourcesValue = TUISources()
     private var tables: [String: TUITable] = [:]
     private var tablesInFlight: Set<String> = []
+    /// Where a terminal deletion is recorded. Injectable, like the cleanup
+    /// controller's.
+    private let journal: (CleanupJournal.Entry) -> Void
 
-    init(scan: ScanController, cleanup: CleanupController) {
+    init(scan: ScanController, cleanup: CleanupController,
+         journal: @escaping (CleanupJournal.Entry) -> Void = { CleanupJournal.append($0) }) {
         self.scan = scan
         self.cleanupController = cleanup
+        self.journal = journal
     }
 
     // MARK: Sampling
@@ -115,7 +120,7 @@ final class AppTUIHost: TUIHost {
     // MARK: Scans
 
     func reloadSources() {
-        job("Looking for disks, machines and clusters…") { [weak self] in
+        startJob("Looking for disks, machines and clusters…") { [weak self] in
             // Every probe shells out; off the main actor, as the splash does.
             let found = await Task.detached(priority: .userInitiated) { () -> TUISources in
                 var s = TUISources()
@@ -162,7 +167,9 @@ final class AppTUIHost: TUIHost {
 
     func files(in node: FSNode) -> [TUIFile] {
         onMain { [scan] in
-            scan.filesIn(node).map { TUIFile(name: $0.name, bytes: $0.physical, apparent: $0.logical) }
+            scan.filesIn(node).map {
+                TUIFile(name: $0.name, bytes: $0.physical, apparent: $0.logical, compressed: $0.compressed)
+            }
         }
     }
 
@@ -170,21 +177,35 @@ final class AppTUIHost: TUIHost {
 
     // MARK: Destructive
 
+    /// Every terminal deletion goes to `cleanup.jsonl`, like a cleanup pass
+    /// does: a permanent delete typed in a terminal is the one that most
+    /// deserves a trail.
     func delete(_ target: TUITarget, permanently: Bool) {
         let verb = permanently ? "Deleting" : "Moving"
         let done = permanently ? "Deleted" : "Moved to Trash"
         let size = Format.bytes(target.bytes)
         let name = target.name
-        job("\(verb) \(name)…") { [scan] in
+        job("\(verb) \(name)…") { [scan, journal] in
+            // Resolved before the removal detaches the node.
+            let path: String?
+            switch target {
+            case .folder(let node): path = scan.path(for: node)
+            case .file(let file, let parent): path = scan.path(for: parent).map { ($0 == "/" ? "" : $0) + "/" + file.name }
+            }
             let ok: Bool
             switch target {
             case .folder(let node):
                 ok = await scan.remove(directory: node, permanently: permanently)
             case .file(let file, let parent):
                 let item = ScanController.FileItem(name: file.name, logical: file.apparent,
-                                                   physical: file.bytes, compressed: false)
+                                                   physical: file.bytes, compressed: file.compressed)
                 ok = await scan.remove(file: item, parent: parent, permanently: permanently)
             }
+            var entry = CleanupJournal.Entry(targetID: permanently ? "terminal-delete" : "terminal-trash",
+                                             engine: permanently ? "unlink" : "trash",
+                                             paths: path.map { [$0] } ?? [name], bytesBefore: target.bytes)
+            if ok { entry.removed = 1 } else { entry.failed = 1 }
+            journal(entry)
             return ok ? "\(done) — \(name) (\(size))"
                       : "Could not remove \(name) — it may be locked, or in use"
         }
@@ -215,7 +236,7 @@ final class AppTUIHost: TUIHost {
         let count = state.selected.count
         guard count > 0 else { return }
         let expected = Format.bytes(state.totalSelected)
-        job("Emptying \(count) target\(count == 1 ? "" : "s") (\(expected))…") { [cleanupController] in
+        startJob("Emptying \(count) target\(count == 1 ? "" : "s") (\(expected))…") { [cleanupController] in
             await cleanupController.cleanSelected()
             let failures = cleanupController.lastFailures
             var text = "Freed \(Format.bytes(cleanupController.lastFreed))"
@@ -239,13 +260,21 @@ final class AppTUIHost: TUIHost {
         lock.unlock()
         guard !already else { return }
 
-        job(kind.loadingLabel) { [weak self] in
+        let started = job(kind.loadingLabel) { [weak self] in
             let table = await Task.detached(priority: .userInitiated) { TUITableBuilder.build(kind) }.value
             self?.withLock {
                 $0.tables[key] = table
                 $0.tablesInFlight.remove(key)
             }
             return nil
+        }
+        // Not started: the key must not stay marked in flight, or this table
+        // could never load again this session.
+        if !started {
+            withLock {
+                $0.tablesInFlight.remove(key)
+                $0.note = "Something is already running — press r once it is done"
+            }
         }
     }
 
@@ -261,9 +290,13 @@ final class AppTUIHost: TUIHost {
     /// Run one long operation off the frame path. Only one at a time: these are
     /// tree surgery, disk walks and vendor commands — overlapping them is how a
     /// second `remove` lands on the tree the first one is rewriting.
-    private func job(_ label: String, _ body: @escaping @MainActor () async -> String?) {
+    ///
+    /// Returns `false` when another job holds the slot and this one did not
+    /// start.
+    @discardableResult
+    private func job(_ label: String, _ body: @escaping @MainActor () async -> String?) -> Bool {
         lock.lock()
-        guard jobLabel == nil else { lock.unlock(); return }
+        guard jobLabel == nil else { lock.unlock(); return false }
         jobLabel = label
         lock.unlock()
         Task { @MainActor [weak self] in
@@ -272,6 +305,15 @@ final class AppTUIHost: TUIHost {
                 $0.jobLabel = nil
                 if let outcome { $0.note = outcome }
             }
+        }
+        return true
+    }
+
+    /// A job the user asked for by name: when the slot is taken, say so rather
+    /// than drop it.
+    private func startJob(_ label: String, _ body: @escaping @MainActor () async -> String?) {
+        if !job(label, body) {
+            withLock { $0.note = "Something is already running — try again once it is done" }
         }
     }
 

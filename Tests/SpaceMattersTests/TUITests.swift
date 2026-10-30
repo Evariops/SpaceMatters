@@ -141,6 +141,31 @@ import Foundation
         #expect(names(plainBrowser.rows()).contains("[files]"))
     }
 
+    /// The host lists a folder's files off the main actor and answers `[]`
+    /// until they land. That first empty answer must not stick: the files show
+    /// as soon as they arrive, on the first visit.
+    @Test func filesShowOnTheFirstVisitWhenTheListingLandsLate() {
+        var browser = TUIBrowser(root: fixture(), rootPath: "/scan")
+        var answers = 0
+        browser.filesProvider = { _ in
+            answers += 1
+            return answers == 1 ? [] : [TUIFile(name: "a.bin", bytes: 250, apparent: 250)]
+        }
+        browser.refreshListing()
+        #expect(!names(browser.rows()).contains("a.bin"))
+        browser.refreshListing() // the next frame
+        #expect(names(browser.rows()).contains("a.bin"))
+    }
+
+    /// A compressed file's gap is compression, not holes — on screen, and in
+    /// what a delete subtracts from the folders above it.
+    @Test func aCompressedFileIsNotCalledSparse() {
+        let file = TUIFile(name: "zeros.txt", bytes: 4096, apparent: 64 << 20, compressed: true)
+        #expect(file.divergence?.label == "compressed")
+        let sparse = TUIFile(name: "disk.img", bytes: 4096, apparent: 64 << 20)
+        #expect(sparse.divergence?.label == "sparse")
+    }
+
     @Test func selectionFollowsItsFolderWhenRowsResort() {
         let root = fixture()
         var browser = TUIBrowser(root: root, rootPath: "/scan")
@@ -178,10 +203,19 @@ import Foundation
         #expect(browser.sort == .size)
     }
 
-    @Test func leavingTheRootGoesHomeInsteadOfNowhere() {
+    /// One "up" too many at the root must not throw away a scan: it is the
+    /// most-used key, and the `h` of a paste. It asks; ⏎ closes, esc stays.
+    @Test func leavingTheRootAsksBeforeDiscardingTheScan() {
         let (app, host) = browse(fixture())
         #expect(app.route == .browser)
         press(app, [.left])
+        guard case .confirm(let confirm)? = app.overlay else { Issue.record("no confirmation"); return }
+        #expect(confirm.title == "Close this scan?")
+        #expect(!confirm.requiresYes)
+        #expect(host.wentHome == 0)
+        press(app, [.escape])
+        #expect(app.route == .browser)       // stayed, scan intact
+        press(app, [.char("q"), .enter])
         #expect(app.route == .home)
         #expect(host.wentHome == 1)
     }
@@ -216,6 +250,111 @@ import Foundation
         #expect(app.overlay != nil)
         press(app, [.char("y")])
         #expect(host.deletions.map(\.permanently) == [true])
+    }
+
+    /// Round 2's blocking finding, as values. A burst — a paste in a terminal
+    /// without bracketed paste, or keys typed ahead while the loop was busy —
+    /// stops at the key that opens a confirmation, and nothing after it may
+    /// answer it. Once the question is up, a burst is refused whole; one key
+    /// read on its own answers.
+    @Test func aBurstCannotAnswerTheConfirmationItOpened() {
+        for burst in ["Do you have a minute?\r", "cd ~/foo\r", "Dy"] {
+            let (app, host) = browse(fixture())
+            #expect(app.apply(batch: keys(burst)) == .awaitAnswer, "\(burst)")
+            #expect(app.isConfirming, "\(burst)")
+            #expect(host.deletions.isEmpty, "\(burst)")
+        }
+        let (app, host) = browse(fixture())
+        #expect(app.apply(batch: [.char("D")]) == .awaitAnswer)
+        #expect(app.apply(batch: [.char("y"), .char("y")]) == .awaitAnswer)
+        #expect(host.deletions.isEmpty)
+        #expect(app.isConfirming)
+        #expect(app.apply(batch: [.char("y")]) == .keepGoing)
+        #expect(host.deletions.map(\.permanently) == [true])
+    }
+
+    /// With bracketed paste on, a paste is text, never keys — and a paste far
+    /// longer than one read, its end marker cut by the read, leaks nothing.
+    @Test func aBracketedPasteIsTextNotKeys() {
+        #expect(Terminal.decode(Array("x\u{1B}[200~Dy\r\u{1B}[201~j".utf8)).keys
+                == [.char("x"), .paste("Dy\r"), .char("j")])
+        var pasting = false
+        let first = Terminal.decode(Array("\u{1B}[200~rm -rf ~\u{1B}[20".utf8), pasting: &pasting)
+        #expect(first.keys == [.paste("rm -rf ~")])
+        #expect(pasting)
+        #expect(first.remainder == Array("\u{1B}[20".utf8))
+        let second = Terminal.decode(first.remainder + Array("1~q".utf8), pasting: &pasting)
+        #expect(second.keys == [.char("q")])
+        #expect(!pasting)
+    }
+
+    /// Only a text field takes a paste, one line of it; anywhere else it is
+    /// dropped whole, because its letters are commands there.
+    @Test func aPasteOnlyGoesIntoATextField() {
+        let (app, host) = browse(fixture())
+        _ = app.apply(.paste("Dy"))
+        #expect(!app.isConfirming)
+        #expect(host.deletions.isEmpty)
+        press(app, [.char("/")])
+        _ = app.apply(.paste("node_\nmodules\u{1B}"))
+        guard case .prompt(let prompt)? = app.overlay else { Issue.record("no prompt"); return }
+        #expect(prompt.value == "node_modules")
+    }
+
+    /// Ctrl-Z arrives as a byte in raw mode; it stops the app like it stops
+    /// anything else in a shell, and nothing typed after it runs.
+    @Test func ctrlZSuspends() {
+        #expect(keys("\u{1A}") == [.suspend])
+        let (app, _) = browse(fixture())
+        #expect(app.apply(batch: [.suspend, .char("D")]) == .suspend)
+        #expect(!app.isConfirming)
+    }
+
+    /// A folder the scanner could not read has no size: the question must not
+    /// say "0 B", and a permanent delete of something never seen is refused.
+    @Test func aFolderNeverReadIsNotAskedAboutAsEmpty() {
+        let root = FSNode(name: "root", parent: nil)
+        let big = leaf("big", in: root, bytes: 1000)
+        let locked = leaf("locked", in: root, bytes: 0, files: 0)
+        locked.markUnreadable()
+        root.finishScan(children: [big, locked], filesLogical: 0, filesPhysical: 0, fileCount: 0)
+        root.aggPhysical.store(1000, ordering: .relaxed)
+        let (app, host) = browse(root)
+
+        press(app, [.down, .char("D")])
+        #expect(!app.isConfirming)
+        #expect(text(app.render(width: 120, height: 12)).contains("never read"))
+        press(app, [.char("d")])
+        guard case .confirm(let confirm)? = app.overlay else { Issue.record("no confirmation"); return }
+        #expect(confirm.lines.first == "Size unknown — this folder was never read")
+        #expect(!confirm.lines.contains { $0.contains("0 B") })
+        #expect(host.deletions.isEmpty)
+    }
+
+    /// After a stopped scan every folder total is a floor, and the question
+    /// says so rather than state it as the size.
+    @Test func aStoppedScanAsksWithALowerBound() {
+        let host = FakeHost()
+        host.phase = .cancelled
+        let (app, _) = browse(fixture(), host: host)
+        press(app, [.char("d")])
+        guard case .confirm(let confirm)? = app.overlay else { Issue.record("no confirmation"); return }
+        #expect(confirm.lines.first?.hasPrefix("At least") == true)
+    }
+
+    /// `--tui <path>` never shows the menu at first, so the probes wait for it
+    /// rather than hold the job slot meanwhile.
+    @Test func aPathGivenUpFrontLeavesTheProbesForTheMenu() {
+        let host = FakeHost()
+        host.tree = fixture()
+        host.sources = TUISources()
+        let app = TUIApp(host: host, loadSources: false)
+        app.open(path: "/scan")
+        app.refresh()
+        #expect(host.reloads == 0)
+        press(app, [.left, .enter])
+        #expect(app.route == .home)
+        #expect(host.reloads == 1)
     }
 
     @Test func escapeCancelsAndSaysSo() {
@@ -314,6 +453,8 @@ import Foundation
         #expect(app.route == .browser)       // still in the scan, one level up
         #expect(host.wentHome == 0)
         press(app, [.escape])
+        #expect(app.isConfirming)            // at the root: asks before closing the scan
+        press(app, [.enter])
         #expect(app.route == .home)
     }
 
@@ -358,6 +499,21 @@ import Foundation
         press(app, [.enter])
         #expect(host.cleaned == 0)
         #expect(text(app.render(width: 100, height: 12)).contains("Still measuring"))
+    }
+
+    /// Discovered targets arrive at the end of the controller's list; on
+    /// screen they sit in their own section, which is listed once.
+    @Test func cleanupSectionsAreListedOnce() {
+        var screen = TUICleanupScreen()
+        func row(_ id: String, _ category: String) -> TUICleanupRow {
+            TUICleanupRow(id: id, name: id, category: category, note: "n", nativeLabel: nil,
+                          regenerable: true, size: .searching, selected: false)
+        }
+        screen.state.rows = [row("trash", "System"), row("npm", "JavaScript"), row("tmp", "System")]
+        let body = text(screen.body(width: 100, height: 20))
+        #expect(body.components(separatedBy: "SYSTEM").count == 2)
+        #expect(body.range(of: "tmp")!.lowerBound < body.range(of: "JAVASCRIPT")!.lowerBound)
+        #expect(body.contains("searching"))
     }
 
     @Test func cleanupShowsWhyARowCannotBeTicked() {
@@ -453,7 +609,7 @@ import Foundation
 
     @Test func quittingWithNothingRunningJustQuits() {
         let (app, _) = browse(fixture())
-        press(app, [.left])              // back to the home menu
+        press(app, [.left, .enter])      // back to the home menu, closing the scan
         #expect(app.apply(.char("q")) == false)
     }
 
@@ -657,7 +813,7 @@ import Foundation
         // padded to the full width — that is what the highlight fills.
         let narrow = browser.body(width: 40, height: 3, types: []).map(plain)
         #expect(narrow[0] == "   on disk       %  name")
-        #expect(narrow[1] == "    1000 B  100.0%  docs/" + String(repeating: " ", count: 15))
+        #expect(narrow[1] == "    1000 B    100%  docs/" + String(repeating: " ", count: 15))
         #expect(narrow[1].count == 40)
 
         // 80 cells: every column is in — 10 + 2 + 6 + 2 + 10 (bar) + 2 + 11
@@ -666,7 +822,7 @@ import Foundation
         // unknown, never 1970.
         let wide = browser.body(width: 80, height: 3, types: []).map(plain)
         #expect(wide[0] == "   on disk       %                    files   written  name")
-        #expect(wide[1].hasPrefix("    1000 B  100.0%  ██████████            2         —  docs/"))
+        #expect(wide[1].hasPrefix("    1000 B    100%  ██████████            2         —  docs/"))
         #expect(TextCell.width(wide[1]) == 80)
     }
 
@@ -750,6 +906,17 @@ import Foundation
     @Test func wrappingKeepsWholeWords() {
         #expect(TextCell.wrap("one two three", 8) == ["one two", "three"])
         #expect(TextCell.wrap("supercalifragilistic", 6) == ["super…"])
+    }
+
+    /// A path keeps every character: broken after a `/`, or mid-name when a
+    /// single name is wider than the line.
+    @Test func pathsWrapWithoutLosingACharacter() {
+        let path = "/tmp/claude-502/-Users-rducom-sources-Evariops-SpaceMatters/be1cd43c/fx/trashme"
+        let lines = TextCell.wrapPath(path, 30)
+        #expect(lines.joined() == path)
+        #expect(lines.allSatisfy { TextCell.width($0) <= 30 })
+        #expect(lines.first == "/tmp/claude-502/")
+        #expect(TextCell.wrapPath("/a/b", 56) == ["/a/b"])
     }
 
     @Test func barsAreExactWidth() {

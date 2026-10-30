@@ -44,8 +44,14 @@ enum TUI {
             return fail("--tui needs a terminal that understands VT sequences (TERM is "
                         + (term.isEmpty ? "unset" : "\"\(term)\"") + ") — use --scan or --briefing", 2)
         }
-        if let path, !FileManager.default.fileExists(atPath: path) {
-            return fail("path does not exist: \(path)", 1)
+        if let path {
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) else {
+                return fail("path does not exist: \(path)", 1)
+            }
+            // A file would be scanned as a folder that cannot be opened, and
+            // reported as needing Full Disk Access: wrong cause, wrong advice.
+            guard isDirectory.boolValue else { return fail("not a folder: \(path)", 1) }
         }
 
         // Built here, on the main thread, before the run loop starts: the
@@ -53,7 +59,7 @@ enum TUI {
         // reaches them through the host.
         let app = MainActor.assumeIsolated { () -> TUIApp in
             let host = AppTUIHost(scan: ScanController(), cleanup: CleanupController())
-            let app = TUIApp(host: host)
+            let app = TUIApp(host: host, loadSources: path == nil)
             if let path { app.open(path: URL(fileURLWithPath: path).standardizedFileURL.path) }
             return app
         }
@@ -89,6 +95,7 @@ enum TUI {
     private static func frames(app: TUIApp) -> Int32 {
         var lastFrame: [String] = []
         var lastSize = (width: 0, height: 0)
+        var flushAfterDraw = false
 
         while true {
             app.refresh()
@@ -112,12 +119,21 @@ enum TUI {
                 // screen, or the diff would skip those lines forever.
                 lastFrame = []
             }
+            if flushAfterDraw {
+                // The question is on screen now. Whatever was typed or pasted
+                // before it was cannot answer it.
+                Terminal.discardInput()
+                flushAfterDraw = false
+            }
 
             // `nil` means input is gone (the terminal was closed): stop rather
             // than spin on a descriptor that reads as ready forever.
             guard let keys = Terminal.readKeys(timeout: tick(for: app.status)) else { return 1 }
-            for key in keys {
-                guard app.apply(key) else { return 0 }
+            switch app.apply(batch: keys) {
+            case .quit: return 0
+            case .suspend: Terminal.suspend()
+            case .awaitAnswer: flushAfterDraw = true
+            case .keepGoing: break
             }
             if app.wantsToQuit { return 0 }
         }

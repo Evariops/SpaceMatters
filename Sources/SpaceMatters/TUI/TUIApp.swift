@@ -77,9 +77,12 @@ final class TUIApp {
     private var note: String?
     private var tick = 0
 
-    init(host: TUIHost) {
+    /// `loadSources: false` for `--tui <path>`: the menu is not shown, and the
+    /// probes (`podman`, `kubectl`…) would hold the one job slot for nothing —
+    /// refusing a delete meanwhile. They run the first time the menu is.
+    init(host: TUIHost, loadSources: Bool = true) {
         self.host = host
-        host.reloadSources()
+        if loadSources { host.reloadSources() }
     }
 
     /// `--tui <path>`: skip the menu and start browsing that folder.
@@ -112,7 +115,7 @@ final class TUIApp {
                 browser?.refreshListing()
             } else if status.phase == .idle {
                 browser = nil
-                route = .home
+                goHome()
             }
             if status.phase == .failed, let failure = status.failure, overlay == nil {
                 overlay = .note(title: "That scan could not run", lines: TextCell.wrap(failure, 56))
@@ -135,10 +138,63 @@ final class TUIApp {
 
     // MARK: Keys
 
+    /// What the frame loop does after a batch of keys.
+    enum BatchOutcome: Equatable {
+        case keepGoing
+        case quit
+        /// Ctrl-Z: give the terminal back and stop.
+        case suspend
+        /// A confirmation is now on screen. The rest of the batch was dropped,
+        /// and the terminal's input queue must be flushed once the question is
+        /// drawn: nothing read before it was visible may answer it.
+        case awaitAnswer
+    }
+
+    /// True while a confirmation is waiting for its answer.
+    var isConfirming: Bool {
+        if case .confirm = overlay { return true }
+        return false
+    }
+
+    /// One read's worth of keys — the frame loop's only way in.
+    ///
+    /// A confirmation is answered by a key pressed *after* reading it. Keys
+    /// stop at the one that opens it: the rest of the read was typed ahead, or
+    /// pasted, before the question existed (a pasted `Do you have a minute?⏎`
+    /// is `D` then `y`, and deleted a folder for good). And while it is up, a
+    /// read that brings more than one key is refused whole — a person answers
+    /// with one key, a paste in a terminal without bracketed paste does not.
+    func apply(batch keys: [TerminalKey]) -> BatchOutcome {
+        if isConfirming, keys.count > 1 {
+            note = "Answer with a single key — that came in as a burst (a paste?)"
+            return .awaitAnswer
+        }
+        for key in keys {
+            if key == .suspend { return .suspend }
+            let wasConfirming = isConfirming
+            guard apply(key) else { return .quit }
+            if wantsToQuit { return .quit }
+            if !wasConfirming, isConfirming { return .awaitAnswer }
+        }
+        return .keepGoing
+    }
+
     /// Applies one key. `false` when the app should close.
     func apply(_ key: TerminalKey) -> Bool {
         note = nil
         if key == .interrupt { return confirmQuitIfBusy() }
+        if key == .suspend { return true } // the frame loop's to act on
+        if case .paste(let text) = key {
+            // Only a text field takes a paste. Anywhere else it is dropped
+            // whole: its letters are commands there.
+            if case .prompt(var prompt) = overlay {
+                prompt.value += Self.pastable(text)
+                overlay = .prompt(prompt)
+            } else {
+                note = "Paste ignored — pasted text only goes into a text field"
+            }
+            return true
+        }
         if overlay != nil { return applyInOverlay(key) }
 
         let request: TUIRequest
@@ -221,14 +277,12 @@ final class TUIApp {
             switch route {
             case .home: return confirmQuitIfBusy()
             case .browser:
-                host.goHome()
-                browser = nil
-                route = .home
+                confirmCloseScan()
             case .results:
                 results = nil
                 route = .browser
             case .cleanup, .table:
-                route = .home
+                goHome()
             }
 
         case .help:
@@ -425,12 +479,27 @@ final class TUIApp {
             note = "Could not resolve that path"
             return
         }
+        // A folder the scanner never read has no size: its 0 B means "unknown",
+        // and a prompt saying "0 B on disk" reads as "it is empty".
+        var neverRead = false
+        if case .folder(let node) = target { neverRead = node.isUnreadable || !node.isScanned }
+        if neverRead && permanently {
+            note = "\(target.name) was never read, so its size is unknown — re-read it (r), "
+                + "or send it to the Trash (d)"
+            return
+        }
 
-        var lines = [
-            "\(Format.bytes(target.bytes)) on disk",
-            TextCell.fitLeading(path, 56),
-            "",
-        ]
+        let size: String
+        if neverRead {
+            size = "Size unknown — this folder was never read"
+        } else if status.phase == .cancelled, target.isFolder {
+            size = "At least \(Format.bytes(target.bytes)) on disk — the scan was stopped before the end"
+        } else {
+            size = "\(Format.bytes(target.bytes)) on disk"
+        }
+        // The whole path, wrapped: the start of it is what tells two
+        // `node_modules` apart.
+        var lines = [size] + TextCell.wrapPath(path, 56) + [""]
         if permanently {
             lines.append("Deleted for good. There is no Trash to fish it out of,")
             lines.append("and no undo.")
@@ -451,6 +520,10 @@ final class TUIApp {
     }
 
     private func confirmClean() {
+        guard status.busy == nil else {
+            note = "Something is already running"
+            return
+        }
         let state = host.cleanup
         let picked = state.selected
         guard state.phase == .ready else {
@@ -477,6 +550,44 @@ final class TUIApp {
             danger: true,
             requiresYes: true,
             action: { [host] in host.cleanSelected() }))
+    }
+
+    /// One "up" too many at the root must not throw away a scan that took
+    /// minutes — it is the most-used key, and the `h` of a paste.
+    private func confirmCloseScan() {
+        guard host.root != nil else {
+            browser = nil
+            goHome()
+            return
+        }
+        let what = status.isScanning
+            ? "The scan is still running — closing it stops it."
+            : "Read in \(Format.seconds(status.elapsed)) — closing it means scanning again to come back."
+        overlay = .confirm(Confirm(
+            title: "Close this scan?",
+            lines: TextCell.wrapPath(status.rootPath, 56) + ["", what, "",
+                                                      "Press ⏎ to close it, esc to stay."],
+            danger: false,
+            requiresYes: false,
+            action: { [weak self] in
+                guard let self else { return }
+                self.host.goHome()
+                self.browser = nil
+                self.goHome()
+            }))
+    }
+
+    /// Back to the menu, with what it lists: `--tui <path>` skipped the probes.
+    private func goHome() {
+        route = .home
+        if !host.sources.loaded { host.reloadSources() }
+    }
+
+    /// A paste, as a text field takes it: one line, no control characters.
+    private static func pastable(_ text: String) -> String {
+        String(String.UnicodeScalarView(text.unicodeScalars.filter {
+            !CharacterSet.controlCharacters.contains($0) && !CharacterSet.newlines.contains($0) && $0 != "\u{FFFD}"
+        }))
     }
 
     /// Quitting mid-job would stop a deletion halfway; say so and ask.
@@ -518,13 +629,16 @@ final class TUIApp {
                          + " · " + Format.plural(Int64(node.childCount), "sub-folder"))
             if node.isUnreadable {
                 lines += TextCell.wrap("This folder could not be opened, so its size reads as 0 "
-                                       + "and is not one. Full Disk Access in System Settings › "
-                                       + "Privacy & Security would let the scanner in.", 56)
+                                       + "and is not one. If macOS privacy protection is why, Full "
+                                       + "Disk Access for the terminal this runs in would let the "
+                                       + "scanner in.", 56)
             }
             if let written = node.newestWrite {
                 lines.append("newest write \(Format.age(written))")
-            } else {
+            } else if !status.isHostScan {
                 lines.append("newest write unknown (streamed scan)")
+            } else if !node.isUnreadable && node.fileCount.load(ordering: .relaxed) == 0 {
+                lines.append("no files in here")
             }
             if let divergence = node.divergence {
                 lines += TextCell.wrap(divergence.summary, 56)
@@ -539,7 +653,7 @@ final class TUIApp {
         }
         if let path = path(of: target) {
             lines.append("")
-            lines += TextCell.wrap(path, 56)
+            lines += TextCell.wrapPath(path, 56)
         }
         return lines
     }
@@ -704,8 +818,8 @@ final class TUIApp {
                 facts = screenTitle
             case .browser, .results:
                 facts = status.isScanning
-                    ? String(format: "scanning… %.1f s", status.elapsed)
-                    : String(format: "scanned in %.1f s", status.elapsed)
+                    ? "scanning… \(Format.seconds(status.elapsed))"
+                    : "scanned in \(Format.seconds(status.elapsed))"
                 // The caveat comes *before* the counts, not after: on an 80
                 // column terminal the tail is what gets cut, and "every total
                 // here is a floor" is the line that must survive. Same wording
